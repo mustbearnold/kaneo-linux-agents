@@ -1,0 +1,50 @@
+{
+  "name": "@kaneo/desktop",
+  "version": "2.12.1",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs",
+  "description": "Kaneo project management desktop app",
+  "author": "Kaneo contributors",
+  "desktopName": "kaneo",
+  "scripts": {
+    "prepare:runtime": "VITE_API_URL=http://127.0.0.1:1337 VITE_CLIENT_URL=http://127.0.0.1:5173 VITE_TURNSTILE_SITE_KEY= pnpm --filter @kaneo/web build && node scripts/prepare-runtime.mjs",
+    "start": "pnpm prepare:runtime && electron .",
+    "package": "pnpm prepare:runtime && electron-builder --linux",
+    "package:dir": "pnpm prepare:runtime && electron-builder --linux dir",
+    "package:appimage": "pnpm prepare:runtime && electron-builder --linux AppImage"
+  },
+  "devDependencies": {
+    "electron": "43.2.0",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "app.kaneo.desktop",
+    "productName": "Kaneo",
+    "executableName": "kaneo",
+    "asar": false,
+    "directories": {
+      "output": "../../dist/kaneo-desktop"
+    },
+    "files": [
+      "main.mjs",
+      "preload.mjs",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "runtime",
+        "to": "runtime"
+      }
+    ],
+    "linux": {
+      "category": "Office",
+      "syncDesktopName": true,
+      "target": [
+        "dir",
+        "AppImage"
+      ],
+      "artifactName": "Kaneo-${version}-${arch}.${ext}"
+    }
+  }
+}

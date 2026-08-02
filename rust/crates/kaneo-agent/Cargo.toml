@@ -1,0 +1,10 @@
+[package]
+name = "kaneo-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line worker for the Rust Kaneo agent migration"
+
+[dependencies]
+kaneo-core = { path = "../kaneo-core" }
+serde_json.workspace = true

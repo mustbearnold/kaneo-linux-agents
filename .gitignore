@@ -27,6 +27,8 @@ out/
 build
 dist
 .source
+/rust/target/
+/apps/desktop/runtime/
 
 # Debug
 npm-debug.log*

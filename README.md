@@ -46,6 +46,18 @@ We believe the best tools are **invisible**. They should amplify your team's nat
 
 Learn more about Kaneo's features and capabilities in our [documentation](https://kaneo.app/docs/core).
 
+## Linux autonomous-agent implementation
+
+This Linux-focused implementation adds a self-hosted Electron desktop shell
+and an on-demand Codex agent runner. Agents can inspect a Kaneo project,
+execute work in a selected local directory, update task status and comments,
+and stream redacted progress into a live monitor while the kanban board keeps
+receiving WebSocket updates.
+
+The Rust migration starts in [`rust/`](rust/README.md) with the bounded,
+parallel agent execution core. The TypeScript API remains the compatibility
+runtime while the rest of Kaneo is ported behind the same domain boundary.
+
 ## Sponsors
 
 Kaneo is open source. If you find it useful, consider [sponsoring the project](https://github.com/sponsors/andrejsshell) to help support ongoing development.
