@@ -30,6 +30,11 @@ server. The Rust runtime also owns dynamic client registration, trusted-origin
 consent, and PKCE authorization-code exchange; its in-memory OAuth state has the
 same restart semantics as the legacy implementation.
 
+Slack, Discord, and Telegram project-integration configuration is native too:
+the Rust API validates webhook or bot credentials, preserves event settings,
+and returns masked secrets while the existing delivery plugins remain the
+outbound execution boundary.
+
 The current TypeScript API remains a compatibility runtime while feature parity
 is built in Rust. In packaged Electron builds it runs privately on port 1338;
 the Rust API owns port 1337 and proxies only the routes that have not moved.

@@ -2613,6 +2613,801 @@ async fn delete_generic_webhook_integration(
     Ok(Json(json!({ "success": true })))
 }
 
+const INTEGRATION_EVENT_KEYS: [&str; 6] = [
+    "taskCreated",
+    "taskStatusChanged",
+    "taskPriorityChanged",
+    "taskTitleChanged",
+    "taskDescriptionChanged",
+    "taskCommentCreated",
+];
+
+fn project_integration_defaults() -> serde_json::Map<String, Value> {
+    [
+        ("taskCreated", true),
+        ("taskStatusChanged", true),
+        ("taskPriorityChanged", false),
+        ("taskTitleChanged", false),
+        ("taskDescriptionChanged", false),
+        ("taskCommentCreated", true),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), Value::Bool(value)))
+    .collect()
+}
+
+fn project_integration_optional_text(input: &Value, key: &str) -> Result<Option<String>, ApiError> {
+    match input.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{key} must be a string"),
+        )),
+    }
+}
+
+fn project_integration_nullable_text(
+    input: &Value,
+    key: &str,
+) -> Result<Option<Option<String>>, ApiError> {
+    match input.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(value)) => Ok(Some(Some(value.clone()))),
+        Some(_) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{key} must be a string or null"),
+        )),
+    }
+}
+
+fn project_integration_optional_bool(input: &Value, key: &str) -> Result<Option<bool>, ApiError> {
+    match input.get(key) {
+        None => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{key} must be a boolean"),
+        )),
+    }
+}
+
+fn project_integration_optional_nullable_i32(
+    input: &Value,
+    key: &str,
+) -> Result<Option<Option<i32>>, ApiError> {
+    match input.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::Number(value)) => {
+            let Some(value) = value.as_i64() else {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("{key} must be an integer or null"),
+                ));
+            };
+            let value = i32::try_from(value).map_err(|_| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("{key} is outside the supported range"),
+                )
+            })?;
+            Ok(Some(Some(value)))
+        }
+        Some(_) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{key} must be an integer or null"),
+        )),
+    }
+}
+
+fn merge_project_integration_events(
+    config: &mut Value,
+    input: Option<&Value>,
+) -> Result<(), ApiError> {
+    let Some(input) = input else {
+        return Ok(());
+    };
+    let Some(input) = input.as_object() else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "events must be an object",
+        ));
+    };
+    let object = config.as_object_mut().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Stored integration config must be an object",
+        )
+    })?;
+    let events = object
+        .entry("events".to_string())
+        .or_insert_with(|| Value::Object(project_integration_defaults()));
+    let events = events.as_object_mut().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Stored integration events must be an object",
+        )
+    })?;
+    for key in INTEGRATION_EVENT_KEYS {
+        if let Some(value) = input.get(key) {
+            if !value.is_boolean() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("events.{key} must be a boolean"),
+                ));
+            }
+            events.insert(key.to_string(), value.clone());
+        }
+    }
+    Ok(())
+}
+
+fn normalize_project_integration_events(config: &mut Value) -> Result<(), ApiError> {
+    let object = config.as_object_mut().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Stored integration config must be an object",
+        )
+    })?;
+    let mut events = project_integration_defaults();
+    if let Some(existing) = object.get("events").and_then(Value::as_object) {
+        for key in INTEGRATION_EVENT_KEYS {
+            if let Some(value) = existing.get(key).filter(|value| value.is_boolean()) {
+                events.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    object.insert("events".to_string(), Value::Object(events));
+    Ok(())
+}
+
+fn validate_slack_webhook(value: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    if url.scheme() != "https" || url.host_str() != Some("hooks.slack.com") {
+        return false;
+    }
+    let parts = url
+        .path()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    parts.len() == 4
+        && parts[0] == "services"
+        && parts[1..]
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|value| value.is_ascii_alphanumeric()))
+}
+
+fn validate_discord_webhook(value: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    if url.scheme() != "https" || !matches!(url.host_str(), Some("discord.com" | "discordapp.com"))
+    {
+        return false;
+    }
+    let parts = url
+        .path()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    parts.len() == 4 && parts[0] == "api" && parts[1] == "webhooks"
+}
+
+fn validate_telegram_bot_token(value: &str) -> bool {
+    let Some((prefix, suffix)) = value.split_once(':') else {
+        return false;
+    };
+    (8..=10).contains(&prefix.len())
+        && prefix.chars().all(|value| value.is_ascii_digit())
+        && suffix.len() == 35
+        && suffix
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '_' | '-'))
+}
+
+fn mask_project_webhook_url(value: &str) -> String {
+    let Ok(url) = Url::parse(value) else {
+        return "Configured".to_string();
+    };
+    let parts = url
+        .path()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let Some(last) = parts.last() else {
+        return "Configured".to_string();
+    };
+    let masked = if last.len() > 8 {
+        format!("{}…{}", &last[..4], &last[last.len() - 4..])
+    } else {
+        "••••".to_string()
+    };
+    let origin = format!(
+        "{}://{}{}",
+        url.scheme(),
+        url.host_str().unwrap_or_default(),
+        url.port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default()
+    );
+    let prefix = parts[..parts.len() - 1].join("/");
+    if prefix.is_empty() {
+        format!("{origin}/{masked}")
+    } else {
+        format!("{origin}/{prefix}/{masked}")
+    }
+}
+
+fn mask_telegram_bot_token(value: &str) -> String {
+    let Some((prefix, suffix)) = value.split_once(':') else {
+        return "Configured".to_string();
+    };
+    if suffix.len() <= 8 {
+        return format!("{prefix}:••••");
+    }
+    format!("{prefix}:{}…{}", &suffix[..4], &suffix[suffix.len() - 4..])
+}
+
+async fn project_integration_row(
+    state: &AppState,
+    project_id: &str,
+    integration_type: &str,
+) -> Result<Option<Row>, ApiError> {
+    state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT id, project_id, type, config, is_active,
+                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+              FROM integration
+              WHERE project_id = $1 AND type = $2
+              LIMIT 1
+            "#,
+            &[&project_id, &integration_type],
+        )
+        .await
+        .map_err(database_error)
+}
+
+fn project_integration_response(row: &Row, integration_type: &str) -> Result<Value, ApiError> {
+    let mut config =
+        serde_json::from_str::<Value>(&row_string(row, "config")?).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid {integration_type} integration config: {error}"),
+            )
+        })?;
+    normalize_project_integration_events(&mut config)?;
+    let object = config.as_object().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Invalid {integration_type} integration config"),
+        )
+    })?;
+    let events = object
+        .get("events")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(project_integration_defaults()));
+    let is_active = row
+        .try_get::<_, Option<bool>>("is_active")
+        .map_err(database_error)?;
+    let base = json!({
+        "id": row_string(row, "id")?,
+        "projectId": row_string(row, "project_id")?,
+        "events": events,
+        "isActive": is_active,
+        "createdAt": row_string(row, "created_at")?,
+        "updatedAt": row_string(row, "updated_at")?,
+    });
+    let webhook_url = object.get("webhookUrl").and_then(Value::as_str);
+    let response = match integration_type {
+        "slack" | "discord" => {
+            let webhook_url = webhook_url.ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Invalid {integration_type} integration config"),
+                )
+            })?;
+            let mut response = base;
+            response["channelName"] = object
+                .get("channelName")
+                .and_then(Value::as_str)
+                .map(Value::from)
+                .unwrap_or(Value::Null);
+            response["webhookConfigured"] = Value::Bool(!webhook_url.is_empty());
+            response["maskedWebhookUrl"] = Value::String(mask_project_webhook_url(webhook_url));
+            response
+        }
+        "telegram" => {
+            let bot_token = object
+                .get("botToken")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Invalid telegram integration config",
+                    )
+                })?;
+            let chat_id = object
+                .get("chatId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Invalid telegram integration config",
+                    )
+                })?;
+            let mut response = base;
+            response["chatId"] = Value::String(chat_id.to_string());
+            response["threadId"] = object.get("threadId").cloned().unwrap_or(Value::Null);
+            response["chatLabel"] = object
+                .get("chatLabel")
+                .and_then(Value::as_str)
+                .map(Value::from)
+                .unwrap_or(Value::Null);
+            response["botTokenConfigured"] = Value::Bool(!bot_token.is_empty());
+            response["maskedBotToken"] = Value::String(mask_telegram_bot_token(bot_token));
+            response
+        }
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Unsupported project integration: {integration_type}"),
+            ));
+        }
+    };
+    Ok(response)
+}
+
+fn validate_project_integration_config(
+    integration_type: &str,
+    config: &Value,
+) -> Result<(), ApiError> {
+    let object = config.as_object().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Integration config must be an object",
+        )
+    })?;
+    match integration_type {
+        "slack" => {
+            let value = object
+                .get("webhookUrl")
+                .and_then(Value::as_str)
+                .filter(|value| validate_slack_webhook(value))
+                .ok_or_else(|| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "Invalid Slack webhook URL")
+                })?;
+            if value.is_empty() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid Slack webhook URL",
+                ));
+            }
+        }
+        "discord" => {
+            let value = object
+                .get("webhookUrl")
+                .and_then(Value::as_str)
+                .filter(|value| validate_discord_webhook(value))
+                .ok_or_else(|| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "Enter a valid Discord webhook URL")
+                })?;
+            if value.is_empty() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Enter a valid Discord webhook URL",
+                ));
+            }
+        }
+        "telegram" => {
+            let bot_token = object
+                .get("botToken")
+                .and_then(Value::as_str)
+                .filter(|value| validate_telegram_bot_token(value))
+                .ok_or_else(|| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "Enter a valid Telegram bot token")
+                })?;
+            if bot_token.is_empty() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Enter a valid Telegram bot token",
+                ));
+            }
+            if object
+                .get("chatId")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Chat ID is required",
+                ));
+            }
+            if let Some(thread_id) = object.get("threadId") {
+                if thread_id
+                    .as_i64()
+                    .is_none_or(|value| value < 1 || value > i32::MAX as i64)
+                {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "threadId must be a positive integer",
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Unsupported project integration: {integration_type}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn get_project_integration(
+    state: &AppState,
+    headers: &HeaderMap,
+    project_id: &str,
+    integration_type: &str,
+) -> Result<Value, ApiError> {
+    let _ = auth_for_project(state, headers, project_id).await?;
+    Ok(project_integration_row(state, project_id, integration_type)
+        .await?
+        .as_ref()
+        .map(|row| project_integration_response(row, integration_type))
+        .transpose()?
+        .unwrap_or(Value::Null))
+}
+
+async fn create_project_integration(
+    state: &AppState,
+    headers: &HeaderMap,
+    project_id: &str,
+    integration_type: &str,
+    input: Value,
+) -> Result<Value, ApiError> {
+    let (auth, workspace_id) = auth_for_project(state, headers, project_id).await?;
+    require_workspace_permission(state, &auth, &workspace_id, "workspace", "manage_settings")
+        .await?;
+    let mut config = match integration_type {
+        "slack" | "discord" => {
+            let webhook_url = project_integration_required_string(&input, "webhookUrl")?;
+            let mut config = json!({"webhookUrl": webhook_url});
+            if let Some(channel_name) = project_integration_optional_text(&input, "channelName")? {
+                config["channelName"] = json!(channel_name);
+            }
+            merge_project_integration_events(&mut config, input.get("events"))?;
+            config
+        }
+        "telegram" => {
+            let bot_token = project_integration_required_string(&input, "botToken")?;
+            let chat_id = project_integration_required_string(&input, "chatId")?;
+            let mut config = json!({"botToken": bot_token, "chatId": chat_id});
+            if let Some(thread_id) = project_integration_optional_nullable_i32(&input, "threadId")?
+            {
+                if let Some(thread_id) = thread_id {
+                    config["threadId"] = json!(thread_id);
+                }
+            }
+            if let Some(chat_label) = project_integration_optional_text(&input, "chatLabel")? {
+                config["chatLabel"] = json!(chat_label);
+            }
+            merge_project_integration_events(&mut config, input.get("events"))?;
+            config
+        }
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Unsupported project integration: {integration_type}"),
+            ));
+        }
+    };
+    normalize_project_integration_events(&mut config)?;
+    validate_project_integration_config(integration_type, &config)?;
+    let serialized = config.to_string();
+    if let Some(existing) = project_integration_row(state, project_id, integration_type).await? {
+        let id = row_string(&existing, "id")?;
+        state
+            .database
+            .client
+            .execute(
+                "UPDATE integration SET config = $2, is_active = TRUE, updated_at = NOW() WHERE id = $1",
+                &[&id, &serialized],
+            )
+            .await
+            .map_err(database_error)?;
+    } else {
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  INSERT INTO integration
+                    (id, project_id, type, config, is_active, created_at, updated_at)
+                  VALUES ($1, $2, $3, $4, TRUE, NOW(), NOW())
+                "#,
+                &[
+                    &Uuid::new_v4().to_string(),
+                    &project_id,
+                    &integration_type,
+                    &serialized,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+    let row = project_integration_row(state, project_id, integration_type)
+        .await?
+        .ok_or_else(|| database_error("Project integration was not saved"))?;
+    project_integration_response(&row, integration_type)
+}
+
+fn project_integration_required_string(input: &Value, key: &str) -> Result<String, ApiError> {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, format!("{key} is required")))
+}
+
+async fn update_project_integration(
+    state: &AppState,
+    headers: &HeaderMap,
+    project_id: &str,
+    integration_type: &str,
+    input: Value,
+) -> Result<Value, ApiError> {
+    let (auth, workspace_id) = auth_for_project(state, headers, project_id).await?;
+    require_workspace_permission(state, &auth, &workspace_id, "workspace", "manage_settings")
+        .await?;
+    let existing = project_integration_row(state, project_id, integration_type)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                format!("{integration_type} integration not found"),
+            )
+        })?;
+    let mut config =
+        serde_json::from_str::<Value>(&row_string(&existing, "config")?).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid {integration_type} integration config: {error}"),
+            )
+        })?;
+    normalize_project_integration_events(&mut config)?;
+    match integration_type {
+        "slack" | "discord" => {
+            if let Some(webhook_url) = project_integration_optional_text(&input, "webhookUrl")? {
+                if !webhook_url.trim().is_empty() {
+                    config["webhookUrl"] = json!(webhook_url.trim());
+                }
+            }
+            if let Some(channel_name) = project_integration_nullable_text(&input, "channelName")? {
+                config["channelName"] = channel_name.map(Value::String).unwrap_or(Value::Null);
+            }
+        }
+        "telegram" => {
+            if let Some(bot_token) = project_integration_optional_text(&input, "botToken")? {
+                config["botToken"] = json!(bot_token.trim());
+            }
+            if let Some(chat_id) = project_integration_optional_text(&input, "chatId")? {
+                config["chatId"] = json!(chat_id.trim());
+            }
+            if let Some(thread_id) = project_integration_optional_nullable_i32(&input, "threadId")?
+            {
+                if let Some(thread_id) = thread_id {
+                    config["threadId"] = Value::from(thread_id);
+                } else if let Some(object) = config.as_object_mut() {
+                    object.remove("threadId");
+                }
+            }
+            if let Some(chat_label) = project_integration_nullable_text(&input, "chatLabel")? {
+                if let Some(chat_label) = chat_label {
+                    config["chatLabel"] = Value::String(chat_label);
+                } else if let Some(object) = config.as_object_mut() {
+                    object.remove("chatLabel");
+                }
+            }
+        }
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Unsupported project integration: {integration_type}"),
+            ));
+        }
+    }
+    merge_project_integration_events(&mut config, input.get("events"))?;
+    normalize_project_integration_events(&mut config)?;
+    validate_project_integration_config(integration_type, &config)?;
+    let is_active = project_integration_optional_bool(&input, "isActive")?
+        .or_else(|| {
+            existing
+                .try_get::<_, Option<bool>>("is_active")
+                .ok()
+                .flatten()
+        })
+        .unwrap_or(true);
+    let id = row_string(&existing, "id")?;
+    let serialized = config.to_string();
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE integration SET config = $2, is_active = $3, updated_at = NOW() WHERE id = $1",
+            &[&id, &serialized, &is_active],
+        )
+        .await
+        .map_err(database_error)?;
+    let row = project_integration_row(state, project_id, integration_type)
+        .await?
+        .ok_or_else(|| database_error("Project integration was not saved"))?;
+    project_integration_response(&row, integration_type)
+}
+
+async fn delete_project_integration(
+    state: &AppState,
+    headers: &HeaderMap,
+    project_id: &str,
+    integration_type: &str,
+) -> Result<Value, ApiError> {
+    let (auth, workspace_id) = auth_for_project(state, headers, project_id).await?;
+    require_workspace_permission(state, &auth, &workspace_id, "workspace", "manage_settings")
+        .await?;
+    let existing = project_integration_row(state, project_id, integration_type)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                format!("{integration_type} integration not found"),
+            )
+        })?;
+    let id = row_string(&existing, "id")?;
+    state
+        .database
+        .client
+        .execute("DELETE FROM integration WHERE id = $1", &[&id])
+        .await
+        .map_err(database_error)?;
+    Ok(json!({"success": true}))
+}
+
+async fn get_slack_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        get_project_integration(&state, &headers, &project_id, "slack").await?,
+    ))
+}
+
+async fn create_slack_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        create_project_integration(&state, &headers, &project_id, "slack", input).await?,
+    ))
+}
+
+async fn update_slack_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        update_project_integration(&state, &headers, &project_id, "slack", input).await?,
+    ))
+}
+
+async fn delete_slack_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        delete_project_integration(&state, &headers, &project_id, "slack").await?,
+    ))
+}
+
+async fn get_discord_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        get_project_integration(&state, &headers, &project_id, "discord").await?,
+    ))
+}
+
+async fn create_discord_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        create_project_integration(&state, &headers, &project_id, "discord", input).await?,
+    ))
+}
+
+async fn update_discord_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        update_project_integration(&state, &headers, &project_id, "discord", input).await?,
+    ))
+}
+
+async fn delete_discord_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        delete_project_integration(&state, &headers, &project_id, "discord").await?,
+    ))
+}
+
+async fn get_telegram_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        get_project_integration(&state, &headers, &project_id, "telegram").await?,
+    ))
+}
+
+async fn create_telegram_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        create_project_integration(&state, &headers, &project_id, "telegram", input).await?,
+    ))
+}
+
+async fn update_telegram_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        update_project_integration(&state, &headers, &project_id, "telegram", input).await?,
+    ))
+}
+
+async fn delete_telegram_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        delete_project_integration(&state, &headers, &project_id, "telegram").await?,
+    ))
+}
+
 fn mcp_object_schema(properties: Value, required: &[&str]) -> Value {
     json!({
         "type": "object",
@@ -10034,6 +10829,27 @@ fn app(state: AppState) -> Router {
                 .post(create_generic_webhook_integration)
                 .patch(update_generic_webhook_integration)
                 .delete(delete_generic_webhook_integration),
+        )
+        .route(
+            "/api/slack-integration/project/{project_id}",
+            get(get_slack_integration)
+                .post(create_slack_integration)
+                .patch(update_slack_integration)
+                .delete(delete_slack_integration),
+        )
+        .route(
+            "/api/discord-integration/project/{project_id}",
+            get(get_discord_integration)
+                .post(create_discord_integration)
+                .patch(update_discord_integration)
+                .delete(delete_discord_integration),
+        )
+        .route(
+            "/api/telegram-integration/project/{project_id}",
+            get(get_telegram_integration)
+                .post(create_telegram_integration)
+                .patch(update_telegram_integration)
+                .delete(delete_telegram_integration),
         )
         .route("/api/invitation/pending", get(pending_invitations))
         .route(
