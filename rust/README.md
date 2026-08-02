@@ -15,7 +15,9 @@ invitations and public invitation details, custom-OAuth id-token reads, and
 workspace billing state. It also owns notification preference and workspace-rule
 CRUD, including the existing AES-256-GCM secret format. Native notification
 creation applies the same task preference gates and emits the user-socket
-invalidation event. Task, comment,
+invalidation event. Generic-webhook configuration CRUD is native as well;
+outbound delivery remains behind the compatibility plugin for now. Task,
+comment,
 relation, label, and time-entry mutations publish filtered events to connected
 project boards, so an agent changing a task is visible without waiting for a
 polling cycle.

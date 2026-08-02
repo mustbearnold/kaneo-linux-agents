@@ -22,7 +22,8 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::StreamExt;
 use kaneo_core::{AgentRun, AgentSpec, RunManager, RunStatus, RunnerConfig};
-use serde::{Deserialize, Serialize};
+use serde::de::Error as SerdeDeError;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -339,20 +340,53 @@ struct CreateNotificationInput {
     related_entity_type: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+enum OptionalStringInput {
+    Missing,
+    Null,
+    Value(String),
+}
+
+impl Default for OptionalStringInput {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+impl<'de> Deserialize<'de> for OptionalStringInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Value::deserialize(deserializer)? {
+            Value::Null => Ok(Self::Null),
+            Value::String(value) => Ok(Self::Value(value)),
+            _ => Err(D::Error::custom("expected a string or null")),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateNotificationPreferencesInput {
     email_enabled: Option<bool>,
     ntfy_enabled: Option<bool>,
-    ntfy_server_url: Option<Option<String>>,
-    ntfy_topic: Option<Option<String>>,
-    ntfy_token: Option<Option<String>>,
+    #[serde(default)]
+    ntfy_server_url: OptionalStringInput,
+    #[serde(default)]
+    ntfy_topic: OptionalStringInput,
+    #[serde(default)]
+    ntfy_token: OptionalStringInput,
     gotify_enabled: Option<bool>,
-    gotify_server_url: Option<Option<String>>,
-    gotify_token: Option<Option<String>>,
+    #[serde(default)]
+    gotify_server_url: OptionalStringInput,
+    #[serde(default)]
+    gotify_token: OptionalStringInput,
     webhook_enabled: Option<bool>,
-    webhook_url: Option<Option<String>>,
-    webhook_secret: Option<Option<String>>,
+    #[serde(default)]
+    webhook_url: OptionalStringInput,
+    #[serde(default)]
+    webhook_secret: OptionalStringInput,
     task_assignment_enabled: Option<bool>,
     task_comment_enabled: Option<bool>,
     task_status_change_enabled: Option<bool>,
@@ -370,6 +404,43 @@ struct NotificationWorkspaceRuleInput {
     webhook_enabled: bool,
     project_mode: String,
     selected_project_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GenericWebhookEventsInput {
+    task_created: Option<bool>,
+    task_status_changed: Option<bool>,
+    task_priority_changed: Option<bool>,
+    task_title_changed: Option<bool>,
+    task_description_changed: Option<bool>,
+    task_comment_created: Option<bool>,
+    task_deleted: Option<bool>,
+    task_moved: Option<bool>,
+    task_due_date_changed: Option<bool>,
+    task_assignee_changed: Option<bool>,
+    task_unassigned: Option<bool>,
+    due_date_reminder: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateGenericWebhookInput {
+    webhook_url: String,
+    secret: Option<String>,
+    events: Option<GenericWebhookEventsInput>,
+    due_date_reminder_lead_time_minutes: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateGenericWebhookInput {
+    webhook_url: Option<String>,
+    #[serde(default)]
+    secret: OptionalStringInput,
+    is_active: Option<bool>,
+    events: Option<GenericWebhookEventsInput>,
+    due_date_reminder_lead_time_minutes: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2129,6 +2200,381 @@ async fn delete_label(
             .map_err(database_error)?;
     }
     Ok(Json(existing))
+}
+
+fn generic_webhook_default_events() -> serde_json::Map<String, Value> {
+    [
+        ("taskCreated", true),
+        ("taskStatusChanged", true),
+        ("taskPriorityChanged", false),
+        ("taskTitleChanged", false),
+        ("taskDescriptionChanged", false),
+        ("taskCommentCreated", true),
+        ("taskDeleted", false),
+        ("taskMoved", false),
+        ("taskDueDateChanged", false),
+        ("taskAssigneeChanged", false),
+        ("taskUnassigned", false),
+        ("dueDateReminder", false),
+    ]
+    .into_iter()
+    .map(|(name, enabled)| (name.to_string(), Value::Bool(enabled)))
+    .collect()
+}
+
+fn normalize_generic_webhook_config(config: &mut Value) -> Result<(), ApiError> {
+    let object = config.as_object_mut().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Generic webhook integration config must be an object",
+        )
+    })?;
+
+    match object.get("secret").and_then(Value::as_str) {
+        Some(secret) if !secret.trim().is_empty() => {
+            object.insert(
+                "secret".to_string(),
+                Value::String(secret.trim().to_string()),
+            );
+        }
+        _ => {
+            object.remove("secret");
+        }
+    }
+
+    let mut events = generic_webhook_default_events();
+    if let Some(existing_events) = object.get("events").and_then(Value::as_object) {
+        for (name, value) in existing_events {
+            if value.is_boolean() {
+                events.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    object.insert("events".to_string(), Value::Object(events));
+    if object
+        .get("dueDateReminderLeadTimeMinutes")
+        .is_none_or(Value::is_null)
+    {
+        object.insert(
+            "dueDateReminderLeadTimeMinutes".to_string(),
+            Value::Number(1440.into()),
+        );
+    }
+    Ok(())
+}
+
+async fn validate_generic_webhook_config(config: &Value) -> Result<(), ApiError> {
+    let object = config.as_object().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Generic webhook integration config must be an object",
+        )
+    })?;
+    let webhook_url = object
+        .get("webhookUrl")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Webhook URL is required"))?;
+    validate_notification_destination(webhook_url)
+        .await
+        .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.message))?;
+    let due_date_lead_time = object
+        .get("dueDateReminderLeadTimeMinutes")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "dueDateReminderLeadTimeMinutes must be an integer",
+            )
+        })?;
+    if !(5..=43_200).contains(&due_date_lead_time) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "dueDateReminderLeadTimeMinutes must be between 5 and 43200",
+        ));
+    }
+    Ok(())
+}
+
+fn merge_generic_webhook_events(
+    config: &mut Value,
+    events: &GenericWebhookEventsInput,
+) -> Result<(), ApiError> {
+    let value = serde_json::to_value(events).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid generic webhook events: {error}"),
+        )
+    })?;
+    let config_object = config.as_object_mut().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Generic webhook integration config must be an object",
+        )
+    })?;
+    let event_object = config_object
+        .entry("events".to_string())
+        .or_insert_with(|| Value::Object(generic_webhook_default_events()));
+    let event_object = event_object.as_object_mut().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Generic webhook events must be an object",
+        )
+    })?;
+    if let Some(updates) = value.as_object() {
+        for (name, value) in updates {
+            if !value.is_null() {
+                event_object.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn generic_webhook_row(state: &AppState, project_id: &str) -> Result<Option<Row>, ApiError> {
+    state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT id, project_id, config, is_active,
+                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+              FROM integration
+              WHERE project_id = $1 AND type = 'generic-webhook'
+              LIMIT 1
+            "#,
+            &[&project_id],
+        )
+        .await
+        .map_err(database_error)
+}
+
+fn generic_webhook_response(row: &Row) -> Result<Value, ApiError> {
+    let mut config =
+        serde_json::from_str::<Value>(&row_string(row, "config")?).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid generic webhook integration config: {error}"),
+            )
+        })?;
+    normalize_generic_webhook_config(&mut config)?;
+    let object = config.as_object().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Generic webhook integration config must be an object",
+        )
+    })?;
+    let webhook_url = object
+        .get("webhookUrl")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let secret = object
+        .get("secret")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let due_date_lead_time = object
+        .get("dueDateReminderLeadTimeMinutes")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(1440);
+
+    Ok(json!({
+        "id": row_string(row, "id")?,
+        "projectId": row_string(row, "project_id")?,
+        "webhookConfigured": webhook_url.is_some(),
+        "maskedWebhookUrl": mask_notification_secret(webhook_url.as_ref()),
+        "secretConfigured": secret.is_some(),
+        "maskedSecret": mask_notification_secret(secret.as_ref()),
+        "events": object.get("events").cloned().unwrap_or_else(|| Value::Object(generic_webhook_default_events())),
+        "dueDateReminderLeadTimeMinutes": due_date_lead_time,
+        "isActive": row.try_get::<_, Option<bool>>("is_active").map_err(database_error)?,
+        "createdAt": row_string(row, "created_at")?,
+        "updatedAt": row_string(row, "updated_at")?,
+    }))
+}
+
+async fn get_generic_webhook_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (_auth, _workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
+    let integration = generic_webhook_row(&state, &project_id).await?;
+    Ok(Json(
+        integration
+            .as_ref()
+            .map(generic_webhook_response)
+            .transpose()?
+            .unwrap_or(Value::Null),
+    ))
+}
+
+async fn create_generic_webhook_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<CreateGenericWebhookInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "workspace", "manage_settings")
+        .await?;
+    let mut config = json!({ "webhookUrl": input.webhook_url });
+    if let Some(secret) = input.secret.as_deref() {
+        if let Some(secret) = normalize_notification_string(Some(secret)) {
+            config["secret"] = Value::String(secret);
+        }
+    }
+    if let Some(events) = input.events.as_ref() {
+        merge_generic_webhook_events(&mut config, events)?;
+    }
+    if let Some(lead_time) = input.due_date_reminder_lead_time_minutes {
+        config["dueDateReminderLeadTimeMinutes"] = Value::Number(lead_time.into());
+    }
+    normalize_generic_webhook_config(&mut config)?;
+    validate_generic_webhook_config(&config).await?;
+    let serialized_config = config.to_string();
+    if let Some(existing) = generic_webhook_row(&state, &project_id).await? {
+        let integration_id = row_string(&existing, "id")?;
+        state
+            .database
+            .client
+            .execute(
+                "UPDATE integration SET config = $2, is_active = TRUE, updated_at = NOW() WHERE id = $1",
+                &[&integration_id, &serialized_config],
+            )
+            .await
+            .map_err(database_error)?;
+    } else {
+        let integration_id = Uuid::new_v4().to_string();
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  INSERT INTO integration
+                    (id, project_id, type, config, is_active, created_at, updated_at)
+                  VALUES ($1, $2, 'generic-webhook', $3, TRUE, NOW(), NOW())
+                "#,
+                &[&integration_id, &project_id, &serialized_config],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+    let integration = generic_webhook_row(&state, &project_id)
+        .await?
+        .ok_or_else(|| database_error("Generic webhook integration was not saved"))?;
+    Ok(Json(generic_webhook_response(&integration)?))
+}
+
+async fn update_generic_webhook_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<UpdateGenericWebhookInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "workspace", "manage_settings")
+        .await?;
+    let existing = generic_webhook_row(&state, &project_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "Generic webhook integration not found",
+            )
+        })?;
+    let mut config =
+        serde_json::from_str::<Value>(&row_string(&existing, "config")?).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid generic webhook integration config: {error}"),
+            )
+        })?;
+    normalize_generic_webhook_config(&mut config)?;
+    if let Some(webhook_url) = input.webhook_url.as_deref() {
+        if !webhook_url.trim().is_empty() {
+            config["webhookUrl"] = Value::String(webhook_url.trim().to_string());
+        }
+    }
+    if !matches!(&input.secret, OptionalStringInput::Missing) {
+        match &input.secret {
+            OptionalStringInput::Value(secret) => {
+                match normalize_notification_string(Some(secret)) {
+                    Some(secret) => config["secret"] = Value::String(secret),
+                    None => {
+                        if let Some(object) = config.as_object_mut() {
+                            object.remove("secret");
+                        }
+                    }
+                }
+            }
+            OptionalStringInput::Null => {
+                if let Some(object) = config.as_object_mut() {
+                    object.remove("secret");
+                }
+            }
+            OptionalStringInput::Missing => {}
+        }
+    }
+    if let Some(events) = input.events.as_ref() {
+        merge_generic_webhook_events(&mut config, events)?;
+    }
+    if let Some(lead_time) = input.due_date_reminder_lead_time_minutes {
+        config["dueDateReminderLeadTimeMinutes"] = Value::Number(lead_time.into());
+    }
+    normalize_generic_webhook_config(&mut config)?;
+    validate_generic_webhook_config(&config).await?;
+    let serialized_config = config.to_string();
+    let integration_id = row_string(&existing, "id")?;
+    let active = input
+        .is_active
+        .or_else(|| {
+            existing
+                .try_get::<_, Option<bool>>("is_active")
+                .ok()
+                .flatten()
+        })
+        .unwrap_or(true);
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE integration SET config = $2, is_active = $3, updated_at = NOW() WHERE id = $1",
+            &[&integration_id, &serialized_config, &active],
+        )
+        .await
+        .map_err(database_error)?;
+    let integration = generic_webhook_row(&state, &project_id)
+        .await?
+        .ok_or_else(|| database_error("Generic webhook integration was not saved"))?;
+    Ok(Json(generic_webhook_response(&integration)?))
+}
+
+async fn delete_generic_webhook_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "workspace", "manage_settings")
+        .await?;
+    let existing = generic_webhook_row(&state, &project_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "Generic webhook integration not found",
+            )
+        })?;
+    let integration_id = row_string(&existing, "id")?;
+    state
+        .database
+        .client
+        .execute("DELETE FROM integration WHERE id = $1", &[&integration_id])
+        .await
+        .map_err(database_error)?;
+    Ok(Json(json!({ "success": true })))
 }
 
 async fn list_projects(
@@ -6450,12 +6896,21 @@ fn normalize_notification_string(value: Option<&str>) -> Option<String> {
 }
 
 fn merged_notification_string(
-    input: &Option<Option<String>>,
+    input: &OptionalStringInput,
     existing: Option<&String>,
 ) -> Option<String> {
     match input {
-        Some(value) => normalize_notification_string(value.as_deref()),
-        None => existing.cloned(),
+        OptionalStringInput::Missing => existing.cloned(),
+        OptionalStringInput::Null => None,
+        OptionalStringInput::Value(value) => normalize_notification_string(Some(value)),
+    }
+}
+
+fn notification_string_input(value: &OptionalStringInput) -> Option<Option<String>> {
+    match value {
+        OptionalStringInput::Missing => None,
+        OptionalStringInput::Null => Some(None),
+        OptionalStringInput::Value(value) => Some(normalize_notification_string(Some(value))),
     }
 }
 
@@ -6856,23 +7311,14 @@ async fn update_notification_preferences(
         existing_gotify_server_url.as_ref(),
     );
     let webhook_url = merged_notification_string(&input.webhook_url, existing_webhook_url.as_ref());
-    let ntfy_token_input = input
-        .ntfy_token
-        .as_ref()
-        .map(|value| normalize_notification_string(value.as_deref()));
-    let gotify_token_input = input
-        .gotify_token
-        .as_ref()
-        .map(|value| normalize_notification_string(value.as_deref()));
-    let webhook_secret_input = input
-        .webhook_secret
-        .as_ref()
-        .map(|value| normalize_notification_string(value.as_deref()));
-    let gotify_token = gotify_token_input.clone().flatten().or_else(|| {
-        existing_gotify_token
-            .clone()
-            .filter(|_| input.gotify_token.is_none())
-    });
+    let ntfy_token_input = notification_string_input(&input.ntfy_token);
+    let gotify_token_input = notification_string_input(&input.gotify_token);
+    let webhook_secret_input = notification_string_input(&input.webhook_secret);
+    let gotify_token = match &input.gotify_token {
+        OptionalStringInput::Missing => existing_gotify_token.clone(),
+        OptionalStringInput::Null => None,
+        OptionalStringInput::Value(_) => gotify_token_input.clone().flatten(),
+    };
 
     let due_date_reminder_lead_time_minutes =
         input
@@ -6896,13 +7342,15 @@ async fn update_notification_preferences(
     }
 
     let should_validate_ntfy = ntfy_enabled
-        || input.ntfy_server_url.is_some()
-        || input.ntfy_topic.is_some()
-        || input.ntfy_token.is_some();
-    let should_validate_gotify =
-        gotify_enabled || input.gotify_server_url.is_some() || input.gotify_token.is_some();
-    let should_validate_webhook =
-        webhook_enabled || input.webhook_url.is_some() || input.webhook_secret.is_some();
+        || !matches!(&input.ntfy_server_url, OptionalStringInput::Missing)
+        || !matches!(&input.ntfy_topic, OptionalStringInput::Missing)
+        || !matches!(&input.ntfy_token, OptionalStringInput::Missing);
+    let should_validate_gotify = gotify_enabled
+        || !matches!(&input.gotify_server_url, OptionalStringInput::Missing)
+        || !matches!(&input.gotify_token, OptionalStringInput::Missing);
+    let should_validate_webhook = webhook_enabled
+        || !matches!(&input.webhook_url, OptionalStringInput::Missing)
+        || !matches!(&input.webhook_secret, OptionalStringInput::Missing);
 
     if should_validate_ntfy {
         let Some(server_url) = ntfy_server_url.as_deref() else {
@@ -6950,18 +7398,26 @@ async fn update_notification_preferences(
             .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.message))?;
     }
 
-    let stored_ntfy_token = if input.ntfy_token.is_some() {
-        encrypt_notification_secret(ntfy_token_input.as_ref().and_then(Option::as_deref))?
+    let stored_ntfy_token = if !matches!(&input.ntfy_token, OptionalStringInput::Missing) {
+        encrypt_notification_secret(ntfy_token_input.as_ref().and_then(|value| value.as_deref()))?
     } else {
         existing_ntfy_token_raw.clone()
     };
-    let stored_gotify_token = if input.gotify_token.is_some() {
-        encrypt_notification_secret(gotify_token_input.as_ref().and_then(Option::as_deref))?
+    let stored_gotify_token = if !matches!(&input.gotify_token, OptionalStringInput::Missing) {
+        encrypt_notification_secret(
+            gotify_token_input
+                .as_ref()
+                .and_then(|value| value.as_deref()),
+        )?
     } else {
         existing_gotify_token_raw.clone()
     };
-    let stored_webhook_secret = if input.webhook_secret.is_some() {
-        encrypt_notification_secret(webhook_secret_input.as_ref().and_then(Option::as_deref))?
+    let stored_webhook_secret = if !matches!(&input.webhook_secret, OptionalStringInput::Missing) {
+        encrypt_notification_secret(
+            webhook_secret_input
+                .as_ref()
+                .and_then(|value| value.as_deref()),
+        )?
     } else {
         existing_webhook_secret_raw.clone()
     };
@@ -8032,6 +8488,13 @@ fn app(state: AppState) -> Router {
         .route(
             "/api/notification-preferences/workspaces/{workspace_id}",
             put(upsert_notification_workspace_rule).delete(delete_notification_workspace_rule),
+        )
+        .route(
+            "/api/generic-webhook-integration/project/{project_id}",
+            get(get_generic_webhook_integration)
+                .post(create_generic_webhook_integration)
+                .patch(update_generic_webhook_integration)
+                .delete(delete_generic_webhook_integration),
         )
         .route("/api/invitation/pending", get(pending_invitations))
         .route(
