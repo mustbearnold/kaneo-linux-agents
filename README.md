@@ -70,6 +70,8 @@ shell. GitHub and Gitea project-integration configuration is native too,
 including Gitea repository discovery and access verification; external webhook
 delivery, issue import, and the remaining authentication/billing/storage
 surface still run through the private compatibility API during the migration.
+Rust-launched agents enforce project/task permissions and receive the local
+Rust MCP endpoint directly in their Codex invocation.
 Packaged Linux desktop builds start the Rust API by default; the legacy
 TypeScript API remains on a private compatibility port for routes that have
 not moved yet, and can be selected explicitly with `KANEO_API_RUNTIME=node`.

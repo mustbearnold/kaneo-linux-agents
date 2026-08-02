@@ -11292,7 +11292,32 @@ async fn start_agent(
             "projectId and prompt are required",
         ));
     }
+    if input.prompt.chars().count() > 20_000 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "prompt must be 20000 characters or fewer",
+        ));
+    }
+    if input
+        .cwd
+        .as_deref()
+        .is_some_and(|cwd| cwd.chars().count() > 1_000)
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "cwd must be 1000 characters or fewer",
+        ));
+    }
+    if input.max_seconds.is_some_and(|seconds| seconds < 60) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "maxSeconds must be at least 60",
+        ));
+    }
     let (auth, workspace_id) = auth_for_project(&state, &headers, &input.project_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "project", "read").await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "task", "create").await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "task", "update").await?;
     let id = Uuid::new_v4().to_string();
     let cwd = resolve_agent_cwd(&input, &id)?;
     if !cwd.is_dir() {
@@ -11317,6 +11342,10 @@ async fn start_agent(
         })?;
     }
     let network_access = input.network_access.unwrap_or(false);
+    let kaneo_api_url = env::var("KANEO_API_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:1337".to_string())
+        .trim_end_matches('/')
+        .to_string();
     let mut command_args = vec![
         "exec".to_string(),
         "--json".to_string(),
@@ -11330,6 +11359,8 @@ async fn start_agent(
         "approval_policy=\"never\"".to_string(),
         "-c".to_string(),
         "mcp_servers.kaneo.bearer_token_env_var=\"KANEO_AGENT_TOKEN\"".to_string(),
+        "-c".to_string(),
+        format!("mcp_servers.kaneo.url=\"{kaneo_api_url}/api/mcp\""),
         "-c".to_string(),
         "mcp_servers.kaneo.default_tools_approval_mode=\"approve\"".to_string(),
         "-c".to_string(),
@@ -11354,10 +11385,7 @@ async fn start_agent(
     let mut environment = std::collections::BTreeMap::new();
     environment.insert("KANEO_AGENT_TOKEN".to_string(), auth.credential);
     environment.insert("CODEX_CI".to_string(), "1".to_string());
-    environment.insert(
-        "KANEO_API_URL".to_string(),
-        env::var("KANEO_API_URL").unwrap_or_else(|_| "http://127.0.0.1:1337".to_string()),
-    );
+    environment.insert("KANEO_API_URL".to_string(), kaneo_api_url);
     environment.insert("KANEO_WORKSPACE_ID".to_string(), workspace_id.clone());
     environment.insert("KANEO_PROJECT_ID".to_string(), input.project_id.clone());
 

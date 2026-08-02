@@ -30,6 +30,12 @@ server. The Rust runtime also owns dynamic client registration, trusted-origin
 consent, and PKCE authorization-code exchange; its in-memory OAuth state has the
 same restart semantics as the legacy implementation.
 
+Native agent runs enforce the same project/task permission boundary as the
+compatibility API, validate prompt and runtime limits, and inject the local
+Rust MCP URL into each Codex invocation. An agent launched by the Rust API can
+therefore use the board bridge without relying on a pre-existing Codex MCP
+configuration.
+
 Slack, Discord, and Telegram project-integration configuration is native too:
 the Rust API validates webhook or bot credentials, preserves event settings,
 and returns masked secrets while the existing delivery plugins remain the
