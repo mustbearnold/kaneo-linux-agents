@@ -282,6 +282,18 @@ struct CommentContentInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct CreateNotificationInput {
+    title: Option<String>,
+    message: Option<String>,
+    #[serde(rename = "type")]
+    notification_type: String,
+    event_data: Option<Value>,
+    related_entity_id: Option<String>,
+    related_entity_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TaskRelationInput {
     source_task_id: String,
     target_task_id: String,
@@ -3202,15 +3214,9 @@ async fn update_task_status(
     Path(id): Path<String>,
     Json(input): Json<StatusInput>,
 ) -> Result<Json<ApiTask>, ApiError> {
-    let (auth, _) = auth_for_task(&state, &headers, &id).await?;
-    let project_id: String = state
-        .database
-        .client
-        .query_one("SELECT project_id FROM task WHERE id = $1", &[&id])
-        .await
-        .map_err(database_error)?
-        .try_get("project_id")
-        .map_err(database_error)?;
+    let (auth, workspace_id) = auth_for_task(&state, &headers, &id).await?;
+    let existing_task = task_by_id(&state.database, &id).await?;
+    let project_id = existing_task.project_id.clone();
     let column_id = column_for_status(&state.database, &project_id, &input.status).await?;
     state
         .database
@@ -3230,6 +3236,32 @@ async fn update_task_status(
         &auth,
         &headers,
     );
+    if existing_task.status != task.status {
+        if let Some(assignee_id) = task
+            .user_id
+            .as_deref()
+            .filter(|user_id| *user_id != auth.user_id)
+        {
+            let event_data = json!({
+                "taskTitle": task.title.clone(),
+                "oldStatus": existing_task.status,
+                "newStatus": task.status.clone(),
+                "projectId": task.project_id.clone(),
+                "workspaceId": workspace_id,
+            });
+            let _ = create_user_notification(
+                &state,
+                assignee_id,
+                None,
+                None,
+                "task_status_changed",
+                Some(&event_data),
+                Some(&task.id),
+                Some("task"),
+            )
+            .await?;
+        }
+    }
     Ok(Json(task))
 }
 
@@ -3324,7 +3356,7 @@ async fn create_task(
     Path(project_id): Path<String>,
     Json(input): Json<CreateTaskInput>,
 ) -> Result<Json<ApiTask>, ApiError> {
-    let (auth, _) = auth_for_project(&state, &headers, &project_id).await?;
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
     validate_priority(&input.priority)?;
     let column_id = column_for_status(&state.database, &project_id, &input.status).await?;
     let number: i32 = state
@@ -3388,6 +3420,28 @@ async fn create_task(
         &auth,
         &headers,
     );
+    if let Some(assignee_id) = input
+        .user_id
+        .as_deref()
+        .filter(|user_id| *user_id != auth.user_id)
+    {
+        let event_data = json!({
+            "taskTitle": task.title.clone(),
+            "projectId": task.project_id.clone(),
+            "workspaceId": workspace_id.clone(),
+        });
+        let _ = create_user_notification(
+            &state,
+            assignee_id,
+            None,
+            None,
+            "task_created",
+            Some(&event_data),
+            Some(&task.id),
+            Some("task"),
+        )
+        .await?;
+    }
     Ok(Json(task))
 }
 
@@ -3548,6 +3602,24 @@ async fn get_session(
         Err(error) if error.status == StatusCode::UNAUTHORIZED => Ok(Json(Value::Null)),
         Err(error) => Err(error),
     }
+}
+
+async fn get_oauth_id_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let id_token = state
+        .database
+        .client
+        .query_opt(
+            "SELECT id_token FROM account WHERE user_id = $1 AND provider_id = 'custom' LIMIT 1",
+            &[&auth.user_id],
+        )
+        .await
+        .map_err(database_error)?
+        .and_then(|row| row_optional_string(&row, "id_token").ok().flatten());
+    Ok(Json(json!({ "idToken": id_token })))
 }
 
 async fn list_organizations(
@@ -4471,7 +4543,7 @@ async fn create_comment(
     Path(task_id): Path<String>,
     Json(input): Json<CommentContentInput>,
 ) -> Result<Json<ActivityRecord>, ApiError> {
-    let (auth, _) = auth_for_task(&state, &headers, &task_id).await?;
+    let (auth, workspace_id) = auth_for_task(&state, &headers, &task_id).await?;
     let activity = insert_activity(
         &state,
         &task_id,
@@ -4485,11 +4557,46 @@ async fn create_comment(
     publish_task_event(
         &state,
         "COMMENT_UPDATED",
-        task.project_id,
-        task_id,
+        task.project_id.clone(),
+        task_id.clone(),
         &auth,
         &headers,
     );
+    if let Some(assignee_id) = task
+        .user_id
+        .as_deref()
+        .filter(|user_id| *user_id != auth.user_id)
+    {
+        let commenter_name = state
+            .database
+            .client
+            .query_opt(
+                "SELECT name FROM \"user\" WHERE id = $1 LIMIT 1",
+                &[&auth.user_id],
+            )
+            .await
+            .map_err(database_error)?
+            .and_then(|row| row.try_get::<_, String>("name").ok());
+        let comment_preview = input.content.chars().take(160).collect::<String>();
+        let event_data = json!({
+            "taskTitle": task.title.clone(),
+            "commenterName": commenter_name,
+            "commentPreview": comment_preview,
+            "projectId": task.project_id.clone(),
+            "workspaceId": workspace_id,
+        });
+        let _ = create_user_notification(
+            &state,
+            assignee_id,
+            None,
+            None,
+            "task_comment",
+            Some(&event_data),
+            Some(&task.id),
+            Some("task"),
+        )
+        .await?;
+    }
     Ok(Json(activity))
 }
 
@@ -5099,6 +5206,113 @@ async fn notifications_for_user(
     }
 }
 
+fn notification_preference_column(notification_type: &str) -> Option<&'static str> {
+    match notification_type {
+        "task_assignee_changed" | "task_created" => Some("task_assignment_enabled"),
+        "task_comment" | "task_mention" => Some("task_comment_enabled"),
+        "task_status_changed" => Some("task_status_change_enabled"),
+        "due_date_reminder" | "task_overdue" => Some("due_date_reminder_enabled"),
+        _ => None,
+    }
+}
+
+async fn create_user_notification(
+    state: &AppState,
+    user_id: &str,
+    title: Option<&str>,
+    content: Option<&str>,
+    notification_type: &str,
+    event_data: Option<&Value>,
+    resource_id: Option<&str>,
+    resource_type: Option<&str>,
+) -> Result<Option<Value>, ApiError> {
+    if let Some(preference_column) = notification_preference_column(notification_type) {
+        let preference = state
+            .database
+            .client
+            .query_opt(
+                r#"
+                  SELECT task_assignment_enabled, task_comment_enabled,
+                         task_status_change_enabled, due_date_reminder_enabled
+                  FROM user_notification_preference
+                  WHERE user_id = $1
+                  LIMIT 1
+                "#,
+                &[&user_id],
+            )
+            .await
+            .map_err(database_error)?;
+        if let Some(preference) = preference {
+            let enabled = preference
+                .try_get::<_, bool>(preference_column)
+                .map_err(database_error)?;
+            if !enabled {
+                return Ok(None);
+            }
+        }
+    }
+
+    let id = Uuid::new_v4().to_string();
+    let event_data_json = event_data.map(Value::to_string).unwrap_or_default();
+    let resource_id = resource_id.unwrap_or_default().to_string();
+    let resource_type = resource_type.unwrap_or_default().to_string();
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO notification
+                (id, user_id, title, content, type, event_data, is_read,
+                 resource_id, resource_type, created_at, updated_at)
+              VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')::jsonb, FALSE,
+                      NULLIF($7, ''), NULLIF($8, ''), NOW(), NOW())
+            "#,
+            &[
+                &id,
+                &user_id,
+                &title,
+                &content,
+                &notification_type,
+                &event_data_json,
+                &resource_id,
+                &resource_type,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    let _ = state.events.send(SocketEvent {
+        event_type: "NOTIFICATION_CREATED".to_string(),
+        project_id: None,
+        task_id: None,
+        source_task_id: None,
+        target_task_id: None,
+        initiator_id: None,
+    });
+    Ok(Some(
+        notifications_for_user(state, user_id, Some(&id)).await?,
+    ))
+}
+
+async fn create_notification(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateNotificationInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let notification = create_user_notification(
+        &state,
+        &auth.user_id,
+        input.title.as_deref(),
+        input.message.as_deref(),
+        &input.notification_type,
+        input.event_data.as_ref(),
+        input.related_entity_id.as_deref(),
+        input.related_entity_type.as_deref(),
+    )
+    .await?;
+    Ok(Json(notification.unwrap_or(Value::Null)))
+}
+
 async fn list_notifications(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5227,6 +5441,71 @@ async fn pending_invitations(
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(Json(Value::Array(rows)))
+}
+
+async fn public_invitation_details(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let row = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT i.id, i.email, w.name AS workspace_name, u.name AS inviter_name,
+                     to_char(i.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS expires_at,
+                     i.status, (i.expires_at < NOW()) AS expired
+              FROM invitation i
+              INNER JOIN workspace w ON w.id = i.workspace_id
+              INNER JOIN "user" u ON u.id = i.inviter_id
+              WHERE i.id = $1
+              LIMIT 1
+            "#,
+            &[&id],
+        )
+        .await
+        .map_err(database_error)?;
+    let Some(row) = row else {
+        return Ok(Json(json!({
+            "valid": false,
+            "error": "Invitation not found",
+        })));
+    };
+
+    let status = row_string(&row, "status")?;
+    let expired = row.try_get::<_, bool>("expired").map_err(database_error)?;
+    let invitation = json!({
+        "id": row_string(&row, "id")?,
+        "email": row_string(&row, "email")?,
+        "workspaceName": row_string(&row, "workspace_name")?,
+        "inviterName": row_string(&row, "inviter_name")?,
+        "expiresAt": row_string(&row, "expires_at")?,
+        "status": status,
+        "expired": expired,
+    });
+    if status == "accepted" {
+        return Ok(Json(json!({
+            "valid": false,
+            "error": "This invitation has already been accepted",
+        })));
+    }
+    if status == "canceled" {
+        return Ok(Json(json!({
+            "valid": false,
+            "error": "This invitation has been canceled",
+        })));
+    }
+    if expired {
+        return Ok(Json(json!({
+            "valid": false,
+            "invitation": invitation,
+            "error": "This invitation has expired",
+        })));
+    }
+    Ok(Json(json!({
+        "valid": true,
+        "invitation": invitation,
+    })))
 }
 
 fn billing_is_enabled() -> bool {
@@ -5760,6 +6039,7 @@ fn app(state: AppState) -> Router {
         .route("/api/public-project/{id}", get(get_public_project))
         .route("/api/search", get(global_search))
         .route("/api/auth/get-session", get(get_session))
+        .route("/api/oauth/id-token", get(get_oauth_id_token))
         .route("/api/auth/organization/list", get(list_organizations))
         .route("/api/auth/organization/list-members", get(list_members))
         .route(
@@ -5772,7 +6052,10 @@ fn app(state: AppState) -> Router {
         )
         .route("/api/ws/user", get(user_socket))
         .route("/api/ws/{project_id}", get(project_socket))
-        .route("/api/notification", get(list_notifications))
+        .route(
+            "/api/notification",
+            get(list_notifications).post(create_notification),
+        )
         .route(
             "/api/notification/{id}/read",
             patch(mark_notification_as_read),
@@ -5783,6 +6066,10 @@ fn app(state: AppState) -> Router {
         )
         .route("/api/notification/clear-all", delete(clear_notifications))
         .route("/api/invitation/pending", get(pending_invitations))
+        .route(
+            "/api/invitation/public/{id}",
+            get(public_invitation_details),
+        )
         .route("/api/billing/{workspace_id}", get(get_workspace_billing))
         .route(
             "/api/workspace/{workspace_id}/members",

@@ -59,8 +59,9 @@ agent runner, authenticated PostgreSQL board API, project/column CRUD,
 public-project reads, workspace members, workflow rules, global search, labels,
 task mutations, external links, activity/comments, task relations, time
 entries, organization membership and permission reads, notifications, pending
-invitations, workspace billing state, and live project WebSockets, plus a
-native Tauri shell.
+invitations, public invitation details, custom-OAuth id-token reads, workspace
+billing state, native notification creation, and live project WebSockets, plus
+a native Tauri shell.
 Packaged Linux desktop builds start the Rust API by default; the legacy
 TypeScript API remains on a private compatibility port for routes that have
 not moved yet, and can be selected explicitly with `KANEO_API_RUNTIME=node`.

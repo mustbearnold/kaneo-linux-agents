@@ -10,9 +10,12 @@ CRUD, public-project reads, workspace member reads, workflow-rule CRUD, global
 search, label CRUD and assignment, task label reads, external-link reads,
 activity and comment CRUD, task-relation CRUD, time-entry CRUD, organization
 membership and permission reads, notification inbox operations, pending
-invitations, and workspace billing state. Task, comment, relation, label, and
-time-entry mutations publish filtered events to connected project boards, so an
-agent changing a task is visible without waiting for a polling cycle.
+invitations and public invitation details, custom-OAuth id-token reads, and
+workspace billing state. Native notification creation applies the same task
+preference gates and emits the user-socket invalidation event. Task, comment,
+relation, label, and time-entry mutations publish filtered events to connected
+project boards, so an agent changing a task is visible without waiting for a
+polling cycle.
 
 The current TypeScript API remains a compatibility runtime while feature parity
 is built in Rust. In packaged Electron builds it runs privately on port 1338;
