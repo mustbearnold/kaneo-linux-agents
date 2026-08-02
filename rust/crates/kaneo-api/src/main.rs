@@ -23,7 +23,7 @@ use kaneo_core::{AgentRun, AgentSpec, RunManager, RunStatus, RunnerConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
@@ -169,6 +169,20 @@ struct BoardQuery {
     due_before: Option<String>,
     #[serde(rename = "dueAfter")]
     due_after: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SearchQuery {
+    q: Option<String>,
+    #[serde(rename = "type")]
+    result_type: Option<String>,
+    #[serde(rename = "workspaceId")]
+    workspace_id: Option<String>,
+    #[serde(rename = "projectId")]
+    project_id: Option<String>,
+    limit: Option<usize>,
+    #[serde(rename = "userEmail")]
+    _user_email: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,6 +373,49 @@ struct UpdateLabelInput {
 #[serde(rename_all = "camelCase")]
 struct AttachLabelInput {
     task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowRuleInput {
+    integration_type: String,
+    event_type: String,
+    column_id: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SearchResult {
+    id: String,
+    #[serde(rename = "type")]
+    result_type: String,
+    title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_name: Option<String>,
+    created_at: String,
+    relevance_score: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_number: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -949,6 +1006,61 @@ async fn require_workspace(
     Ok(())
 }
 
+async fn require_workspace_permission(
+    state: &AppState,
+    auth: &AuthContext,
+    workspace_id: &str,
+    resource: &str,
+    action: &str,
+) -> Result<(), ApiError> {
+    require_workspace(state, auth, workspace_id).await?;
+    if auth.is_admin() {
+        return Ok(());
+    }
+
+    let role = state
+        .database
+        .client
+        .query_opt(
+            "SELECT role FROM workspace_member WHERE workspace_id = $1 AND user_id = $2 LIMIT 1",
+            &[&workspace_id, &auth.user_id],
+        )
+        .await
+        .map_err(database_error)?
+        .and_then(|row| row.try_get::<_, String>("role").ok())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "You don't have access to this workspace",
+            )
+        })?;
+
+    let granted = state
+        .database
+        .client
+        .query_opt(
+            "SELECT permission FROM workspace_role WHERE workspace_id = $1 AND role = $2 LIMIT 1",
+            &[&workspace_id, &role],
+        )
+        .await
+        .map_err(database_error)?
+        .and_then(|row| row_optional_string(&row, "permission").ok().flatten())
+        .and_then(|raw| serde_json::from_str::<HashMap<String, Vec<String>>>(&raw).ok())
+        .unwrap_or_else(|| built_in_permissions(&role));
+
+    let allowed = granted
+        .get(resource)
+        .is_some_and(|actions| actions.iter().any(|value| value == action));
+    if allowed {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Insufficient permissions",
+        ))
+    }
+}
+
 fn cookie_credential(headers: &HeaderMap) -> Option<String> {
     let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
     cookie.split(';').find_map(|part| {
@@ -1106,6 +1218,34 @@ async fn config() -> Json<Value> {
             && env_present("CREEM_API_KEY")
             && env_present("CREEM_WEBHOOK_SECRET"),
     }))
+}
+
+async fn instance_status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let has_users = state
+        .database
+        .client
+        .query_one("SELECT COUNT(*)::bigint AS count FROM \"user\"", &[])
+        .await
+        .map_err(database_error)?
+        .try_get::<_, i64>("count")
+        .map_err(database_error)?
+        > 0;
+    let has_admin = state
+        .database
+        .client
+        .query_one(
+            "SELECT COUNT(*)::bigint AS count FROM \"user\" WHERE role = 'admin'",
+            &[],
+        )
+        .await
+        .map_err(database_error)?
+        .try_get::<_, i64>("count")
+        .map_err(database_error)?
+        > 0;
+    Ok(Json(json!({
+        "hasUsers": has_users,
+        "hasAdmin": has_admin,
+    })))
 }
 
 async fn rust_status(State(state): State<AppState>) -> Json<Value> {
@@ -2029,6 +2169,700 @@ async fn get_project(
         "isPublic": row.try_get::<_, bool>("is_public").map_err(database_error)?,
         "tasks": tasks,
     })))
+}
+
+async fn get_public_project(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<BoardQuery>,
+) -> Result<Json<BoardResponse>, ApiError> {
+    let board = load_board(&state, &id, &query).await?;
+    if !board.data.is_public {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Project is not public",
+        ));
+    }
+    Ok(Json(board))
+}
+
+async fn list_workspace_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace(&state, &auth, &workspace_id).await?;
+    let rows = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT u.id, u.name, u.email, u.image, m.role
+              FROM workspace_member m
+              INNER JOIN "user" u ON u.id = m.user_id
+              WHERE m.workspace_id = $1
+              ORDER BY u.name ASC, u.email ASC
+            "#,
+            &[&workspace_id],
+        )
+        .await
+        .map_err(database_error)?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(json!({
+                "id": row_string(&row, "id")?,
+                "name": row_string(&row, "name")?,
+                "email": row_string(&row, "email")?,
+                "image": row_optional_string(&row, "image")?,
+                "role": row_string(&row, "role")?,
+            }))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()
+        .map(Json)
+}
+
+fn search_task_from_row(row: &Row, relevance_score: i32) -> Result<SearchResult, ApiError> {
+    Ok(SearchResult {
+        id: row_string(row, "id")?,
+        result_type: "task".to_string(),
+        title: row_string(row, "title")?,
+        description: row_optional_string(row, "description")?,
+        content: None,
+        project_id: row_optional_string(row, "project_id")?,
+        project_name: row_optional_string(row, "project_name")?,
+        workspace_id: row_optional_string(row, "workspace_id")?,
+        workspace_name: row_optional_string(row, "workspace_name")?,
+        user_id: row_optional_string(row, "user_id")?,
+        user_name: row_optional_string(row, "user_name")?,
+        created_at: row_string(row, "created_at")?,
+        relevance_score,
+        task_number: row_optional_i32(row, "task_number")?,
+        project_slug: row_optional_string(row, "project_slug")?,
+        priority: row_optional_string(row, "priority")?,
+        status: row_optional_string(row, "status")?,
+    })
+}
+
+fn search_project_from_row(row: &Row, relevance_score: i32) -> Result<SearchResult, ApiError> {
+    Ok(SearchResult {
+        id: row_string(row, "id")?,
+        result_type: "project".to_string(),
+        title: row_string(row, "name")?,
+        description: row_optional_string(row, "description")?,
+        content: None,
+        project_id: Some(row_string(row, "id")?),
+        project_name: row_optional_string(row, "name")?,
+        workspace_id: row_optional_string(row, "workspace_id")?,
+        workspace_name: row_optional_string(row, "workspace_name")?,
+        user_id: None,
+        user_name: None,
+        created_at: row_string(row, "created_at")?,
+        relevance_score,
+        task_number: None,
+        project_slug: row_optional_string(row, "slug")?,
+        priority: None,
+        status: None,
+    })
+}
+
+fn search_workspace_from_row(row: &Row, relevance_score: i32) -> Result<SearchResult, ApiError> {
+    Ok(SearchResult {
+        id: row_string(row, "id")?,
+        result_type: "workspace".to_string(),
+        title: row_string(row, "name")?,
+        description: row_optional_string(row, "description")?,
+        content: None,
+        project_id: None,
+        project_name: None,
+        workspace_id: Some(row_string(row, "id")?),
+        workspace_name: Some(row_string(row, "name")?),
+        user_id: None,
+        user_name: None,
+        created_at: row_string(row, "created_at")?,
+        relevance_score,
+        task_number: None,
+        project_slug: None,
+        priority: None,
+        status: None,
+    })
+}
+
+fn to_display_case(value: &str) -> String {
+    value
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .map(|part| {
+            let mut chars = part.chars();
+            let first = chars
+                .next()
+                .map(|character| character.to_uppercase().collect::<String>())
+                .unwrap_or_default();
+            format!("{first}{}", chars.as_str().to_lowercase())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn event_value_string(data: &serde_json::Map<String, Value>, key: &str, fallback: &str) -> String {
+    data.get(key)
+        .map(|value| match value {
+            Value::String(value) => value.clone(),
+            Value::Bool(value) => value.to_string(),
+            Value::Number(value) => value.to_string(),
+            _ => fallback.to_string(),
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn activity_search_content(
+    activity_type: &str,
+    content: Option<String>,
+    event_data: Option<String>,
+) -> Option<String> {
+    if content.as_ref().is_some_and(|value| !value.is_empty()) {
+        return content;
+    }
+    let data = event_data
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| value.as_object().cloned());
+    let Some(data) = data else {
+        return None;
+    };
+    match activity_type {
+        "status_changed" => Some(format!(
+            "changed status from {} to {}",
+            to_display_case(&event_value_string(&data, "oldStatus", "")),
+            to_display_case(&event_value_string(&data, "newStatus", "")),
+        )),
+        "priority_changed" => Some(format!(
+            "changed priority from {} to {}",
+            to_display_case(&event_value_string(&data, "oldPriority", "")),
+            to_display_case(&event_value_string(&data, "newPriority", "")),
+        )),
+        "unassigned" => Some("unassigned the task".to_string()),
+        "assignee_changed" => {
+            if data
+                .get("isSelfAssigned")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                Some("assigned the task to themselves".to_string())
+            } else {
+                Some(format!(
+                    "assigned the task to {}",
+                    event_value_string(&data, "newAssignee", "someone")
+                ))
+            }
+        }
+        "due_date_changed" => {
+            let new_due_date = event_value_string(&data, "newDueDate", "");
+            let old_due_date = event_value_string(&data, "oldDueDate", "");
+            if new_due_date.is_empty() {
+                Some("cleared the due date".to_string())
+            } else if old_due_date.is_empty() {
+                Some(format!("set due date to {new_due_date}"))
+            } else {
+                Some(format!(
+                    "changed due date from {old_due_date} to {new_due_date}"
+                ))
+            }
+        }
+        "title_changed" => Some(format!(
+            "changed title from \"{}\" to \"{}\"",
+            event_value_string(&data, "oldTitle", ""),
+            event_value_string(&data, "newTitle", "")
+        )),
+        "task" => Some("created the task".to_string()),
+        _ => None,
+    }
+}
+
+fn parse_short_task_id(value: &str) -> Option<(String, i32)> {
+    let (prefix, number) = value.rsplit_once('-')?;
+    let first = prefix.chars().next()?;
+    if !first.is_ascii_alphabetic()
+        || !prefix.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
+        || number.is_empty()
+        || !number.chars().all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((prefix.to_string(), number.parse().ok()?))
+}
+
+async fn global_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let search_query = query
+        .q
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Query must be at least 1 character",
+            )
+        })?;
+    let result_type = query.result_type.as_deref().unwrap_or("all");
+    if !matches!(
+        result_type,
+        "all" | "tasks" | "projects" | "workspaces" | "comments" | "activities"
+    ) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid search type",
+        ));
+    }
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=50).contains(&limit) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Limit must be between 1 and 50",
+        ));
+    }
+    let workspace_id = query.workspace_id.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Workspace ID could not be determined",
+        )
+    })?;
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace(&state, &auth, &workspace_id).await?;
+
+    let pattern = format!("%{}%", search_query.to_lowercase());
+    let project_filter = query.project_id.clone();
+    let limit_i64 = limit as i64;
+    let mut results = Vec::new();
+
+    if matches!(result_type, "all" | "tasks") {
+        let mut seen_task_ids = HashSet::new();
+        if let Some((slug, task_number)) = parse_short_task_id(&search_query) {
+            let rows = state
+                .database
+                .client
+                .query(
+                    r#"
+                      SELECT t.id, t.title, t.description, t.project_id,
+                             p.name AS project_name, p.slug AS project_slug,
+                             p.workspace_id, w.name AS workspace_name,
+                             t.assignee_id AS user_id, u.name AS user_name,
+                             to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                             t.number AS task_number, t.priority, t.status
+                      FROM task t
+                      INNER JOIN project p ON p.id = t.project_id
+                      LEFT JOIN workspace w ON w.id = p.workspace_id
+                      LEFT JOIN "user" u ON u.id = t.assignee_id
+                      WHERE p.workspace_id = $1
+                        AND ($4::text IS NULL OR t.project_id = $4)
+                        AND p.slug ILIKE $2
+                        AND t.number = $3
+                      LIMIT 1
+                    "#,
+                    &[&workspace_id, &slug, &task_number, &project_filter],
+                )
+                .await
+                .map_err(database_error)?;
+            for row in rows {
+                let task = search_task_from_row(&row, 10)?;
+                seen_task_ids.insert(task.id.clone());
+                results.push(task);
+            }
+        }
+
+        let rows = state
+            .database
+            .client
+            .query(
+                r#"
+                  SELECT t.id, t.title, t.description, t.project_id,
+                         p.name AS project_name, p.slug AS project_slug,
+                         p.workspace_id, w.name AS workspace_name,
+                         t.assignee_id AS user_id, u.name AS user_name,
+                         to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                         t.number AS task_number, t.priority, t.status,
+                         CASE
+                           WHEN LOWER(t.title) LIKE $3 THEN 3
+                           WHEN LOWER(t.description) LIKE $3 THEN 2
+                           ELSE 1
+                         END AS relevance_score
+                  FROM task t
+                  INNER JOIN project p ON p.id = t.project_id
+                  LEFT JOIN workspace w ON w.id = p.workspace_id
+                  LEFT JOIN "user" u ON u.id = t.assignee_id
+                  WHERE p.workspace_id = $1
+                    AND ($2::text IS NULL OR t.project_id = $2)
+                    AND (t.title ILIKE $3 OR t.description ILIKE $3)
+                  ORDER BY relevance_score DESC, t.created_at DESC
+                  LIMIT $4
+                "#,
+                &[&workspace_id, &project_filter, &pattern, &limit_i64],
+            )
+            .await
+            .map_err(database_error)?;
+        for row in rows {
+            let task_id = row_string(&row, "id")?;
+            if seen_task_ids.contains(&task_id) {
+                continue;
+            }
+            let relevance_score = row.try_get("relevance_score").map_err(database_error)?;
+            results.push(search_task_from_row(&row, relevance_score)?);
+        }
+    }
+
+    if matches!(result_type, "all" | "projects") {
+        let rows = state
+            .database
+            .client
+            .query(
+                r#"
+                  SELECT p.id, p.name, p.description, p.slug, p.workspace_id,
+                         w.name AS workspace_name,
+                         to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                         CASE
+                           WHEN LOWER(p.name) LIKE $2 THEN 3
+                           WHEN LOWER(p.description) LIKE $2 THEN 2
+                           ELSE 1
+                         END AS relevance_score
+                  FROM project p
+                  LEFT JOIN workspace w ON w.id = p.workspace_id
+                  WHERE p.workspace_id = $1
+                    AND (p.name ILIKE $2 OR p.description ILIKE $2)
+                  ORDER BY relevance_score DESC, p.created_at DESC
+                  LIMIT $3
+                "#,
+                &[&workspace_id, &pattern, &limit_i64],
+            )
+            .await
+            .map_err(database_error)?;
+        for row in rows {
+            let relevance_score = row.try_get("relevance_score").map_err(database_error)?;
+            results.push(search_project_from_row(&row, relevance_score)?);
+        }
+    }
+
+    if matches!(result_type, "all" | "workspaces") {
+        let rows = state
+            .database
+            .client
+            .query(
+                r#"
+                  SELECT id, name, description,
+                         to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                         CASE
+                           WHEN LOWER(name) LIKE $2 THEN 3
+                           WHEN LOWER(description) LIKE $2 THEN 2
+                           ELSE 1
+                         END AS relevance_score
+                  FROM workspace
+                  WHERE id = $1
+                    AND (name ILIKE $2 OR description ILIKE $2)
+                  ORDER BY relevance_score DESC, created_at DESC
+                  LIMIT $3
+                "#,
+                &[&workspace_id, &pattern, &limit_i64],
+            )
+            .await
+            .map_err(database_error)?;
+        for row in rows {
+            let relevance_score = row.try_get("relevance_score").map_err(database_error)?;
+            results.push(search_workspace_from_row(&row, relevance_score)?);
+        }
+    }
+
+    if matches!(result_type, "all" | "comments" | "activities") {
+        let type_filter = if result_type == "comments" {
+            "AND a.type = 'comment'"
+        } else {
+            ""
+        };
+        let sql = format!(
+            r#"
+              SELECT a.id, a.type, a.content, a.event_data::text AS event_data,
+                     t.title AS task_title, t.number AS task_number,
+                     p.id AS project_id, p.name AS project_name, p.slug AS project_slug,
+                     p.workspace_id, w.name AS workspace_name,
+                     a.user_id, u.name AS user_name,
+                     to_char(a.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     CASE
+                       WHEN LOWER(COALESCE(a.content, a.event_data::text, '')) LIKE $3 THEN 2
+                       WHEN LOWER(t.title) LIKE $3 THEN 1
+                       ELSE 1
+                     END AS relevance_score
+              FROM activity a
+              INNER JOIN task t ON t.id = a.task_id
+              INNER JOIN project p ON p.id = t.project_id
+              LEFT JOIN workspace w ON w.id = p.workspace_id
+              LEFT JOIN "user" u ON u.id = a.user_id
+              WHERE p.workspace_id = $1
+                AND ($2::text IS NULL OR t.project_id = $2)
+                AND (
+                  COALESCE(a.content, a.event_data::text, '') ILIKE $3
+                  OR t.title ILIKE $3
+                )
+                {type_filter}
+              ORDER BY relevance_score DESC, a.created_at DESC
+              LIMIT $4
+            "#,
+        );
+        let rows = state
+            .database
+            .client
+            .query(
+                &sql,
+                &[&workspace_id, &project_filter, &pattern, &limit_i64],
+            )
+            .await
+            .map_err(database_error)?;
+        for row in rows {
+            let activity_type = row_string(&row, "type")?;
+            let is_comment = activity_type == "comment";
+            let task_title = row_optional_string(&row, "task_title")?;
+            let result = SearchResult {
+                id: row_string(&row, "id")?,
+                result_type: if is_comment {
+                    "comment".to_string()
+                } else {
+                    "activity".to_string()
+                },
+                title: if is_comment {
+                    format!("Comment on {}", task_title.as_deref().unwrap_or("task"))
+                } else {
+                    format!(
+                        "{} on {}",
+                        activity_type,
+                        task_title.as_deref().unwrap_or("task")
+                    )
+                },
+                description: None,
+                content: activity_search_content(
+                    &activity_type,
+                    row_optional_string(&row, "content")?,
+                    row_optional_string(&row, "event_data")?,
+                ),
+                project_id: row_optional_string(&row, "project_id")?,
+                project_name: row_optional_string(&row, "project_name")?,
+                workspace_id: row_optional_string(&row, "workspace_id")?,
+                workspace_name: row_optional_string(&row, "workspace_name")?,
+                user_id: row_optional_string(&row, "user_id")?,
+                user_name: row_optional_string(&row, "user_name")?,
+                created_at: row_string(&row, "created_at")?,
+                relevance_score: row.try_get("relevance_score").map_err(database_error)?,
+                task_number: row_optional_i32(&row, "task_number")?,
+                project_slug: row_optional_string(&row, "project_slug")?,
+                priority: None,
+                status: None,
+            };
+            results.push(result);
+        }
+    }
+
+    results.sort_by(|left, right| {
+        right
+            .relevance_score
+            .cmp(&left.relevance_score)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+    });
+    let total_count = results.len();
+    results.truncate(limit);
+
+    Ok(Json(json!({
+        "results": results,
+        "totalCount": total_count,
+        "searchQuery": search_query,
+    })))
+}
+
+async fn workflow_rule_project(state: &AppState, rule_id: &str) -> Result<String, ApiError> {
+    state
+        .database
+        .client
+        .query_opt(
+            "SELECT project_id FROM workflow_rule WHERE id = $1 LIMIT 1",
+            &[&rule_id],
+        )
+        .await
+        .map_err(database_error)?
+        .map(|row| row_string(&row, "project_id"))
+        .transpose()?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Workflow rule not found"))
+}
+
+async fn workflow_rule_record(state: &AppState, rule_id: &str) -> Result<Value, ApiError> {
+    let row = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT id, project_id, integration_type, event_type, column_id,
+                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+              FROM workflow_rule
+              WHERE id = $1
+              LIMIT 1
+            "#,
+            &[&rule_id],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Workflow rule not found"))?;
+    Ok(json!({
+        "id": row_string(&row, "id")?,
+        "projectId": row_string(&row, "project_id")?,
+        "integrationType": row_string(&row, "integration_type")?,
+        "eventType": row_string(&row, "event_type")?,
+        "columnId": row_string(&row, "column_id")?,
+        "createdAt": row_string(&row, "created_at")?,
+        "updatedAt": row_string(&row, "updated_at")?,
+    }))
+}
+
+async fn list_workflow_rules(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let _ = auth_for_project(&state, &headers, &project_id).await?;
+    let rows = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT r.id, r.project_id, r.integration_type, r.event_type, r.column_id,
+                     c.name AS column_name, c.slug AS column_slug,
+                     to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     to_char(r.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+              FROM workflow_rule r
+              LEFT JOIN "column" c ON c.id = r.column_id
+              WHERE r.project_id = $1
+              ORDER BY r.created_at ASC
+            "#,
+            &[&project_id],
+        )
+        .await
+        .map_err(database_error)?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(json!({
+                "id": row_string(&row, "id")?,
+                "projectId": row_string(&row, "project_id")?,
+                "integrationType": row_string(&row, "integration_type")?,
+                "eventType": row_string(&row, "event_type")?,
+                "columnId": row_string(&row, "column_id")?,
+                "columnName": row_optional_string(&row, "column_name")?,
+                "columnSlug": row_optional_string(&row, "column_slug")?,
+                "createdAt": row_string(&row, "created_at")?,
+                "updatedAt": row_string(&row, "updated_at")?,
+            }))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()
+        .map(Json)
+}
+
+async fn upsert_workflow_rule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<WorkflowRuleInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "project", "update").await?;
+
+    let column_exists = state
+        .database
+        .client
+        .query_opt(
+            "SELECT 1 FROM \"column\" WHERE id = $1 AND project_id = $2 LIMIT 1",
+            &[&input.column_id, &project_id],
+        )
+        .await
+        .map_err(database_error)?
+        .is_some();
+    if !column_exists {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Column does not belong to the provided project",
+        ));
+    }
+
+    let existing = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT id FROM workflow_rule
+              WHERE project_id = $1 AND integration_type = $2 AND event_type = $3
+              LIMIT 1
+            "#,
+            &[&project_id, &input.integration_type, &input.event_type],
+        )
+        .await
+        .map_err(database_error)?;
+    let rule_id = if let Some(row) = existing {
+        let rule_id = row_string(&row, "id")?;
+        state
+            .database
+            .client
+            .execute(
+                "UPDATE workflow_rule SET column_id = $1, updated_at = NOW() WHERE id = $2",
+                &[&input.column_id, &rule_id],
+            )
+            .await
+            .map_err(database_error)?;
+        rule_id
+    } else {
+        let rule_id = Uuid::new_v4().to_string();
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  INSERT INTO workflow_rule
+                    (id, project_id, integration_type, event_type, column_id, created_at, updated_at)
+                  VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+                "#,
+                &[
+                    &rule_id,
+                    &project_id,
+                    &input.integration_type,
+                    &input.event_type,
+                    &input.column_id,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        rule_id
+    };
+
+    Ok(Json(workflow_rule_record(&state, &rule_id).await?))
+}
+
+async fn delete_workflow_rule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let project_id = workflow_rule_project(&state, &id).await?;
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "project", "update").await?;
+    let existing = workflow_rule_record(&state, &id).await?;
+    let deleted = state
+        .database
+        .client
+        .execute("DELETE FROM workflow_rule WHERE id = $1", &[&id])
+        .await
+        .map_err(database_error)?;
+    if deleted == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Workflow rule not found",
+        ));
+    }
+    Ok(Json(existing))
 }
 
 async fn list_columns(
@@ -4921,7 +5755,10 @@ fn app(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/config", get(config))
+        .route("/api/instance/status", get(instance_status))
         .route("/api/rust/status", get(rust_status))
+        .route("/api/public-project/{id}", get(get_public_project))
+        .route("/api/search", get(global_search))
         .route("/api/auth/get-session", get(get_session))
         .route("/api/auth/organization/list", get(list_organizations))
         .route("/api/auth/organization/list-members", get(list_members))
@@ -4947,6 +5784,10 @@ fn app(state: AppState) -> Router {
         .route("/api/notification/clear-all", delete(clear_notifications))
         .route("/api/invitation/pending", get(pending_invitations))
         .route("/api/billing/{workspace_id}", get(get_workspace_billing))
+        .route(
+            "/api/workspace/{workspace_id}/members",
+            get(list_workspace_members),
+        )
         .route("/api/label/task/{task_id}", get(list_task_labels))
         .route(
             "/api/label/workspace/{workspace_id}",
@@ -5007,6 +5848,12 @@ fn app(state: AppState) -> Router {
                 .delete(delete_column),
         )
         .route("/api/column/reorder/{project_id}", put(reorder_columns))
+        .route(
+            "/api/workflow-rule/{project_id}",
+            get(list_workflow_rules)
+                .put(upsert_workflow_rule)
+                .delete(delete_workflow_rule),
+        )
         .route("/api/task/tasks/{project_id}", get(list_tasks))
         .route(
             "/api/task/{id}",

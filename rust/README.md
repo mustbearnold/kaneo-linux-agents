@@ -6,7 +6,8 @@ an authenticated PostgreSQL HTTP runtime for the board and task flows, and a
 Tauri desktop shell that starts the Rust API and can serve the built web app.
 
 The Rust API also owns the board's live project WebSocket, project and column
-CRUD, label CRUD and assignment, task label reads, external-link reads,
+CRUD, public-project reads, workspace member reads, workflow-rule CRUD, global
+search, label CRUD and assignment, task label reads, external-link reads,
 activity and comment CRUD, task-relation CRUD, time-entry CRUD, organization
 membership and permission reads, notification inbox operations, pending
 invitations, and workspace billing state. Task, comment, relation, label, and
