@@ -108,6 +108,7 @@ struct AppState {
     database: Database,
     runner: RunManager,
     http: reqwest::Client,
+    api_base_url: String,
     legacy_api_url: Option<String>,
     events: broadcast::Sender<SocketEvent>,
 }
@@ -2575,6 +2576,1070 @@ async fn delete_generic_webhook_integration(
         .await
         .map_err(database_error)?;
     Ok(Json(json!({ "success": true })))
+}
+
+fn mcp_object_schema(properties: Value, required: &[&str]) -> Value {
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+    })
+}
+
+fn mcp_string_schema() -> Value {
+    json!({ "type": "string", "minLength": 1 })
+}
+
+fn mcp_optional_string_schema() -> Value {
+    json!({ "type": "string" })
+}
+
+fn mcp_tool_definitions() -> Value {
+    let string = mcp_string_schema();
+    let optional_string = mcp_optional_string_schema();
+    let priority = json!({
+        "type": "string",
+        "enum": ["no-priority", "low", "medium", "high", "urgent"],
+    });
+    let date_time = json!({ "type": "string", "format": "date-time" });
+    Value::Array(vec![
+        json!({
+            "name": "whoami",
+            "description": "Return the current Kaneo session and user.",
+            "inputSchema": mcp_object_schema(json!({}), &[]),
+        }),
+        json!({
+            "name": "list_workspaces",
+            "description": "List workspaces the signed-in user can access.",
+            "inputSchema": mcp_object_schema(json!({}), &[]),
+        }),
+        json!({
+            "name": "list_projects",
+            "description": "List projects in a workspace.",
+            "inputSchema": mcp_object_schema(json!({
+                "workspaceId": string,
+                "includeArchived": {"type": "boolean"},
+            }), &["workspaceId"]),
+        }),
+        json!({
+            "name": "get_project",
+            "description": "Get a single project by ID.",
+            "inputSchema": mcp_object_schema(json!({"id": string}), &["id"]),
+        }),
+        json!({
+            "name": "create_project",
+            "description": "Create a project in a workspace.",
+            "inputSchema": mcp_object_schema(json!({
+                "name": string,
+                "workspaceId": string,
+                "icon": string,
+                "slug": string,
+            }), &["name", "workspaceId", "icon", "slug"]),
+        }),
+        json!({
+            "name": "update_project",
+            "description": "Update project metadata; omitted fields are preserved.",
+            "inputSchema": mcp_object_schema(json!({
+                "id": string,
+                "name": optional_string,
+                "icon": {"type": "string"},
+                "slug": optional_string,
+                "description": {"type": "string"},
+                "isPublic": {"type": "boolean"},
+            }), &["id"]),
+        }),
+        json!({
+            "name": "list_tasks",
+            "description": "List tasks for a project with optional filters and sorting.",
+            "inputSchema": mcp_object_schema(json!({
+                "projectId": string,
+                "status": optional_string,
+                "priority": priority,
+                "assigneeId": optional_string,
+                "page": {"type": "integer", "minimum": 1},
+                "limit": {"type": "integer", "minimum": 1},
+                "sortBy": {"type": "string"},
+                "sortOrder": {"type": "string", "enum": ["asc", "desc"]},
+                "dueBefore": date_time,
+                "dueAfter": date_time,
+            }), &["projectId"]),
+        }),
+        json!({
+            "name": "get_task",
+            "description": "Get a task by ID.",
+            "inputSchema": mcp_object_schema(json!({"taskId": string}), &["taskId"]),
+        }),
+        json!({
+            "name": "create_task",
+            "description": "Create a task in a project.",
+            "inputSchema": mcp_object_schema(json!({
+                "projectId": string,
+                "title": string,
+                "description": {"type": "string"},
+                "priority": priority,
+                "status": string,
+                "startDate": date_time,
+                "dueDate": date_time,
+                "userId": optional_string,
+            }), &["projectId", "title", "description", "priority", "status"]),
+        }),
+        json!({
+            "name": "update_task",
+            "description": "Update a task; omitted fields are preserved.",
+            "inputSchema": mcp_object_schema(json!({
+                "taskId": string,
+                "title": optional_string,
+                "description": {"type": ["string", "null"]},
+                "status": optional_string,
+                "priority": priority,
+                "projectId": optional_string,
+                "position": {"type": "number"},
+                "startDate": {"type": ["string", "null"], "format": "date-time"},
+                "dueDate": {"type": ["string", "null"], "format": "date-time"},
+                "userId": {"type": ["string", "null"]},
+            }), &["taskId"]),
+        }),
+        json!({
+            "name": "move_task",
+            "description": "Move a task to another project and optional status.",
+            "inputSchema": mcp_object_schema(json!({
+                "taskId": string,
+                "destinationProjectId": string,
+                "destinationStatus": optional_string,
+            }), &["taskId", "destinationProjectId"]),
+        }),
+        json!({
+            "name": "update_task_status",
+            "description": "Update only the status of a task.",
+            "inputSchema": mcp_object_schema(json!({"taskId": string, "status": string}), &["taskId", "status"]),
+        }),
+        json!({
+            "name": "list_task_comments",
+            "description": "List comments on a task.",
+            "inputSchema": mcp_object_schema(json!({"taskId": string}), &["taskId"]),
+        }),
+        json!({
+            "name": "create_task_comment",
+            "description": "Add a comment to a task.",
+            "inputSchema": mcp_object_schema(json!({"taskId": string, "content": string}), &["taskId", "content"]),
+        }),
+        json!({
+            "name": "update_task_comment",
+            "description": "Update one of your comments on a task.",
+            "inputSchema": mcp_object_schema(json!({"commentId": string, "content": string}), &["commentId", "content"]),
+        }),
+        json!({
+            "name": "delete_task_comment",
+            "description": "Delete one of your comments from a task.",
+            "inputSchema": mcp_object_schema(json!({"commentId": string}), &["commentId"]),
+        }),
+        json!({
+            "name": "list_workspace_labels",
+            "description": "List labels defined in a workspace.",
+            "inputSchema": mcp_object_schema(json!({"workspaceId": string}), &["workspaceId"]),
+        }),
+        json!({
+            "name": "create_label",
+            "description": "Create a label in a workspace, optionally attached to a task.",
+            "inputSchema": mcp_object_schema(json!({
+                "name": string,
+                "color": {"type": "string", "pattern": "^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$"},
+                "workspaceId": string,
+                "taskId": optional_string,
+            }), &["name", "color", "workspaceId"]),
+        }),
+        json!({
+            "name": "attach_label_to_task",
+            "description": "Attach an existing label to a task.",
+            "inputSchema": mcp_object_schema(json!({"labelId": string, "taskId": string}), &["labelId", "taskId"]),
+        }),
+        json!({
+            "name": "detach_label_from_task",
+            "description": "Detach a label from its current task.",
+            "inputSchema": mcp_object_schema(json!({"labelId": string}), &["labelId"]),
+        }),
+        json!({
+            "name": "create_task_relation",
+            "description": "Create a subtask, blocks, or related relation between tasks.",
+            "inputSchema": mcp_object_schema(json!({
+                "sourceTaskId": string,
+                "targetTaskId": string,
+                "relationType": {"type": "string", "enum": ["subtask", "blocks", "related"]},
+            }), &["sourceTaskId", "targetTaskId", "relationType"]),
+        }),
+        json!({
+            "name": "get_task_relations",
+            "description": "List all relations involving a task.",
+            "inputSchema": mcp_object_schema(json!({"taskId": string}), &["taskId"]),
+        }),
+        json!({
+            "name": "delete_task_relation",
+            "description": "Delete a task relation by relation ID.",
+            "inputSchema": mcp_object_schema(json!({"id": string}), &["id"]),
+        }),
+        json!({
+            "name": "delete_label",
+            "description": "Delete a task-associated label by ID.",
+            "inputSchema": mcp_object_schema(json!({"id": string}), &["id"]),
+        }),
+    ])
+}
+
+fn mcp_path_segment(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+fn mcp_query(pairs: &[(&str, String)]) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in pairs {
+        serializer.append_pair(key, value);
+    }
+    serializer.finish()
+}
+
+fn mcp_required_string(args: &Value, key: &str) -> Result<String, String> {
+    match args.get(key) {
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(value.clone()),
+        Some(Value::String(_)) => Err(format!("{key} must not be empty")),
+        Some(_) => Err(format!("{key} must be a string")),
+        None => Err(format!("Missing required argument: {key}")),
+    }
+}
+
+fn mcp_required_text(args: &Value, key: &str) -> Result<String, String> {
+    match args.get(key) {
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(format!("{key} must be a string")),
+        None => Err(format!("Missing required argument: {key}")),
+    }
+}
+
+fn mcp_optional_string(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(Value::String(_)) => Err(format!("{key} must not be empty")),
+        Some(_) => Err(format!("{key} must be a string")),
+    }
+}
+
+fn mcp_optional_text(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(format!("{key} must be a string")),
+    }
+}
+
+fn mcp_nullable_string(args: &Value, key: &str) -> Result<Option<Option<String>>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(Some(value.clone()))),
+        Some(Value::String(_)) => Err(format!("{key} must not be empty")),
+        Some(_) => Err(format!("{key} must be a string or null")),
+    }
+}
+
+fn mcp_optional_bool(args: &Value, key: &str) -> Result<Option<bool>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(format!("{key} must be a boolean")),
+    }
+}
+
+fn mcp_optional_positive_i64(args: &Value, key: &str) -> Result<Option<i64>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::Number(value)) => {
+            let Some(value) = value.as_i64() else {
+                return Err(format!("{key} must be a positive integer"));
+            };
+            if value < 1 {
+                return Err(format!("{key} must be a positive integer"));
+            }
+            Ok(Some(value))
+        }
+        Some(_) => Err(format!("{key} must be a positive integer")),
+    }
+}
+
+fn mcp_priority(args: &Value, key: &str, required: bool) -> Result<Option<String>, String> {
+    let value = if required {
+        Some(mcp_required_string(args, key)?)
+    } else {
+        mcp_optional_string(args, key)?
+    };
+    if let Some(value) = value {
+        if !matches!(
+            value.as_str(),
+            "no-priority" | "low" | "medium" | "high" | "urgent"
+        ) {
+            return Err(format!("{key} is not a valid task priority"));
+        }
+        Ok(Some(value))
+    } else {
+        Ok(None)
+    }
+}
+
+fn mcp_existing_optional_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn mcp_i32_value(value: &Value, key: &str) -> Result<i32, String> {
+    let value = value
+        .as_i64()
+        .ok_or_else(|| format!("{key} must be a number"))?;
+    i32::try_from(value).map_err(|_| format!("{key} is outside the supported range"))
+}
+
+async fn mcp_api_request(
+    state: &AppState,
+    auth: &AuthContext,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, String> {
+    let url = format!("{}{}", state.api_base_url.trim_end_matches('/'), path);
+    let mut request = state
+        .http
+        .request(method, url)
+        .timeout(std::time::Duration::from_secs(10))
+        .header("authorization", format!("Bearer {}", auth.credential));
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("{path}: {error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("{path}: could not read response: {error}"))?;
+    let value = if text.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::String(text.clone()))
+    };
+    if !status.is_success() {
+        let detail = value
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| value.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+        return Err(format!("{path}: {detail}"));
+    }
+    Ok(value)
+}
+
+async fn mcp_call_tool(
+    state: &AppState,
+    auth: &AuthContext,
+    name: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    match name {
+        "whoami" => {
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::GET,
+                "/api/auth/get-session",
+                None,
+            )
+            .await
+        }
+        "list_workspaces" => {
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::GET,
+                "/api/auth/organization/list",
+                None,
+            )
+            .await
+        }
+        "list_projects" => {
+            let workspace_id = mcp_required_string(args, "workspaceId")?;
+            let include_archived = mcp_optional_bool(args, "includeArchived")? == Some(true);
+            let query = if include_archived {
+                mcp_query(&[
+                    ("workspaceId", workspace_id),
+                    ("includeArchived", "true".to_string()),
+                ])
+            } else {
+                mcp_query(&[("workspaceId", workspace_id)])
+            };
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::GET,
+                &format!("/api/project?{query}"),
+                None,
+            )
+            .await
+        }
+        "get_project" => {
+            let id = mcp_required_string(args, "id")?;
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::GET,
+                &format!("/api/project/{}", mcp_path_segment(&id)),
+                None,
+            )
+            .await
+        }
+        "create_project" => {
+            let body = json!({
+                "name": mcp_required_string(args, "name")?,
+                "workspaceId": mcp_required_string(args, "workspaceId")?,
+                "icon": mcp_required_string(args, "icon")?,
+                "slug": mcp_required_string(args, "slug")?,
+            });
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::POST,
+                "/api/project",
+                Some(body),
+            )
+            .await
+        }
+        "update_project" => {
+            let id = mcp_required_string(args, "id")?;
+            let existing = mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::GET,
+                &format!("/api/project/{}", mcp_path_segment(&id)),
+                None,
+            )
+            .await?;
+            let name = mcp_optional_string(args, "name")?.unwrap_or_else(|| {
+                existing
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            });
+            if name.trim().is_empty() {
+                return Err("Cannot update project: missing name.".to_string());
+            }
+            let icon = mcp_optional_text(args, "icon")?.unwrap_or_else(|| {
+                existing
+                    .get("icon")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Layout")
+                    .to_string()
+            });
+            let slug = mcp_optional_string(args, "slug")?.unwrap_or_else(|| {
+                existing
+                    .get("slug")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            });
+            if slug.trim().is_empty() {
+                return Err("Cannot update project: missing slug.".to_string());
+            }
+            let description = mcp_optional_text(args, "description")?.unwrap_or_else(|| {
+                existing
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            });
+            let is_public = mcp_optional_bool(args, "isPublic")?.unwrap_or_else(|| {
+                existing
+                    .get("isPublic")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            });
+            let body = json!({
+                "name": name,
+                "icon": icon,
+                "slug": slug,
+                "description": description,
+                "isPublic": is_public,
+            });
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::PUT,
+                &format!("/api/project/{}", mcp_path_segment(&id)),
+                Some(body),
+            )
+            .await
+        }
+        "list_tasks" => {
+            let project_id = mcp_required_string(args, "projectId")?;
+            let mut pairs = vec![];
+            for key in ["status", "assigneeId", "sortBy", "dueBefore", "dueAfter"] {
+                if let Some(value) = mcp_optional_text(args, key)? {
+                    if value.trim().is_empty() {
+                        return Err(format!("{key} must not be empty"));
+                    }
+                    pairs.push((key, value));
+                }
+            }
+            if let Some(priority) = mcp_priority(args, "priority", false)? {
+                pairs.push(("priority", priority));
+            }
+            if let Some(page) = mcp_optional_positive_i64(args, "page")? {
+                pairs.push(("page", page.to_string()));
+            }
+            if let Some(limit) = mcp_optional_positive_i64(args, "limit")? {
+                pairs.push(("limit", limit.to_string()));
+            }
+            if let Some(sort_order) = mcp_optional_string(args, "sortOrder")? {
+                if !matches!(sort_order.as_str(), "asc" | "desc") {
+                    return Err("sortOrder must be asc or desc".to_string());
+                }
+                pairs.push(("sortOrder", sort_order));
+            }
+            let query = mcp_query(&pairs);
+            let path = if query.is_empty() {
+                format!("/api/task/tasks/{}", mcp_path_segment(&project_id))
+            } else {
+                format!("/api/task/tasks/{}?{query}", mcp_path_segment(&project_id))
+            };
+            mcp_api_request(state, auth, reqwest::Method::GET, &path, None).await
+        }
+        "get_task" => {
+            let task_id = mcp_required_string(args, "taskId")?;
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::GET,
+                &format!("/api/task/{}", mcp_path_segment(&task_id)),
+                None,
+            )
+            .await
+        }
+        "create_task" => {
+            let mut body = json!({
+                "title": mcp_required_string(args, "title")?,
+                "description": mcp_required_text(args, "description")?,
+                "priority": mcp_priority(args, "priority", true)?.unwrap_or_default(),
+                "status": mcp_required_string(args, "status")?,
+            });
+            for key in ["startDate", "dueDate", "userId"] {
+                if let Some(value) = mcp_optional_string(args, key)? {
+                    body[key] = json!(value);
+                }
+            }
+            let project_id = mcp_required_string(args, "projectId")?;
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::POST,
+                &format!("/api/task/{}", mcp_path_segment(&project_id)),
+                Some(body),
+            )
+            .await
+        }
+        "update_task" => {
+            let task_id = mcp_required_string(args, "taskId")?;
+            let existing = mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::GET,
+                &format!("/api/task/{}", mcp_path_segment(&task_id)),
+                None,
+            )
+            .await?;
+            let position = match args.get("position") {
+                Some(value) => mcp_i32_value(value, "position")?,
+                None => mcp_i32_value(
+                    existing.get("position").ok_or_else(|| {
+                        "Cannot update task: missing numeric `position` on existing task."
+                            .to_string()
+                    })?,
+                    "position",
+                )?,
+            };
+            let title = mcp_optional_string(args, "title")?.unwrap_or_else(|| {
+                existing
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            });
+            if title.trim().is_empty() {
+                return Err("Cannot update task: missing title.".to_string());
+            }
+            let description = match args.get("description") {
+                None => mcp_existing_optional_string(&existing, "description").unwrap_or_default(),
+                Some(Value::Null) => String::new(),
+                Some(Value::String(value)) => value.clone(),
+                Some(_) => return Err("description must be a string or null".to_string()),
+            };
+            let status = mcp_optional_string(args, "status")?.unwrap_or_else(|| {
+                existing
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            });
+            if status.trim().is_empty() {
+                return Err("Cannot update task: missing status.".to_string());
+            }
+            let priority = mcp_priority(args, "priority", false)?.or_else(|| {
+                existing
+                    .get("priority")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+            let Some(priority) = priority else {
+                return Err("Cannot update task: invalid or missing priority.".to_string());
+            };
+            if !matches!(
+                priority.as_str(),
+                "no-priority" | "low" | "medium" | "high" | "urgent"
+            ) {
+                return Err("Cannot update task: invalid or missing priority.".to_string());
+            }
+            let project_id = mcp_optional_string(args, "projectId")?.unwrap_or_else(|| {
+                existing
+                    .get("projectId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            });
+            if project_id.trim().is_empty() {
+                return Err("Cannot update task: missing projectId.".to_string());
+            }
+            let mut body = json!({
+                "title": title,
+                "description": description,
+                "status": status,
+                "priority": priority,
+                "projectId": project_id,
+                "position": position,
+            });
+            for key in ["startDate", "dueDate"] {
+                let value = match args.get(key) {
+                    None => mcp_existing_optional_string(&existing, key),
+                    Some(Value::Null) => None,
+                    Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+                    Some(Value::String(_)) => return Err(format!("{key} must not be empty")),
+                    Some(_) => return Err(format!("{key} must be a string or null")),
+                };
+                if let Some(value) = value {
+                    body[key] = json!(value);
+                }
+            }
+            if let Some(user_id) = mcp_nullable_string(args, "userId")? {
+                body["userId"] = json!(user_id.unwrap_or_default());
+            } else if let Some(user_id) = mcp_existing_optional_string(&existing, "userId") {
+                body["userId"] = json!(user_id);
+            }
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::PUT,
+                &format!("/api/task/{}", mcp_path_segment(&task_id)),
+                Some(body),
+            )
+            .await
+        }
+        "move_task" => {
+            let task_id = mcp_required_string(args, "taskId")?;
+            let destination_project_id = mcp_required_string(args, "destinationProjectId")?;
+            let mut body = json!({
+                "destinationProjectId": destination_project_id,
+            });
+            if let Some(destination_status) = mcp_optional_string(args, "destinationStatus")? {
+                body["destinationStatus"] = json!(destination_status);
+            }
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::PUT,
+                &format!("/api/task/move/{}", mcp_path_segment(&task_id)),
+                Some(body),
+            )
+            .await
+        }
+        "update_task_status" => {
+            let task_id = mcp_required_string(args, "taskId")?;
+            let body = json!({"status": mcp_required_string(args, "status")?});
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::PUT,
+                &format!("/api/task/status/{}", mcp_path_segment(&task_id)),
+                Some(body),
+            )
+            .await
+        }
+        "list_task_comments" => {
+            let task_id = mcp_required_string(args, "taskId")?;
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::GET,
+                &format!("/api/comment/{}", mcp_path_segment(&task_id)),
+                None,
+            )
+            .await
+        }
+        "create_task_comment" => {
+            let task_id = mcp_required_string(args, "taskId")?;
+            let body = json!({"content": mcp_required_string(args, "content")?});
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::POST,
+                &format!("/api/comment/{}", mcp_path_segment(&task_id)),
+                Some(body),
+            )
+            .await
+        }
+        "update_task_comment" => {
+            let comment_id = mcp_required_string(args, "commentId")?;
+            let body = json!({"content": mcp_required_string(args, "content")?});
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::PUT,
+                &format!("/api/comment/{}", mcp_path_segment(&comment_id)),
+                Some(body),
+            )
+            .await
+        }
+        "delete_task_comment" => {
+            let comment_id = mcp_required_string(args, "commentId")?;
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::DELETE,
+                &format!("/api/comment/{}", mcp_path_segment(&comment_id)),
+                None,
+            )
+            .await
+        }
+        "list_workspace_labels" => {
+            let workspace_id = mcp_required_string(args, "workspaceId")?;
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::GET,
+                &format!("/api/label/workspace/{}", mcp_path_segment(&workspace_id)),
+                None,
+            )
+            .await
+        }
+        "create_label" => {
+            let color = mcp_required_string(args, "color")?;
+            if !color.starts_with('#')
+                || !(color.len() == 4 || color.len() == 7)
+                || !color[1..].chars().all(|value| value.is_ascii_hexdigit())
+            {
+                return Err("color must be a hex color like #FF6600".to_string());
+            }
+            let mut body = json!({
+                "name": mcp_required_string(args, "name")?,
+                "color": color,
+                "workspaceId": mcp_required_string(args, "workspaceId")?,
+            });
+            if let Some(task_id) = mcp_optional_string(args, "taskId")? {
+                body["taskId"] = json!(task_id);
+            }
+            mcp_api_request(state, auth, reqwest::Method::POST, "/api/label", Some(body)).await
+        }
+        "attach_label_to_task" => {
+            let label_id = mcp_required_string(args, "labelId")?;
+            let body = json!({"taskId": mcp_required_string(args, "taskId")?});
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::PUT,
+                &format!("/api/label/{}/task", mcp_path_segment(&label_id)),
+                Some(body),
+            )
+            .await
+        }
+        "detach_label_from_task" => {
+            let label_id = mcp_required_string(args, "labelId")?;
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::DELETE,
+                &format!("/api/label/{}/task", mcp_path_segment(&label_id)),
+                None,
+            )
+            .await
+        }
+        "create_task_relation" => {
+            let relation_type = mcp_required_string(args, "relationType")?;
+            if !matches!(relation_type.as_str(), "subtask" | "blocks" | "related") {
+                return Err("relationType must be subtask, blocks, or related".to_string());
+            }
+            let body = json!({
+                "sourceTaskId": mcp_required_string(args, "sourceTaskId")?,
+                "targetTaskId": mcp_required_string(args, "targetTaskId")?,
+                "relationType": relation_type,
+            });
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::POST,
+                "/api/task-relation",
+                Some(body),
+            )
+            .await
+        }
+        "get_task_relations" => {
+            let task_id = mcp_required_string(args, "taskId")?;
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::GET,
+                &format!("/api/task-relation/{}", mcp_path_segment(&task_id)),
+                None,
+            )
+            .await
+        }
+        "delete_task_relation" => {
+            let id = mcp_required_string(args, "id")?;
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::DELETE,
+                &format!("/api/task-relation/{}", mcp_path_segment(&id)),
+                None,
+            )
+            .await
+        }
+        "delete_label" => {
+            let id = mcp_required_string(args, "id")?;
+            let label = mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::GET,
+                &format!("/api/label/{}", mcp_path_segment(&id)),
+                None,
+            )
+            .await?;
+            if !label
+                .get("taskId")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+            {
+                return Err("Label is not associated with a task and cannot be deleted (workspace-level labels are not deletable via this endpoint).".to_string());
+            }
+            mcp_api_request(
+                state,
+                auth,
+                reqwest::Method::DELETE,
+                &format!("/api/label/{}", mcp_path_segment(&id)),
+                None,
+            )
+            .await
+        }
+        _ => Err(format!("Unknown MCP tool: {name}")),
+    }
+}
+
+fn mcp_tool_result(value: Value) -> Value {
+    let text = match value {
+        Value::String(value) => value,
+        value => serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".to_string()),
+    };
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "isError": false,
+    })
+}
+
+fn mcp_tool_error(message: impl Into<String>) -> Value {
+    let value = json!({"error": message.into()});
+    json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{\"error\":\"unknown\"}".to_string()),
+        }],
+        "isError": true,
+    })
+}
+
+fn mcp_session_id(headers: &HeaderMap) -> String {
+    headers
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
+fn mcp_response(payload: Value, status: StatusCode, session_id: &str) -> Response {
+    let mut response = (status, Json(payload)).into_response();
+    if let Ok(value) = HeaderValue::from_str(session_id) {
+        response.headers_mut().insert("mcp-session-id", value);
+    }
+    response
+}
+
+fn mcp_rpc_result(id: Value, result: Value, session_id: &str) -> Response {
+    mcp_response(
+        json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        StatusCode::OK,
+        session_id,
+    )
+}
+
+fn mcp_rpc_error(id: Value, code: i32, message: impl Into<String>, session_id: &str) -> Response {
+    mcp_response(
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": code, "message": message.into()},
+        }),
+        StatusCode::OK,
+        session_id,
+    )
+}
+
+fn mcp_unauthorized_response(state: &AppState) -> Response {
+    let resource_metadata = format!(
+        "{}/api/.well-known/oauth-protected-resource/api/mcp",
+        state.api_base_url.trim_end_matches('/')
+    );
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "invalid_token",
+            "error_description": "Missing or invalid token",
+        })),
+    )
+        .into_response();
+    if let Ok(value) =
+        HeaderValue::from_str(&format!("Bearer resource_metadata=\"{resource_metadata}\""))
+    {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
+    }
+    response
+}
+
+async fn mcp_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Result<Response, ApiError> {
+    let auth = match authenticate(&state, &headers).await {
+        Ok(auth) => auth,
+        Err(error) if error.status == StatusCode::UNAUTHORIZED => {
+            return Ok(mcp_unauthorized_response(&state));
+        }
+        Err(error) => return Err(error),
+    };
+    let session_id = mcp_session_id(&headers);
+    let id = request.get("id").cloned();
+    let Some(method) = request.get("method").and_then(Value::as_str) else {
+        return Ok(match id {
+            Some(id) => mcp_rpc_error(id, -32600, "Invalid Request", &session_id),
+            None => mcp_response(Value::Null, StatusCode::ACCEPTED, &session_id),
+        });
+    };
+    let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+    let result = match method {
+        "initialize" => {
+            let protocol_version = params
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or("2025-06-18");
+            Ok(json!({
+                "protocolVersion": protocol_version,
+                "capabilities": {"tools": {"listChanged": false}},
+                "serverInfo": {"name": "kaneo-mcp", "version": "1.0.0"},
+            }))
+        }
+        "notifications/initialized" => {
+            return Ok(mcp_response(Value::Null, StatusCode::ACCEPTED, &session_id));
+        }
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({"tools": mcp_tool_definitions()})),
+        "tools/call" => {
+            let name = params.get("name").and_then(Value::as_str).ok_or_else(|| {
+                ApiError::new(StatusCode::BAD_REQUEST, "MCP tool name is required")
+            })?;
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if !arguments.is_object() {
+                Ok(mcp_tool_error("MCP tool arguments must be an object"))
+            } else {
+                match mcp_call_tool(&state, &auth, name, &arguments).await {
+                    Ok(value) => Ok(mcp_tool_result(value)),
+                    Err(error) => Ok(mcp_tool_error(error)),
+                }
+            }
+        }
+        _ => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("Unsupported MCP method: {method}"),
+        )),
+    };
+    let response = match (id, result) {
+        (Some(id), Ok(result)) => mcp_rpc_result(id, result, &session_id),
+        (Some(id), Err(error)) => mcp_rpc_error(id, -32601, error.message, &session_id),
+        (None, Ok(_)) | (None, Err(_)) => {
+            mcp_response(Value::Null, StatusCode::ACCEPTED, &session_id)
+        }
+    };
+    Ok(response)
+}
+
+async fn mcp_get_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    match authenticate(&state, &headers).await {
+        Ok(_) => {
+            let mut response = StatusCode::METHOD_NOT_ALLOWED.into_response();
+            response
+                .headers_mut()
+                .insert(header::ALLOW, HeaderValue::from_static("POST"));
+            Ok(response)
+        }
+        Err(error) if error.status == StatusCode::UNAUTHORIZED => {
+            Ok(mcp_unauthorized_response(&state))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn mcp_protected_resource_metadata(State(state): State<AppState>) -> Json<Value> {
+    let base = state.api_base_url.trim_end_matches('/');
+    Json(json!({
+        "resource": format!("{base}/api/mcp"),
+        "authorization_servers": [format!("{base}/api")],
+    }))
+}
+
+async fn mcp_authorization_server_metadata(State(state): State<AppState>) -> Json<Value> {
+    let base = state.api_base_url.trim_end_matches('/');
+    Json(json!({
+        "issuer": format!("{base}/api"),
+        "authorization_endpoint": format!("{base}/api/mcp/authorize"),
+        "token_endpoint": format!("{base}/api/mcp/token"),
+        "registration_endpoint": format!("{base}/api/mcp/register"),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    }))
 }
 
 async fn list_projects(
@@ -8456,6 +9521,15 @@ fn app(state: AppState) -> Router {
         .route("/api/search", get(global_search))
         .route("/api/auth/get-session", get(get_session))
         .route("/api/oauth/id-token", get(get_oauth_id_token))
+        .route("/api/mcp", get(mcp_get_endpoint).post(mcp_endpoint))
+        .route(
+            "/api/.well-known/oauth-protected-resource/api/mcp",
+            get(mcp_protected_resource_metadata),
+        )
+        .route(
+            "/api/.well-known/oauth-authorization-server/api",
+            get(mcp_authorization_server_metadata),
+        )
         .route("/api/auth/organization/list", get(list_organizations))
         .route("/api/auth/organization/list-members", get(list_members))
         .route(
@@ -8633,6 +9707,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         database,
         runner: RunManager::new(RunnerConfig::default()),
         http: reqwest::Client::new(),
+        api_base_url: env::var("KANEO_API_URL")
+            .unwrap_or_else(|_| format!("http://{bind}"))
+            .trim_end_matches('/')
+            .to_string(),
         legacy_api_url,
         events,
     };

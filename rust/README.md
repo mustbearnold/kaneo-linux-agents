@@ -22,6 +22,13 @@ relation, label, and time-entry mutations publish filtered events to connected
 project boards, so an agent changing a task is visible without waiting for a
 polling cycle.
 
+The Rust API also serves the authenticated `/api/mcp` JSON-RPC endpoint and its
+protected-resource metadata. It exposes the project, task, comment, label, and
+relation tools used by autonomous agents through the same session or API-key
+credential, so the agent-to-board path no longer depends on the TypeScript MCP
+server. OAuth client registration, consent, and token exchange remain on the
+compatibility surface until that auth flow is ported.
+
 The current TypeScript API remains a compatibility runtime while feature parity
 is built in Rust. In packaged Electron builds it runs privately on port 1338;
 the Rust API owns port 1337 and proxies only the routes that have not moved.
