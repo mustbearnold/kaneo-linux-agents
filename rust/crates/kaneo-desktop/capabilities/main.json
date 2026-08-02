@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Kaneo's desktop webview capabilities.",
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:5173/*",
+      "http://localhost:5173/*"
+    ]
+  },
+  "windows": ["main"],
+  "permissions": ["allow-pick-project-folder"]
+}

@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-pick-project-folder"
+description = "Allows the Kaneo webview to open a native project-folder picker."
+commands.allow = ["pick_project_folder"]
