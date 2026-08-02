@@ -6,9 +6,10 @@ an authenticated PostgreSQL HTTP runtime for the board and task flows, and a
 Tauri desktop shell that starts the Rust API and can serve the built web app.
 
 The Rust API also owns the board's live project WebSocket, task label reads,
-and external-link reads. Task mutations publish filtered events to connected
-project boards, so an agent changing a task is visible without waiting for a
-polling cycle.
+external-link reads, organization membership and permission reads, notification
+inbox operations, pending invitations, and workspace billing state. Task
+mutations publish filtered events to connected project boards, so an agent
+changing a task is visible without waiting for a polling cycle.
 
 The current TypeScript API remains a compatibility runtime while feature parity
 is built in Rust. In packaged Electron builds it runs privately on port 1338;

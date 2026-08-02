@@ -14,7 +14,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post, put};
+use axum::routing::{any, delete, get, patch, post, put};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -127,6 +127,30 @@ struct ProjectQuery {
     workspace_id: Option<String>,
     #[serde(rename = "includeArchived")]
     include_archived: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OrganizationQuery {
+    #[serde(rename = "organizationId")]
+    organization_id: Option<String>,
+    #[serde(rename = "organizationSlug")]
+    organization_slug: Option<String>,
+    #[serde(rename = "membersLimit")]
+    members_limit: Option<usize>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    #[serde(rename = "sortBy")]
+    sort_by: Option<String>,
+    #[serde(rename = "sortDirection")]
+    sort_direction: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PermissionInput {
+    #[serde(rename = "organizationId")]
+    organization_id: Option<String>,
+    permission: Option<HashMap<String, Vec<String>>>,
+    permissions: Option<HashMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1685,7 +1709,7 @@ async fn list_organizations(
         .client
         .query(
             r#"
-              SELECT w.id, w.name, w.slug, w.logo, w.metadata,
+              SELECT w.id, w.name, w.slug, w.logo, w.metadata, w.description,
                      to_char(w.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at
               FROM workspace w
               INNER JOIN workspace_member m ON m.workspace_id = w.id
@@ -1709,12 +1733,883 @@ async fn list_organizations(
                 "name": row_string(&row, "name")?,
                 "slug": row_string(&row, "slug")?,
                 "logo": row_optional_string(&row, "logo")?,
+                "description": row_optional_string(&row, "description")?,
                 "metadata": metadata,
                 "createdAt": row_string(&row, "created_at")?,
             }))
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(Json(Value::Array(organizations)))
+}
+
+async fn active_organization_id(
+    state: &AppState,
+    auth: &AuthContext,
+) -> Result<Option<String>, ApiError> {
+    let Some(session_token) = auth.session_token.as_deref() else {
+        return Ok(None);
+    };
+    state
+        .database
+        .client
+        .query_opt(
+            "SELECT active_organization_id FROM session WHERE token = $1 LIMIT 1",
+            &[&session_token],
+        )
+        .await
+        .map_err(database_error)?
+        .map(|row| row_optional_string(&row, "active_organization_id"))
+        .transpose()
+        .map(|value| value.flatten())
+}
+
+async fn resolve_organization_id(
+    state: &AppState,
+    auth: &AuthContext,
+    organization_id: Option<&str>,
+    organization_slug: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(organization_id) = organization_id.filter(|value| !value.trim().is_empty()) {
+        return Ok(organization_id.to_string());
+    }
+
+    if let Some(organization_slug) = organization_slug.filter(|value| !value.trim().is_empty()) {
+        return state
+            .database
+            .client
+            .query_opt(
+                "SELECT id FROM workspace WHERE slug = $1 LIMIT 1",
+                &[&organization_slug],
+            )
+            .await
+            .map_err(database_error)?
+            .map(|row| row_string(&row, "id"))
+            .transpose()?
+            .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Organization not found"));
+    }
+
+    active_organization_id(state, auth)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "No active organization"))
+}
+
+fn organization_member_json(row: &Row) -> Result<Value, ApiError> {
+    Ok(json!({
+        "id": row_string(row, "member_id")?,
+        "organizationId": row_string(row, "organization_id")?,
+        "userId": row_string(row, "user_id")?,
+        "role": row_string(row, "role")?,
+        "createdAt": row_string(row, "member_created_at")?,
+        "user": {
+            "id": row_string(row, "user_id")?,
+            "name": row_string(row, "user_name")?,
+            "email": row_string(row, "user_email")?,
+            "image": row_optional_string(row, "user_image")?,
+        },
+    }))
+}
+
+async fn list_organization_members(
+    state: &AppState,
+    organization_id: &str,
+    limit: usize,
+    offset: usize,
+    sort_by: Option<&str>,
+    sort_direction: Option<&str>,
+) -> Result<(Vec<Value>, i64), ApiError> {
+    let sort_column = match sort_by {
+        Some("role") => "m.role",
+        Some("userId") => "m.user_id",
+        Some("createdAt") | Some("joinedAt") => "m.joined_at",
+        _ => "m.joined_at",
+    };
+    let sort_direction = if sort_direction == Some("desc") {
+        "DESC"
+    } else {
+        "ASC"
+    };
+    let limit = limit.min(1000) as i64;
+    let offset = offset as i64;
+    let query = format!(
+        r#"
+          SELECT m.id AS member_id, m.workspace_id AS organization_id,
+                 m.user_id, m.role,
+                 to_char(m.joined_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS member_created_at,
+                 u.name AS user_name, u.email AS user_email, u.image AS user_image
+          FROM workspace_member m
+          INNER JOIN "user" u ON u.id = m.user_id
+          WHERE m.workspace_id = $1
+          ORDER BY {sort_column} {sort_direction}
+          LIMIT $2 OFFSET $3
+        "#
+    );
+    let rows = state
+        .database
+        .client
+        .query(&query, &[&organization_id, &limit, &offset])
+        .await
+        .map_err(database_error)?;
+    let members = rows
+        .iter()
+        .map(organization_member_json)
+        .collect::<Result<Vec<_>, _>>()?;
+    let total = state
+        .database
+        .client
+        .query_one(
+            "SELECT COUNT(*)::bigint AS total FROM workspace_member WHERE workspace_id = $1",
+            &[&organization_id],
+        )
+        .await
+        .map_err(database_error)?
+        .try_get::<_, i64>("total")
+        .map_err(database_error)?;
+    Ok((members, total))
+}
+
+async fn list_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<OrganizationQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let organization_id = resolve_organization_id(
+        &state,
+        &auth,
+        query.organization_id.as_deref(),
+        query.organization_slug.as_deref(),
+    )
+    .await?;
+    require_workspace(&state, &auth, &organization_id).await?;
+    let (members, total) = list_organization_members(
+        &state,
+        &organization_id,
+        query.limit.unwrap_or(100),
+        query.offset.unwrap_or(0),
+        query.sort_by.as_deref(),
+        query.sort_direction.as_deref(),
+    )
+    .await?;
+    Ok(Json(json!({ "members": members, "total": total })))
+}
+
+async fn get_full_organization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<OrganizationQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let organization_id = resolve_organization_id(
+        &state,
+        &auth,
+        query.organization_id.as_deref(),
+        query.organization_slug.as_deref(),
+    )
+    .await?;
+    require_workspace(&state, &auth, &organization_id).await?;
+    let organization = if query.organization_slug.is_some() {
+        state
+            .database
+            .client
+            .query_opt(
+                r#"
+                  SELECT id, name, slug, logo, metadata, description,
+                         to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at
+                  FROM workspace WHERE slug = $1 LIMIT 1
+                "#,
+                &[&query.organization_slug.as_deref().unwrap_or_default()],
+            )
+            .await
+            .map_err(database_error)?
+    } else {
+        state
+            .database
+            .client
+            .query_opt(
+                r#"
+                  SELECT id, name, slug, logo, metadata, description,
+                         to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at
+                  FROM workspace WHERE id = $1 LIMIT 1
+                "#,
+                &[&organization_id],
+            )
+            .await
+            .map_err(database_error)?
+    }
+    .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Organization not found"))?;
+    let metadata = row_optional_string(&organization, "metadata")
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let (members, _) = list_organization_members(
+        &state,
+        &organization_id,
+        query.members_limit.unwrap_or(100),
+        0,
+        None,
+        None,
+    )
+    .await?;
+    let invitations = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT id, workspace_id, email, role, status, inviter_id,
+                     to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS expires_at,
+                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at
+              FROM invitation
+              WHERE workspace_id = $1
+              ORDER BY created_at ASC
+            "#,
+            &[&organization_id],
+        )
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|row| {
+            Ok(json!({
+                "id": row_string(&row, "id")?,
+                "organizationId": row_string(&row, "workspace_id")?,
+                "email": row_string(&row, "email")?,
+                "role": row_optional_string(&row, "role")?,
+                "status": row_string(&row, "status")?,
+                "inviterId": row_string(&row, "inviter_id")?,
+                "expiresAt": row_string(&row, "expires_at")?,
+                "createdAt": row_string(&row, "created_at")?,
+            }))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let teams = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT id, name, workspace_id,
+                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at
+              FROM team WHERE workspace_id = $1 ORDER BY created_at ASC
+            "#,
+            &[&organization_id],
+        )
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|row| {
+            Ok(json!({
+                "id": row_string(&row, "id")?,
+                "name": row_string(&row, "name")?,
+                "organizationId": row_string(&row, "workspace_id")?,
+                "createdAt": row_string(&row, "created_at")?,
+            }))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    Ok(Json(json!({
+        "id": row_string(&organization, "id")?,
+        "name": row_string(&organization, "name")?,
+        "slug": row_string(&organization, "slug")?,
+        "logo": row_optional_string(&organization, "logo")?,
+        "metadata": metadata,
+        "description": row_optional_string(&organization, "description")?,
+        "createdAt": row_string(&organization, "created_at")?,
+        "members": members,
+        "invitations": invitations,
+        "teams": teams,
+    })))
+}
+
+fn built_in_permissions(role: &str) -> HashMap<String, Vec<String>> {
+    let mut permissions = HashMap::new();
+    permissions.insert("organization".to_string(), vec!["update".to_string()]);
+    permissions.insert("member".to_string(), Vec::new());
+    permissions.insert("invitation".to_string(), Vec::new());
+    permissions.insert("team".to_string(), Vec::new());
+    permissions.insert("ac".to_string(), vec!["read".to_string()]);
+    match role {
+        "owner" => {
+            permissions.insert(
+                "organization".to_string(),
+                vec!["update".to_string(), "delete".to_string()],
+            );
+            permissions.insert(
+                "member".to_string(),
+                vec![
+                    "create".to_string(),
+                    "update".to_string(),
+                    "delete".to_string(),
+                ],
+            );
+            permissions.insert(
+                "invitation".to_string(),
+                vec!["create".to_string(), "cancel".to_string()],
+            );
+            permissions.insert(
+                "team".to_string(),
+                vec![
+                    "create".to_string(),
+                    "update".to_string(),
+                    "delete".to_string(),
+                ],
+            );
+            permissions.insert(
+                "ac".to_string(),
+                vec![
+                    "create".to_string(),
+                    "read".to_string(),
+                    "update".to_string(),
+                    "delete".to_string(),
+                ],
+            );
+            permissions.insert(
+                "project".to_string(),
+                vec![
+                    "create".to_string(),
+                    "read".to_string(),
+                    "update".to_string(),
+                    "delete".to_string(),
+                    "share".to_string(),
+                ],
+            );
+            permissions.insert(
+                "task".to_string(),
+                vec![
+                    "create".to_string(),
+                    "read".to_string(),
+                    "update".to_string(),
+                    "delete".to_string(),
+                    "assign".to_string(),
+                ],
+            );
+            permissions.insert(
+                "label".to_string(),
+                vec![
+                    "create".to_string(),
+                    "read".to_string(),
+                    "update".to_string(),
+                    "delete".to_string(),
+                ],
+            );
+            permissions.insert(
+                "workspace".to_string(),
+                vec![
+                    "read".to_string(),
+                    "update".to_string(),
+                    "delete".to_string(),
+                    "manage_settings".to_string(),
+                ],
+            );
+        }
+        "admin" => {
+            permissions.insert(
+                "member".to_string(),
+                vec![
+                    "create".to_string(),
+                    "update".to_string(),
+                    "delete".to_string(),
+                ],
+            );
+            permissions.insert(
+                "invitation".to_string(),
+                vec!["create".to_string(), "cancel".to_string()],
+            );
+            permissions.insert(
+                "team".to_string(),
+                vec![
+                    "create".to_string(),
+                    "update".to_string(),
+                    "delete".to_string(),
+                ],
+            );
+            permissions.insert(
+                "ac".to_string(),
+                vec![
+                    "create".to_string(),
+                    "read".to_string(),
+                    "update".to_string(),
+                    "delete".to_string(),
+                ],
+            );
+            permissions.insert(
+                "project".to_string(),
+                vec![
+                    "create".to_string(),
+                    "read".to_string(),
+                    "update".to_string(),
+                    "delete".to_string(),
+                    "share".to_string(),
+                ],
+            );
+            permissions.insert(
+                "task".to_string(),
+                vec![
+                    "create".to_string(),
+                    "read".to_string(),
+                    "update".to_string(),
+                    "delete".to_string(),
+                    "assign".to_string(),
+                ],
+            );
+            permissions.insert(
+                "label".to_string(),
+                vec![
+                    "create".to_string(),
+                    "read".to_string(),
+                    "update".to_string(),
+                    "delete".to_string(),
+                ],
+            );
+            permissions.insert(
+                "workspace".to_string(),
+                vec![
+                    "read".to_string(),
+                    "update".to_string(),
+                    "manage_settings".to_string(),
+                ],
+            );
+        }
+        "member" => {
+            permissions.insert(
+                "project".to_string(),
+                vec!["create".to_string(), "read".to_string()],
+            );
+            permissions.insert(
+                "task".to_string(),
+                vec![
+                    "create".to_string(),
+                    "read".to_string(),
+                    "update".to_string(),
+                ],
+            );
+            permissions.insert(
+                "label".to_string(),
+                vec![
+                    "create".to_string(),
+                    "read".to_string(),
+                    "update".to_string(),
+                    "delete".to_string(),
+                ],
+            );
+            permissions.insert("workspace".to_string(), vec!["read".to_string()]);
+        }
+        "viewer" => {
+            permissions.insert("project".to_string(), vec!["read".to_string()]);
+            permissions.insert("task".to_string(), vec!["read".to_string()]);
+            permissions.insert("label".to_string(), vec!["read".to_string()]);
+            permissions.insert("workspace".to_string(), vec!["read".to_string()]);
+        }
+        _ => {}
+    }
+    permissions
+}
+
+fn permission_satisfied(
+    granted: &HashMap<String, Vec<String>>,
+    required: &HashMap<String, Vec<String>>,
+) -> bool {
+    required.iter().all(|(resource, actions)| {
+        granted
+            .get(resource)
+            .is_some_and(|available| actions.iter().all(|action| available.contains(action)))
+    })
+}
+
+async fn has_permission(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<PermissionInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let organization_id =
+        resolve_organization_id(&state, &auth, input.organization_id.as_deref(), None).await?;
+    require_workspace(&state, &auth, &organization_id).await?;
+    let required = input
+        .permissions
+        .or(input.permission)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "permissions is required"))?;
+    if auth.is_admin() {
+        return Ok(Json(json!({ "error": null, "success": true })));
+    }
+    let role = state
+        .database
+        .client
+        .query_one(
+            "SELECT role FROM workspace_member WHERE workspace_id = $1 AND user_id = $2 LIMIT 1",
+            &[&organization_id, &auth.user_id],
+        )
+        .await
+        .map_err(database_error)?
+        .try_get::<_, String>("role")
+        .map_err(database_error)?;
+    let granted = state
+        .database
+        .client
+        .query_opt(
+            "SELECT permission FROM workspace_role WHERE workspace_id = $1 AND role = $2 LIMIT 1",
+            &[&organization_id, &role],
+        )
+        .await
+        .map_err(database_error)?
+        .and_then(|row| row_optional_string(&row, "permission").ok().flatten())
+        .and_then(|raw| serde_json::from_str::<HashMap<String, Vec<String>>>(&raw).ok())
+        .unwrap_or_else(|| built_in_permissions(&role));
+    Ok(Json(json!({
+        "error": null,
+        "success": permission_satisfied(&granted, &required),
+    })))
+}
+
+async fn notifications_for_user(
+    state: &AppState,
+    user_id: &str,
+    notification_id: Option<&str>,
+) -> Result<Value, ApiError> {
+    let rows = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT n.id, n.user_id, n.title, n.content, n.type,
+                     n.event_data::text AS event_data,
+                     COALESCE(n.is_read, FALSE) AS is_read,
+                     n.resource_id, n.resource_type,
+                     to_char(n.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     to_char(n.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+                     p.id AS project_id, p.workspace_id
+              FROM notification n
+              LEFT JOIN task t
+                ON t.id = n.resource_id AND n.resource_type = 'task'
+              LEFT JOIN project p ON p.id = t.project_id
+              WHERE n.user_id = $1
+                AND ($2::text IS NULL OR n.id = $2)
+              ORDER BY n.created_at DESC
+              LIMIT 50
+            "#,
+            &[&user_id, &notification_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if notification_id.is_some() && rows.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Notification not found",
+        ));
+    }
+    let notifications = rows
+        .into_iter()
+        .map(|row| {
+            let mut event_data = row_optional_string(&row, "event_data")
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .unwrap_or(Value::Null);
+            let project_id = row_optional_string(&row, "project_id")?;
+            let workspace_id = row_optional_string(&row, "workspace_id")?;
+            if project_id.is_some() || workspace_id.is_some() {
+                let object = event_data.as_object_mut().cloned().unwrap_or_default();
+                let mut object = object;
+                if let Some(project_id) = project_id {
+                    object
+                        .entry("projectId".to_string())
+                        .or_insert_with(|| Value::String(project_id));
+                }
+                if let Some(workspace_id) = workspace_id {
+                    object
+                        .entry("workspaceId".to_string())
+                        .or_insert_with(|| Value::String(workspace_id));
+                }
+                event_data = Value::Object(object);
+            }
+            Ok(json!({
+                "id": row_string(&row, "id")?,
+                "userId": row_string(&row, "user_id")?,
+                "title": row_optional_string(&row, "title")?,
+                "content": row_optional_string(&row, "content")?,
+                "type": row_string(&row, "type")?,
+                "eventData": event_data,
+                "isRead": row.try_get::<_, bool>("is_read").map_err(database_error)?,
+                "resourceId": row_optional_string(&row, "resource_id")?,
+                "resourceType": row_optional_string(&row, "resource_type")?,
+                "createdAt": row_string(&row, "created_at")?,
+                "updatedAt": row_string(&row, "updated_at")?,
+            }))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    if notification_id.is_some() {
+        Ok(notifications.into_iter().next().unwrap_or(Value::Null))
+    } else {
+        Ok(Value::Array(notifications))
+    }
+}
+
+async fn list_notifications(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    Ok(Json(
+        notifications_for_user(&state, &auth.user_id, None).await?,
+    ))
+}
+
+async fn mark_notification_as_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let updated = state
+        .database
+        .client
+        .execute(
+            "UPDATE notification SET is_read = TRUE, updated_at = NOW() WHERE id = $1 AND user_id = $2",
+            &[&id, &auth.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if updated == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Notification not found",
+        ));
+    }
+    Ok(Json(
+        notifications_for_user(&state, &auth.user_id, Some(&id)).await?,
+    ))
+}
+
+async fn mark_all_notifications_as_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE notification SET is_read = TRUE, updated_at = NOW() WHERE user_id = $1",
+            &[&auth.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn clear_notifications(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    state
+        .database
+        .client
+        .execute(
+            "DELETE FROM notification WHERE user_id = $1",
+            &[&auth.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn pending_invitations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let user = state
+        .database
+        .client
+        .query_one(
+            "SELECT email, email_verified FROM \"user\" WHERE id = $1 LIMIT 1",
+            &[&auth.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if !user
+        .try_get::<_, bool>("email_verified")
+        .map_err(database_error)?
+    {
+        return Ok(Json(json!([])));
+    }
+    let email = row_string(&user, "email")?.to_lowercase();
+    let rows = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT i.id, i.email, i.workspace_id, w.name AS workspace_name,
+                     u.name AS inviter_name,
+                     to_char(i.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS expires_at,
+                     to_char(i.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     i.status
+              FROM invitation i
+              INNER JOIN workspace w ON w.id = i.workspace_id
+              INNER JOIN "user" u ON u.id = i.inviter_id
+              WHERE lower(i.email) = $1
+                AND i.status = 'pending'
+                AND i.expires_at > NOW()
+              ORDER BY i.created_at ASC
+            "#,
+            &[&email],
+        )
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|row| {
+            Ok(json!({
+                "id": row_string(&row, "id")?,
+                "email": row_string(&row, "email")?,
+                "workspaceId": row_string(&row, "workspace_id")?,
+                "workspaceName": row_string(&row, "workspace_name")?,
+                "inviterName": row_string(&row, "inviter_name")?,
+                "expiresAt": row_string(&row, "expires_at")?,
+                "createdAt": row_string(&row, "created_at")?,
+                "status": row_string(&row, "status")?,
+            }))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(Json(Value::Array(rows)))
+}
+
+fn billing_is_enabled() -> bool {
+    env_true("KANEO_CLOUD") && env_present("CREEM_API_KEY") && env_present("CREEM_WEBHOOK_SECRET")
+}
+
+fn billing_trial_days() -> i32 {
+    env::var("BILLING_TRIAL_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|days| *days >= 0)
+        .unwrap_or(14)
+}
+
+async fn get_workspace_billing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace(&state, &auth, &workspace_id).await?;
+    let workspace_exists = state
+        .database
+        .client
+        .query_opt(
+            "SELECT created_at FROM workspace WHERE id = $1 LIMIT 1",
+            &[&workspace_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let Some(workspace) = workspace_exists else {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "Workspace not found"));
+    };
+
+    let existing = state
+        .database
+        .client
+        .query_opt(
+            "SELECT id FROM workspace_billing WHERE workspace_id = $1 LIMIT 1",
+            &[&workspace_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if existing.is_none() {
+        let founding_free = if let Some(cutoff) = env::var("BILLING_FOUNDING_CUTOFF")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        {
+            state
+                .database
+                .client
+                .query_one(
+                    "SELECT created_at <= $1::timestamp AS founding_free FROM workspace WHERE id = $2",
+                    &[&cutoff, &workspace_id],
+                )
+                .await
+                .map_err(database_error)?
+                .try_get::<_, bool>("founding_free")
+                .map_err(database_error)?
+        } else {
+            let _ = workspace;
+            false
+        };
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  INSERT INTO workspace_billing (id, workspace_id, founding_free, trial_ends_at)
+                  VALUES ($1, $2, $3,
+                    CASE WHEN $3 THEN NULL
+                         ELSE NOW() + ($4::int * INTERVAL '1 day')
+                    END)
+                  ON CONFLICT (workspace_id) DO NOTHING
+                "#,
+                &[
+                    &Uuid::new_v4().to_string(),
+                    &workspace_id,
+                    &founding_free,
+                    &billing_trial_days(),
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+
+    let billing = state
+        .database
+        .client
+        .query_one(
+            r#"
+              SELECT founding_free,
+                     to_char(trial_ends_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS trial_ends_at,
+                     creem_customer_id, plan, billing_interval, status, seats,
+                     to_char(current_period_end AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS current_period_end,
+                     to_char(canceled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS canceled_at,
+                     (trial_ends_at IS NOT NULL AND trial_ends_at > NOW()) AS trial_active
+              FROM workspace_billing
+              WHERE workspace_id = $1
+              LIMIT 1
+            "#,
+            &[&workspace_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let billing_enabled = billing_is_enabled();
+    let founding_free = billing
+        .try_get::<_, bool>("founding_free")
+        .map_err(database_error)?;
+    let status = row_optional_string(&billing, "status")?;
+    let trial_active = billing
+        .try_get::<_, bool>("trial_active")
+        .map_err(database_error)?;
+    let (active, reason) = if !billing_enabled {
+        (true, "billing_disabled")
+    } else if founding_free {
+        (true, "founding_free")
+    } else if matches!(
+        status.as_deref(),
+        Some("active" | "trialing" | "past_due" | "scheduled_cancel")
+    ) {
+        (true, "subscription")
+    } else if trial_active {
+        (true, "trial")
+    } else {
+        (false, "expired")
+    };
+    Ok(Json(json!({
+        "billingEnabled": billing_enabled,
+        "entitlement": { "active": active, "reason": reason },
+        "foundingFree": founding_free,
+        "trialEndsAt": row_optional_string(&billing, "trial_ends_at")?,
+        "plan": row_optional_string(&billing, "plan")?,
+        "billingInterval": row_optional_string(&billing, "billing_interval")?,
+        "status": status,
+        "seats": billing.try_get::<_, i32>("seats").map_err(database_error)?,
+        "currentPeriodEnd": row_optional_string(&billing, "current_period_end")?,
+        "canceledAt": row_optional_string(&billing, "canceled_at")?,
+        "hasCustomer": row_optional_string(&billing, "creem_customer_id")?.is_some(),
+    })))
 }
 
 fn build_agent_prompt(input: &StartAgentInput, workspace_id: &str) -> String {
@@ -2106,8 +3001,29 @@ fn app(state: AppState) -> Router {
         .route("/api/rust/status", get(rust_status))
         .route("/api/auth/get-session", get(get_session))
         .route("/api/auth/organization/list", get(list_organizations))
+        .route("/api/auth/organization/list-members", get(list_members))
+        .route(
+            "/api/auth/organization/get-full-organization",
+            get(get_full_organization),
+        )
+        .route(
+            "/api/auth/organization/has-permission",
+            post(has_permission),
+        )
         .route("/api/ws/user", get(user_socket))
         .route("/api/ws/{project_id}", get(project_socket))
+        .route("/api/notification", get(list_notifications))
+        .route(
+            "/api/notification/{id}/read",
+            patch(mark_notification_as_read),
+        )
+        .route(
+            "/api/notification/read-all",
+            patch(mark_all_notifications_as_read),
+        )
+        .route("/api/notification/clear-all", delete(clear_notifications))
+        .route("/api/invitation/pending", get(pending_invitations))
+        .route("/api/billing/{workspace_id}", get(get_workspace_billing))
         .route("/api/label/task/{task_id}", get(list_task_labels))
         .route(
             "/api/label/workspace/{workspace_id}",

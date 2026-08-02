@@ -56,7 +56,9 @@ receiving WebSocket updates.
 
 The Rust migration in [`rust/`](rust/README.md) now owns the bounded parallel
 agent runner, authenticated PostgreSQL board API, task mutations, board labels,
-external links, and live project WebSockets, plus a native Tauri shell.
+external links, organization membership and permission reads, notifications,
+pending invitations, workspace billing state, and live project WebSockets, plus
+a native Tauri shell.
 Packaged Linux desktop builds start the Rust API by default; the legacy
 TypeScript API remains on a private compatibility port for routes that have
 not moved yet, and can be selected explicitly with `KANEO_API_RUNTIME=node`.
