@@ -246,6 +246,49 @@ struct DueDateInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AssigneeInput {
+    user_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DescriptionInput {
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MoveTaskInput {
+    destination_project_id: String,
+    destination_status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkTaskInput {
+    task_ids: Vec<String>,
+    operation: String,
+    value: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportTaskInput {
+    title: String,
+    description: Option<String>,
+    status: String,
+    priority: Option<String>,
+    start_date: Option<String>,
+    due_date: Option<String>,
+    user_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportTasksInput {
+    tasks: Vec<ImportTaskInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CreateActivityInput {
     task_id: String,
     user_id: String,
@@ -3350,6 +3393,838 @@ async fn update_task_due_date(
     Ok(Json(task))
 }
 
+async fn update_task_assignee(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<AssigneeInput>,
+) -> Result<Json<ApiTask>, ApiError> {
+    let (auth, workspace_id) = auth_for_task(&state, &headers, &id).await?;
+    let existing_task = task_by_id(&state.database, &id).await?;
+    if existing_task.user_id == input.user_id {
+        return Ok(Json(existing_task));
+    }
+    if let Some(user_id) = input.user_id.as_deref() {
+        let user_exists = state
+            .database
+            .client
+            .query_opt("SELECT 1 FROM \"user\" WHERE id = $1 LIMIT 1", &[&user_id])
+            .await
+            .map_err(database_error)?
+            .is_some();
+        if !user_exists {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "User not found"));
+        }
+    }
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE task SET assignee_id = $1, updated_at = NOW() WHERE id = $2",
+            &[&input.user_id, &id],
+        )
+        .await
+        .map_err(database_error)?;
+    let task = task_by_id(&state.database, &id).await?;
+    publish_task_event(
+        &state,
+        "TASK_UPDATED",
+        task.project_id.clone(),
+        id,
+        &auth,
+        &headers,
+    );
+    if let Some(assignee_id) = task
+        .user_id
+        .as_deref()
+        .filter(|user_id| *user_id != auth.user_id)
+    {
+        let event_data = json!({
+            "taskTitle": task.title.clone(),
+            "projectId": task.project_id.clone(),
+            "workspaceId": workspace_id,
+        });
+        let _ = create_user_notification(
+            &state,
+            assignee_id,
+            None,
+            None,
+            "task_assignee_changed",
+            Some(&event_data),
+            Some(&task.id),
+            Some("task"),
+        )
+        .await?;
+    }
+    Ok(Json(task))
+}
+
+async fn update_task_description(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<DescriptionInput>,
+) -> Result<Json<ApiTask>, ApiError> {
+    let (auth, _) = auth_for_task(&state, &headers, &id).await?;
+    let updated = state
+        .database
+        .client
+        .execute(
+            "UPDATE task SET description = $1, updated_at = NOW() WHERE id = $2",
+            &[&input.description, &id],
+        )
+        .await
+        .map_err(database_error)?;
+    if updated == 0 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "Task not found"));
+    }
+    let task = task_by_id(&state.database, &id).await?;
+    publish_task_event(
+        &state,
+        "TASK_UPDATED",
+        task.project_id.clone(),
+        id,
+        &auth,
+        &headers,
+    );
+    Ok(Json(task))
+}
+
+async fn move_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<MoveTaskInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_task(&state, &headers, &id).await?;
+    let existing_task = task_by_id(&state.database, &id).await?;
+    if existing_task.project_id == input.destination_project_id {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Task is already in that project",
+        ));
+    }
+    let destination_project = state
+        .database
+        .client
+        .query_opt(
+            "SELECT id, name, workspace_id FROM project WHERE id = $1 LIMIT 1",
+            &[&input.destination_project_id],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Project not found"))?;
+    let destination_workspace = row_string(&destination_project, "workspace_id")?;
+    if destination_workspace != workspace_id {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Tasks can only be moved within the same workspace",
+        ));
+    }
+    let source_project = state
+        .database
+        .client
+        .query_one(
+            "SELECT id, name FROM project WHERE id = $1 LIMIT 1",
+            &[&existing_task.project_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let columns = state
+        .database
+        .client
+        .query(
+            "SELECT id, slug FROM \"column\" WHERE project_id = $1 ORDER BY position ASC",
+            &[&input.destination_project_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let selected_column = if let Some(status) = input.destination_status.as_deref() {
+        columns
+            .iter()
+            .find(|row| row.try_get::<_, String>("slug").ok().as_deref() == Some(status))
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Selected status is not valid for the destination project",
+                )
+            })?
+    } else {
+        columns
+            .iter()
+            .find(|row| {
+                row.try_get::<_, String>("slug").ok().as_deref() == Some(&existing_task.status)
+            })
+            .or_else(|| columns.first())
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Destination project does not have a workflow",
+                )
+            })?
+    };
+    let destination_status = row_string(selected_column, "slug")?;
+    let destination_column_id = row_string(selected_column, "id")?;
+    let next_number: i32 = state
+        .database
+        .client
+        .query_one(
+            "UPDATE project SET last_task_number = last_task_number + 1 WHERE id = $1 RETURNING last_task_number",
+            &[&input.destination_project_id],
+        )
+        .await
+        .map_err(database_error)?
+        .try_get("last_task_number")
+        .map_err(database_error)?;
+    let next_position: i32 = state
+        .database
+        .client
+        .query_one(
+            "SELECT COALESCE(MAX(position), 0) + 1 AS position FROM task WHERE project_id = $1 AND status = $2 AND column_id = $3",
+            &[&input.destination_project_id, &destination_status, &destination_column_id],
+        )
+        .await
+        .map_err(database_error)?
+        .try_get("position")
+        .map_err(database_error)?;
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              UPDATE task
+              SET project_id = $1, status = $2, column_id = $3, number = $4,
+                  position = $5, updated_at = NOW()
+              WHERE id = $6
+            "#,
+            &[
+                &input.destination_project_id,
+                &destination_status,
+                &destination_column_id,
+                &next_number,
+                &next_position,
+                &id,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE asset SET project_id = $1 WHERE task_id = $2",
+            &[&input.destination_project_id, &id],
+        )
+        .await
+        .map_err(database_error)?;
+    let task = task_by_id(&state.database, &id).await?;
+    publish_task_move(
+        &state,
+        existing_task.project_id.clone(),
+        id.clone(),
+        &auth,
+        &headers,
+    );
+    publish_task_move(&state, task.project_id.clone(), id.clone(), &auth, &headers);
+    Ok(Json(json!({
+        "task": task,
+        "sourceProjectId": row_string(&source_project, "id")?,
+        "destinationProjectId": input.destination_project_id,
+    })))
+}
+
+async fn export_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let _ = auth_for_project(&state, &headers, &project_id).await?;
+    let project = state
+        .database
+        .client
+        .query_opt(
+            "SELECT id, name, slug, description FROM project WHERE id = $1 LIMIT 1",
+            &[&project_id],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Project not found"))?;
+    let rows = state
+        .database
+        .client
+        .query(
+            &format!(
+                "{} WHERE t.project_id = $1 ORDER BY t.position ASC",
+                task_select_sql()
+            ),
+            &[&project_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let exported_at: String = state
+        .database
+        .client
+        .query_one(
+            "SELECT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS exported_at",
+            &[],
+        )
+        .await
+        .map_err(database_error)?
+        .try_get("exported_at")
+        .map_err(database_error)?;
+    let tasks = rows
+        .into_iter()
+        .map(|row| {
+            Ok(json!({
+                "title": row_string(&row, "title")?,
+                "description": row_optional_string(&row, "description")?.unwrap_or_default(),
+                "status": row_string(&row, "status")?,
+                "priority": row_optional_string(&row, "priority")?.unwrap_or_else(|| "low".to_string()),
+                "dueDate": row_optional_string(&row, "due_date")?,
+                "startDate": row_optional_string(&row, "start_date")?,
+                "userId": row_optional_string(&row, "user_id")?,
+            }))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(Json(json!({
+        "project": {
+            "name": row_string(&project, "name")?,
+            "slug": row_string(&project, "slug")?,
+            "description": row_optional_string(&project, "description")?,
+            "exportedAt": exported_at,
+        },
+        "tasks": tasks,
+    })))
+}
+
+struct BulkTaskRecord {
+    id: String,
+    project_id: String,
+    workspace_id: String,
+}
+
+async fn bulk_update_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<BulkTaskInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    if input.task_ids.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "At least one task ID is required",
+        ));
+    }
+    let rows = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT t.id, t.title, t.project_id, t.assignee_id AS user_id,
+                     to_char(t.due_date AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS due_date,
+                     p.workspace_id
+              FROM task t
+              INNER JOIN project p ON p.id = t.project_id
+              WHERE t.id = ANY($1::text[])
+            "#,
+            &[&input.task_ids],
+        )
+        .await
+        .map_err(database_error)?;
+    if rows.is_empty() {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "No tasks found"));
+    }
+    let tasks = rows
+        .iter()
+        .map(|row| {
+            Ok(BulkTaskRecord {
+                id: row_string(row, "id")?,
+                project_id: row_string(row, "project_id")?,
+                workspace_id: row_string(row, "workspace_id")?,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let workspace_ids = tasks
+        .iter()
+        .map(|task| task.workspace_id.clone())
+        .collect::<HashSet<_>>();
+    if workspace_ids.len() > 1 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "All tasks must belong to the same workspace",
+        ));
+    }
+    let workspace_id = workspace_ids
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Could not determine workspace"))?;
+    require_workspace(&state, &auth, &workspace_id).await?;
+    let found_ids = tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>();
+    let mut updated_count: i64 = 0;
+
+    match input.operation.as_str() {
+        "updateStatus" => {
+            let status = input
+                .value
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "Status value is required")
+                })?;
+            let project_ids = tasks
+                .iter()
+                .map(|task| task.project_id.clone())
+                .collect::<HashSet<_>>();
+            for project_id in project_ids {
+                let column_id = if matches!(status, "planned" | "archived") {
+                    None
+                } else {
+                    state
+                        .database
+                        .client
+                        .query_opt(
+                            "SELECT id FROM \"column\" WHERE project_id = $1 AND slug = $2 LIMIT 1",
+                            &[&project_id, &status],
+                        )
+                        .await
+                        .map_err(database_error)?
+                        .map(|row| row_string(&row, "id"))
+                        .transpose()?
+                        .ok_or_else(|| {
+                            ApiError::new(
+                                StatusCode::BAD_REQUEST,
+                                format!("Invalid status \"{status}\" for this project"),
+                            )
+                        })?
+                        .into()
+                };
+                let project_task_ids = tasks
+                    .iter()
+                    .filter(|task| task.project_id == project_id)
+                    .map(|task| task.id.clone())
+                    .collect::<Vec<_>>();
+                updated_count += state
+                    .database
+                    .client
+                    .execute(
+                        "UPDATE task SET status = $1, column_id = $2, updated_at = NOW() WHERE id = ANY($3::text[])",
+                        &[&status, &column_id, &project_task_ids],
+                    )
+                    .await
+                    .map_err(database_error)? as i64;
+                for task_id in project_task_ids {
+                    publish_task_event(
+                        &state,
+                        "TASK_UPDATED",
+                        project_id.clone(),
+                        task_id,
+                        &auth,
+                        &headers,
+                    );
+                }
+            }
+        }
+        "updatePriority" => {
+            let priority = input
+                .value
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "Priority value is required")
+                })?;
+            validate_priority(priority)?;
+            updated_count = state
+                .database
+                .client
+                .execute(
+                    "UPDATE task SET priority = $1, updated_at = NOW() WHERE id = ANY($2::text[])",
+                    &[&priority, &found_ids],
+                )
+                .await
+                .map_err(database_error)? as i64;
+            for task in &tasks {
+                publish_task_event(
+                    &state,
+                    "TASK_UPDATED",
+                    task.project_id.clone(),
+                    task.id.clone(),
+                    &auth,
+                    &headers,
+                );
+            }
+        }
+        "updateAssignee" => {
+            let assignee_id = input
+                .value
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            if let Some(user_id) = assignee_id.as_deref() {
+                let user_exists = state
+                    .database
+                    .client
+                    .query_opt("SELECT 1 FROM \"user\" WHERE id = $1 LIMIT 1", &[&user_id])
+                    .await
+                    .map_err(database_error)?
+                    .is_some();
+                if !user_exists {
+                    return Err(ApiError::new(StatusCode::BAD_REQUEST, "User not found"));
+                }
+            }
+            updated_count = state
+                .database
+                .client
+                .execute(
+                    "UPDATE task SET assignee_id = $1, updated_at = NOW() WHERE id = ANY($2::text[])",
+                    &[&assignee_id, &found_ids],
+                )
+                .await
+                .map_err(database_error)? as i64;
+            for task in &tasks {
+                publish_task_event(
+                    &state,
+                    "TASK_UPDATED",
+                    task.project_id.clone(),
+                    task.id.clone(),
+                    &auth,
+                    &headers,
+                );
+            }
+        }
+        "delete" => {
+            updated_count = state
+                .database
+                .client
+                .execute("DELETE FROM task WHERE id = ANY($1::text[])", &[&found_ids])
+                .await
+                .map_err(database_error)? as i64;
+            for task in &tasks {
+                publish_task_event(
+                    &state,
+                    "TASK_DELETED",
+                    task.project_id.clone(),
+                    task.id.clone(),
+                    &auth,
+                    &headers,
+                );
+            }
+        }
+        "addLabel" => {
+            let label_id = input
+                .value
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Label ID is required"))?;
+            let label = state
+                .database
+                .client
+                .query_opt(
+                    "SELECT name, color FROM label WHERE id = $1 LIMIT 1",
+                    &[&label_id],
+                )
+                .await
+                .map_err(database_error)?
+                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Label not found"))?;
+            let label_name = row_string(&label, "name")?;
+            let label_color = row_string(&label, "color")?;
+            for task in &tasks {
+                let inserted = state
+                    .database
+                    .client
+                    .execute(
+                        "INSERT INTO label (id, name, color, created_at, updated_at, task_id, workspace_id) VALUES ($1, $2, $3, NOW(), NOW(), $4, $5) ON CONFLICT DO NOTHING",
+                        &[
+                            &Uuid::new_v4().to_string(),
+                            &label_name,
+                            &label_color,
+                            &task.id,
+                            &workspace_id,
+                        ],
+                    )
+                    .await
+                    .map_err(database_error)?;
+                updated_count += inserted as i64;
+                if inserted > 0 {
+                    publish_task_event(
+                        &state,
+                        "TASK_LABEL_UPDATED",
+                        task.project_id.clone(),
+                        task.id.clone(),
+                        &auth,
+                        &headers,
+                    );
+                }
+            }
+        }
+        "removeLabel" => {
+            let label_id = input
+                .value
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Label ID is required"))?;
+            updated_count = state
+                .database
+                .client
+                .execute(
+                    "UPDATE label SET task_id = NULL, updated_at = NOW() WHERE id = $1 AND task_id = ANY($2::text[])",
+                    &[&label_id, &found_ids],
+                )
+                .await
+                .map_err(database_error)? as i64;
+            for task in &tasks {
+                publish_task_event(
+                    &state,
+                    "TASK_LABEL_UPDATED",
+                    task.project_id.clone(),
+                    task.id.clone(),
+                    &auth,
+                    &headers,
+                );
+            }
+        }
+        "updateDueDate" => {
+            let due_date = input.value.clone().filter(|value| !value.is_empty());
+            if let Some(value) = due_date.as_deref() {
+                state
+                    .database
+                    .client
+                    .query_one("SELECT $1::text::timestamptz", &[&value])
+                    .await
+                    .map_err(|error| {
+                        ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            format!("Invalid date value \"{value}\": {error}"),
+                        )
+                    })?;
+            }
+            updated_count = state
+                .database
+                .client
+                .execute(
+                    "UPDATE task SET due_date = $1::text::timestamptz AT TIME ZONE 'UTC', updated_at = NOW() WHERE id = ANY($2::text[])",
+                    &[&due_date, &found_ids],
+                )
+                .await
+                .map_err(database_error)? as i64;
+            for task in &tasks {
+                publish_task_event(
+                    &state,
+                    "TASK_UPDATED",
+                    task.project_id.clone(),
+                    task.id.clone(),
+                    &auth,
+                    &headers,
+                );
+            }
+        }
+        operation => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("Unknown operation \"{operation}\""),
+            ));
+        }
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "updatedCount": updated_count,
+    })))
+}
+
+async fn import_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<ImportTasksInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
+    let project = state
+        .database
+        .client
+        .query_opt(
+            "SELECT id, name, slug FROM project WHERE id = $1 LIMIT 1",
+            &[&project_id],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Project not found"))?;
+    let valid_statuses = state
+        .database
+        .client
+        .query(
+            "SELECT slug FROM \"column\" WHERE project_id = $1 ORDER BY position ASC",
+            &[&project_id],
+        )
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|row| row_string(&row, "slug"))
+        .collect::<Result<HashSet<_>, ApiError>>()?;
+    let mut valid_statuses = valid_statuses;
+    valid_statuses.insert("planned".to_string());
+    valid_statuses.insert("archived".to_string());
+
+    let task_count = input.tasks.len() as i32;
+    let mut next_number = if task_count == 0 {
+        0
+    } else {
+        let last_number: i32 = state
+            .database
+            .client
+            .query_one(
+                "UPDATE project SET last_task_number = last_task_number + $1 WHERE id = $2 RETURNING last_task_number",
+                &[&task_count, &project_id],
+            )
+            .await
+            .map_err(database_error)?
+            .try_get("last_task_number")
+            .map_err(database_error)?;
+        last_number - task_count
+    };
+    let imported_at: String = state
+        .database
+        .client
+        .query_one(
+            "SELECT to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS imported_at",
+            &[],
+        )
+        .await
+        .map_err(database_error)?
+        .try_get("imported_at")
+        .map_err(database_error)?;
+    let mut results = Vec::with_capacity(input.tasks.len());
+
+    for task_input in input.tasks {
+        let (status, status_warning) = if valid_statuses.contains(&task_input.status) {
+            (task_input.status.clone(), None)
+        } else {
+            (
+                "planned".to_string(),
+                Some(format!(
+                    "Unknown status \"{}\" mapped to \"planned\"",
+                    task_input.status
+                )),
+            )
+        };
+        let (priority, priority_warning) = match task_input.priority.as_deref() {
+            Some(value)
+                if matches!(value, "no-priority" | "low" | "medium" | "high" | "urgent") =>
+            {
+                (value.to_string(), None)
+            }
+            Some(value) => (
+                "no-priority".to_string(),
+                Some(format!(
+                    "Unknown priority \"{value}\" mapped to \"no-priority\""
+                )),
+            ),
+            None => ("low".to_string(), None),
+        };
+        let column_id = if matches!(status.as_str(), "planned" | "archived") {
+            None
+        } else {
+            state
+                .database
+                .client
+                .query_opt(
+                    "SELECT id FROM \"column\" WHERE project_id = $1 AND slug = $2 LIMIT 1",
+                    &[&project_id, &status],
+                )
+                .await
+                .map_err(database_error)?
+                .map(|row| row_string(&row, "id"))
+                .transpose()?
+        };
+        next_number += 1;
+        let id = Uuid::new_v4().to_string();
+        let description = task_input.description.clone().unwrap_or_default();
+        let assignee_id = task_input.user_id.clone().filter(|value| !value.is_empty());
+        let insert_result = state
+            .database
+            .client
+            .execute(
+                r#"
+                  INSERT INTO task
+                    (id, project_id, number, assignee_id, title, description,
+                     status, column_id, priority, start_date, due_date, created_at, updated_at)
+                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                          $10::text::timestamptz AT TIME ZONE 'UTC',
+                          $11::text::timestamptz AT TIME ZONE 'UTC', NOW(), NOW())
+                "#,
+                &[
+                    &id,
+                    &project_id,
+                    &next_number,
+                    &assignee_id,
+                    &task_input.title,
+                    &description,
+                    &status,
+                    &column_id,
+                    &priority,
+                    &task_input.start_date,
+                    &task_input.due_date,
+                ],
+            )
+            .await;
+        match insert_result {
+            Ok(_) => {
+                let task = task_by_id(&state.database, &id).await?;
+                publish_task_event(
+                    &state,
+                    "TASK_CREATED",
+                    task.project_id.clone(),
+                    task.id.clone(),
+                    &auth,
+                    &headers,
+                );
+                let warnings = [status_warning, priority_warning]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                let mut result = json!({
+                    "success": true,
+                    "task": task,
+                });
+                if !warnings.is_empty() {
+                    result["warnings"] = json!(warnings);
+                }
+                results.push(result);
+            }
+            Err(error) => {
+                results.push(json!({
+                    "success": false,
+                    "error": error.to_string(),
+                    "task": {
+                        "title": task_input.title,
+                        "description": description,
+                        "status": task_input.status,
+                        "priority": task_input.priority.unwrap_or_else(|| "low".to_string()),
+                        "startDate": task_input.start_date,
+                        "dueDate": task_input.due_date,
+                        "userId": task_input.user_id,
+                    },
+                }));
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "importedAt": imported_at,
+        "project": {
+            "id": row_string(&project, "id")?,
+            "name": row_string(&project, "name")?,
+            "slug": row_string(&project, "slug")?,
+        },
+        "results": {
+            "total": results.len(),
+            "successful": results.iter().filter(|result| result["success"] == true).count(),
+            "failed": results.iter().filter(|result| result["success"] == false).count(),
+            "tasks": results,
+        },
+        "workspaceId": workspace_id,
+    })))
+}
+
 async fn create_task(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6142,6 +7017,8 @@ fn app(state: AppState) -> Router {
                 .delete(delete_workflow_rule),
         )
         .route("/api/task/tasks/{project_id}", get(list_tasks))
+        .route("/api/task/bulk", patch(bulk_update_tasks))
+        .route("/api/task/import/{project_id}", post(import_tasks))
         .route(
             "/api/task/{id}",
             get(get_task)
@@ -6153,6 +7030,10 @@ fn app(state: AppState) -> Router {
         .route("/api/task/title/{id}", put(update_task_title))
         .route("/api/task/priority/{id}", put(update_task_priority))
         .route("/api/task/due-date/{id}", put(update_task_due_date))
+        .route("/api/task/assignee/{id}", put(update_task_assignee))
+        .route("/api/task/description/{id}", put(update_task_description))
+        .route("/api/task/move/{id}", put(move_task))
+        .route("/api/task/export/{project_id}", get(export_tasks))
         .route("/api/agent/runs", post(start_agent))
         .route("/api/agent/runs/{id}", get(get_agent))
         .route("/api/agent/runs/{id}/cancel", post(cancel_agent))

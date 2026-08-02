@@ -57,8 +57,9 @@ receiving WebSocket updates.
 The Rust migration in [`rust/`](rust/README.md) now owns the bounded parallel
 agent runner, authenticated PostgreSQL board API, project/column CRUD,
 public-project reads, workspace members, workflow rules, global search, labels,
-task mutations, external links, activity/comments, task relations, time
-entries, organization membership and permission reads, notifications, pending
+task mutations including field-specific updates, move/export/import and bulk
+operations, external links, activity/comments, task relations, time entries,
+organization membership and permission reads, notifications, pending
 invitations, public invitation details, custom-OAuth id-token reads, workspace
 billing state, native notification creation, and live project WebSockets, plus
 a native Tauri shell.

@@ -7,7 +7,8 @@ Tauri desktop shell that starts the Rust API and can serve the built web app.
 
 The Rust API also owns the board's live project WebSocket, project and column
 CRUD, public-project reads, workspace member reads, workflow-rule CRUD, global
-search, label CRUD and assignment, task label reads, external-link reads,
+search, label CRUD and assignment, task label reads, task field updates,
+cross-project move/export/import and bulk operations, external-link reads,
 activity and comment CRUD, task-relation CRUD, time-entry CRUD, organization
 membership and permission reads, notification inbox operations, pending
 invitations and public invitation details, custom-OAuth id-token reads, and
