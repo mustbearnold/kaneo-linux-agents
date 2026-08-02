@@ -61,8 +61,9 @@ task mutations including field-specific updates, move/export/import and bulk
 operations, external links, activity/comments, task relations, time entries,
 organization membership and permission reads, notifications, pending
 invitations, public invitation details, custom-OAuth id-token reads, workspace
-billing state, native notification creation, and live project WebSockets, plus
-a native Tauri shell.
+billing state, notification preference/workspace-rule CRUD with compatible
+AES-GCM secret storage, native notification creation, and live project
+WebSockets, plus a native Tauri shell.
 Packaged Linux desktop builds start the Rust API by default; the legacy
 TypeScript API remains on a private compatibility port for routes that have
 not moved yet, and can be selected explicitly with `KANEO_API_RUNTIME=node`.

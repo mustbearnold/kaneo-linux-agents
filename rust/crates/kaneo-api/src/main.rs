@@ -8,6 +8,8 @@
 //! origin without pretending that the remaining integration surface has
 //! already been ported.
 
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
 use axum::body::{Body, to_bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
@@ -25,11 +27,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::net::IpAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, lookup_host};
 use tokio::sync::broadcast;
 use tokio_postgres::{Client, NoTls, Row};
+use url::Url;
 use uuid::Uuid;
 
 const DEFAULT_BIND: &str = "127.0.0.1:1337";
@@ -333,6 +337,39 @@ struct CreateNotificationInput {
     event_data: Option<Value>,
     related_entity_id: Option<String>,
     related_entity_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateNotificationPreferencesInput {
+    email_enabled: Option<bool>,
+    ntfy_enabled: Option<bool>,
+    ntfy_server_url: Option<Option<String>>,
+    ntfy_topic: Option<Option<String>>,
+    ntfy_token: Option<Option<String>>,
+    gotify_enabled: Option<bool>,
+    gotify_server_url: Option<Option<String>>,
+    gotify_token: Option<Option<String>>,
+    webhook_enabled: Option<bool>,
+    webhook_url: Option<Option<String>>,
+    webhook_secret: Option<Option<String>>,
+    task_assignment_enabled: Option<bool>,
+    task_comment_enabled: Option<bool>,
+    task_status_change_enabled: Option<bool>,
+    due_date_reminder_enabled: Option<bool>,
+    due_date_reminder_lead_time_minutes: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationWorkspaceRuleInput {
+    is_active: bool,
+    email_enabled: bool,
+    ntfy_enabled: bool,
+    gotify_enabled: bool,
+    webhook_enabled: bool,
+    project_mode: String,
+    selected_project_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6258,6 +6295,1054 @@ async fn clear_notifications(
     Ok(Json(json!({ "success": true })))
 }
 
+const NOTIFICATION_SECRET_PREFIX: &str = "enc:v1:";
+
+fn notification_secret_key() -> Result<[u8; 32], ApiError> {
+    let raw_key = env::var("NOTIFICATION_SECRET_ENCRYPTION_KEY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "NOTIFICATION_SECRET_ENCRYPTION_KEY is required to store encrypted notification secrets",
+            )
+        })?;
+    let digest = Sha256::digest(raw_key.as_bytes());
+    let mut key = [0_u8; 32];
+    key.copy_from_slice(&digest);
+    Ok(key)
+}
+
+fn decrypt_notification_secret(value: Option<&String>) -> Result<Option<String>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !value.starts_with(NOTIFICATION_SECRET_PREFIX) {
+        return Ok(Some(value.clone()));
+    }
+
+    let payload = &value[NOTIFICATION_SECRET_PREFIX.len()..];
+    let mut parts = payload.split('.');
+    let iv_part = parts.next().filter(|part| !part.is_empty());
+    let tag_part = parts.next().filter(|part| !part.is_empty());
+    let encrypted_part = parts.next().filter(|part| !part.is_empty());
+    let (Some(iv_part), Some(tag_part), Some(encrypted_part)) = (iv_part, tag_part, encrypted_part)
+    else {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid encrypted notification secret payload",
+        ));
+    };
+
+    let iv = URL_SAFE_NO_PAD.decode(iv_part).map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to decrypt notification secret",
+        )
+    })?;
+    let auth_tag = URL_SAFE_NO_PAD.decode(tag_part).map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to decrypt notification secret",
+        )
+    })?;
+    let encrypted = URL_SAFE_NO_PAD.decode(encrypted_part).map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to decrypt notification secret",
+        )
+    })?;
+    if iv.len() != 12 || auth_tag.len() != 16 {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to decrypt notification secret",
+        ));
+    }
+
+    let key = notification_secret_key().map_err(|error| {
+        if error.status == StatusCode::INTERNAL_SERVER_ERROR
+            && error.message.contains("required to store")
+        {
+            error
+        } else {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to decrypt notification secret",
+            )
+        }
+    })?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to decrypt notification secret",
+        )
+    })?;
+    let mut sealed = encrypted;
+    sealed.extend_from_slice(&auth_tag);
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&iv), sealed.as_ref())
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to decrypt notification secret",
+            )
+        })?;
+    String::from_utf8(plaintext).map(Some).map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to decrypt notification secret",
+        )
+    })
+}
+
+fn encrypt_notification_secret(value: Option<&str>) -> Result<Option<String>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    if value.starts_with(NOTIFICATION_SECRET_PREFIX) {
+        let candidate = value.to_string();
+        if decrypt_notification_secret(Some(&candidate)).is_ok() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    let key = notification_secret_key()?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to encrypt notification secret",
+        )
+    })?;
+    let nonce_bytes = Uuid::new_v4();
+    let nonce = &nonce_bytes.as_bytes()[..12];
+    let sealed = cipher
+        .encrypt(Nonce::from_slice(nonce), value.as_bytes())
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to encrypt notification secret",
+            )
+        })?;
+    if sealed.len() < 16 {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to encrypt notification secret",
+        ));
+    }
+    let split = sealed.len() - 16;
+    let encrypted = &sealed[..split];
+    let auth_tag = &sealed[split..];
+    Ok(Some(format!(
+        "{NOTIFICATION_SECRET_PREFIX}{}.{}.{}",
+        URL_SAFE_NO_PAD.encode(nonce),
+        URL_SAFE_NO_PAD.encode(auth_tag),
+        URL_SAFE_NO_PAD.encode(encrypted),
+    )))
+}
+
+fn normalize_notification_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn merged_notification_string(
+    input: &Option<Option<String>>,
+    existing: Option<&String>,
+) -> Option<String> {
+    match input {
+        Some(value) => normalize_notification_string(value.as_deref()),
+        None => existing.cloned(),
+    }
+}
+
+fn mask_notification_secret(value: Option<&String>) -> Option<String> {
+    let value = value.filter(|value| !value.is_empty())?;
+    let characters = value.chars().collect::<Vec<_>>();
+    if characters.len() > 8 {
+        let prefix = characters[..4].iter().collect::<String>();
+        let suffix = characters[characters.len() - 4..]
+            .iter()
+            .collect::<String>();
+        Some(format!("{prefix}…{suffix}"))
+    } else {
+        Some("••••".to_string())
+    }
+}
+
+fn row_optional_string_from(row: Option<&Row>, name: &str) -> Result<Option<String>, ApiError> {
+    row.map(|row| row_optional_string(row, name))
+        .transpose()
+        .map(|value| value.flatten())
+}
+
+fn row_bool_from(row: Option<&Row>, name: &str, fallback: bool) -> Result<bool, ApiError> {
+    row.map(|row| row.try_get::<_, bool>(name).map_err(database_error))
+        .transpose()
+        .map(|value| value.unwrap_or(fallback))
+}
+
+fn row_i32_from(row: Option<&Row>, name: &str, fallback: i32) -> Result<i32, ApiError> {
+    row.map(|row| row.try_get::<_, i32>(name).map_err(database_error))
+        .transpose()
+        .map(|value| value.unwrap_or(fallback))
+}
+
+fn is_private_notification_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            octets[0] == 0
+                || octets[0] == 10
+                || octets[0] == 127
+                || (octets[0] == 169 && octets[1] == 254)
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 168)
+        }
+        IpAddr::V6(address) => {
+            let first = address.segments()[0];
+            address.is_unspecified()
+                || address.is_loopback()
+                || (first & 0xffc0) == 0xfe80
+                || (first & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+async fn validate_notification_destination(value: &str) -> Result<(), ApiError> {
+    let url = Url::parse(value).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid webhook URL: {error}"),
+        )
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Generic webhook URL must use http or https",
+        ));
+    }
+    if env::var("KANEO_ALLOW_PRIVATE_WEBHOOK_DESTINATIONS")
+        .is_ok_and(|value| value == "true" || value == "1")
+    {
+        return Ok(());
+    }
+
+    let host = url.host_str().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Generic webhook destination could not be resolved",
+        )
+    })?;
+    if host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(is_private_notification_ip)
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Generic webhook destination resolves to a non-routable address",
+        ));
+    }
+
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addresses = lookup_host((host, port)).await.map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Generic webhook destination could not be resolved",
+        )
+    })?;
+    let mut found = false;
+    for address in addresses {
+        found = true;
+        if is_private_notification_ip(address.ip()) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Generic webhook destination resolves to a non-routable address",
+            ));
+        }
+    }
+    if !found {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Generic webhook destination could not be resolved",
+        ));
+    }
+    Ok(())
+}
+
+async fn notification_user_email(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Option<String>, ApiError> {
+    state
+        .database
+        .client
+        .query_opt(
+            "SELECT email FROM \"user\" WHERE id = $1 LIMIT 1",
+            &[&user_id],
+        )
+        .await
+        .map_err(database_error)?
+        .map(|row| row_optional_string(&row, "email"))
+        .transpose()
+        .map(|value| value.flatten())
+}
+
+async fn notification_preferences_json(state: &AppState, user_id: &str) -> Result<Value, ApiError> {
+    let email_address = notification_user_email(state, user_id).await?;
+    let preference = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT email_enabled, ntfy_enabled, ntfy_server_url, ntfy_topic,
+                     ntfy_token, gotify_enabled, gotify_server_url, gotify_token,
+                     webhook_enabled, webhook_url, webhook_secret,
+                     task_assignment_enabled, task_comment_enabled,
+                     task_status_change_enabled, due_date_reminder_enabled,
+                     due_date_reminder_lead_time_minutes,
+                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+              FROM user_notification_preference
+              WHERE user_id = $1
+              LIMIT 1
+            "#,
+            &[&user_id],
+        )
+        .await
+        .map_err(database_error)?;
+
+    let raw_ntfy_token = row_optional_string_from(preference.as_ref(), "ntfy_token")?;
+    let raw_gotify_token = row_optional_string_from(preference.as_ref(), "gotify_token")?;
+    let raw_webhook_secret = row_optional_string_from(preference.as_ref(), "webhook_secret")?;
+    let ntfy_token = decrypt_notification_secret(raw_ntfy_token.as_ref())?;
+    let gotify_token = decrypt_notification_secret(raw_gotify_token.as_ref())?;
+    let webhook_secret = decrypt_notification_secret(raw_webhook_secret.as_ref())?;
+    let ntfy_server_url = row_optional_string_from(preference.as_ref(), "ntfy_server_url")?;
+    let ntfy_topic = row_optional_string_from(preference.as_ref(), "ntfy_topic")?;
+    let gotify_server_url = row_optional_string_from(preference.as_ref(), "gotify_server_url")?;
+    let webhook_url = row_optional_string_from(preference.as_ref(), "webhook_url")?;
+
+    let rules = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT r.id, r.workspace_id, w.name AS workspace_name,
+                     r.is_active, r.email_enabled, r.ntfy_enabled,
+                     r.gotify_enabled, r.webhook_enabled, r.project_mode,
+                     to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     to_char(r.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+              FROM user_notification_workspace_rule r
+              INNER JOIN workspace w ON w.id = r.workspace_id
+              WHERE r.user_id = $1
+              ORDER BY r.created_at ASC
+            "#,
+            &[&user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let selected_projects = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT p.workspace_rule_id, p.project_id
+              FROM user_notification_workspace_project p
+              INNER JOIN user_notification_workspace_rule r
+                ON r.id = p.workspace_rule_id
+              WHERE r.user_id = $1
+            "#,
+            &[&user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let mut projects_by_rule = HashMap::<String, Vec<String>>::new();
+    for row in selected_projects {
+        projects_by_rule
+            .entry(row_string(&row, "workspace_rule_id")?)
+            .or_default()
+            .push(row_string(&row, "project_id")?);
+    }
+
+    let workspace_rules = rules
+        .into_iter()
+        .map(|row| {
+            let id = row_string(&row, "id")?;
+            let project_mode = row_string(&row, "project_mode")?;
+            Ok(json!({
+                "id": id.clone(),
+                "workspaceId": row_string(&row, "workspace_id")?,
+                "workspaceName": row_string(&row, "workspace_name")?,
+                "isActive": row.try_get::<_, bool>("is_active").map_err(database_error)?,
+                "emailEnabled": row.try_get::<_, bool>("email_enabled").map_err(database_error)?,
+                "ntfyEnabled": row.try_get::<_, bool>("ntfy_enabled").map_err(database_error)?,
+                "gotifyEnabled": row.try_get::<_, bool>("gotify_enabled").map_err(database_error)?,
+                "webhookEnabled": row.try_get::<_, bool>("webhook_enabled").map_err(database_error)?,
+                "projectMode": if project_mode == "selected" { "selected" } else { "all" },
+                "selectedProjectIds": projects_by_rule.remove(&id).unwrap_or_default(),
+                "createdAt": row_string(&row, "created_at")?,
+                "updatedAt": row_string(&row, "updated_at")?,
+            }))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    Ok(json!({
+        "emailAddress": email_address,
+        "emailEnabled": row_bool_from(preference.as_ref(), "email_enabled", false)?,
+        "ntfyEnabled": row_bool_from(preference.as_ref(), "ntfy_enabled", false)?,
+        "ntfyConfigured": ntfy_server_url.is_some() && ntfy_topic.is_some(),
+        "ntfyServerUrl": ntfy_server_url,
+        "ntfyTopic": ntfy_topic,
+        "ntfyTokenConfigured": ntfy_token.is_some(),
+        "maskedNtfyToken": mask_notification_secret(ntfy_token.as_ref()),
+        "gotifyEnabled": row_bool_from(preference.as_ref(), "gotify_enabled", false)?,
+        "gotifyConfigured": gotify_server_url.is_some() && gotify_token.is_some(),
+        "gotifyServerUrl": gotify_server_url,
+        "gotifyTokenConfigured": gotify_token.is_some(),
+        "maskedGotifyToken": mask_notification_secret(gotify_token.as_ref()),
+        "webhookEnabled": row_bool_from(preference.as_ref(), "webhook_enabled", false)?,
+        "webhookConfigured": webhook_url.is_some(),
+        "webhookUrl": webhook_url,
+        "webhookSecretConfigured": webhook_secret.is_some(),
+        "maskedWebhookSecret": mask_notification_secret(webhook_secret.as_ref()),
+        "taskAssignmentEnabled": row_bool_from(preference.as_ref(), "task_assignment_enabled", true)?,
+        "taskCommentEnabled": row_bool_from(preference.as_ref(), "task_comment_enabled", true)?,
+        "taskStatusChangeEnabled": row_bool_from(preference.as_ref(), "task_status_change_enabled", true)?,
+        "dueDateReminderEnabled": row_bool_from(preference.as_ref(), "due_date_reminder_enabled", true)?,
+        "dueDateReminderLeadTimeMinutes": row_i32_from(preference.as_ref(), "due_date_reminder_lead_time_minutes", 1440)?,
+        "workspaces": workspace_rules,
+        "createdAt": row_optional_string_from(preference.as_ref(), "created_at")?,
+        "updatedAt": row_optional_string_from(preference.as_ref(), "updated_at")?,
+    }))
+}
+
+async fn require_notification_workspace_membership(
+    state: &AppState,
+    user_id: &str,
+    workspace_id: &str,
+) -> Result<(), ApiError> {
+    let member = state
+        .database
+        .client
+        .query_opt(
+            "SELECT 1 FROM workspace_member WHERE user_id = $1 AND workspace_id = $2 LIMIT 1",
+            &[&user_id, &workspace_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if member.is_none() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "You don't have access to this workspace",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_notification_project_selection(
+    state: &AppState,
+    workspace_id: &str,
+    project_ids: &[String],
+) -> Result<(), ApiError> {
+    if project_ids.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Select at least one project for selected project mode",
+        ));
+    }
+    let unique = project_ids.iter().collect::<HashSet<_>>();
+    if unique.len() != project_ids.len() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "One or more selected projects are invalid",
+        ));
+    }
+    for project_id in project_ids {
+        let project = state
+            .database
+            .client
+            .query_opt(
+                "SELECT 1 FROM project WHERE id = $1 AND workspace_id = $2 LIMIT 1",
+                &[&project_id, &workspace_id],
+            )
+            .await
+            .map_err(database_error)?;
+        if project.is_none() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "One or more selected projects are invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn get_notification_preferences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    Ok(Json(
+        notification_preferences_json(&state, &auth.user_id).await?,
+    ))
+}
+
+async fn update_notification_preferences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<UpdateNotificationPreferencesInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let email_address = notification_user_email(&state, &auth.user_id).await?;
+    let existing = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT email_enabled, ntfy_enabled, ntfy_server_url, ntfy_topic,
+                     ntfy_token, gotify_enabled, gotify_server_url, gotify_token,
+                     webhook_enabled, webhook_url, webhook_secret,
+                     task_assignment_enabled, task_comment_enabled,
+                     task_status_change_enabled, due_date_reminder_enabled,
+                     due_date_reminder_lead_time_minutes
+              FROM user_notification_preference
+              WHERE user_id = $1
+              LIMIT 1
+            "#,
+            &[&auth.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+
+    let existing_ntfy_server_url = row_optional_string_from(existing.as_ref(), "ntfy_server_url")?;
+    let existing_ntfy_topic = row_optional_string_from(existing.as_ref(), "ntfy_topic")?;
+    let existing_gotify_server_url =
+        row_optional_string_from(existing.as_ref(), "gotify_server_url")?;
+    let existing_webhook_url = row_optional_string_from(existing.as_ref(), "webhook_url")?;
+    let existing_ntfy_token_raw = row_optional_string_from(existing.as_ref(), "ntfy_token")?;
+    let existing_gotify_token_raw = row_optional_string_from(existing.as_ref(), "gotify_token")?;
+    let existing_webhook_secret_raw =
+        row_optional_string_from(existing.as_ref(), "webhook_secret")?;
+    let _existing_ntfy_token = decrypt_notification_secret(existing_ntfy_token_raw.as_ref())?;
+    let existing_gotify_token = decrypt_notification_secret(existing_gotify_token_raw.as_ref())?;
+    let _existing_webhook_secret =
+        decrypt_notification_secret(existing_webhook_secret_raw.as_ref())?;
+
+    let email_enabled =
+        input
+            .email_enabled
+            .unwrap_or(row_bool_from(existing.as_ref(), "email_enabled", false)?);
+    let ntfy_enabled =
+        input
+            .ntfy_enabled
+            .unwrap_or(row_bool_from(existing.as_ref(), "ntfy_enabled", false)?);
+    let gotify_enabled =
+        input
+            .gotify_enabled
+            .unwrap_or(row_bool_from(existing.as_ref(), "gotify_enabled", false)?);
+    let webhook_enabled = input.webhook_enabled.unwrap_or(row_bool_from(
+        existing.as_ref(),
+        "webhook_enabled",
+        false,
+    )?);
+    let ntfy_server_url =
+        merged_notification_string(&input.ntfy_server_url, existing_ntfy_server_url.as_ref());
+    let ntfy_topic = merged_notification_string(&input.ntfy_topic, existing_ntfy_topic.as_ref());
+    let gotify_server_url = merged_notification_string(
+        &input.gotify_server_url,
+        existing_gotify_server_url.as_ref(),
+    );
+    let webhook_url = merged_notification_string(&input.webhook_url, existing_webhook_url.as_ref());
+    let ntfy_token_input = input
+        .ntfy_token
+        .as_ref()
+        .map(|value| normalize_notification_string(value.as_deref()));
+    let gotify_token_input = input
+        .gotify_token
+        .as_ref()
+        .map(|value| normalize_notification_string(value.as_deref()));
+    let webhook_secret_input = input
+        .webhook_secret
+        .as_ref()
+        .map(|value| normalize_notification_string(value.as_deref()));
+    let gotify_token = gotify_token_input.clone().flatten().or_else(|| {
+        existing_gotify_token
+            .clone()
+            .filter(|_| input.gotify_token.is_none())
+    });
+
+    let due_date_reminder_lead_time_minutes =
+        input
+            .due_date_reminder_lead_time_minutes
+            .unwrap_or(row_i32_from(
+                existing.as_ref(),
+                "due_date_reminder_lead_time_minutes",
+                1440,
+            )?);
+    if !(5..=43_200).contains(&due_date_reminder_lead_time_minutes) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "dueDateReminderLeadTimeMinutes must be between 5 and 43200",
+        ));
+    }
+    if email_enabled && email_address.is_none() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Email notifications require an account email address",
+        ));
+    }
+
+    let should_validate_ntfy = ntfy_enabled
+        || input.ntfy_server_url.is_some()
+        || input.ntfy_topic.is_some()
+        || input.ntfy_token.is_some();
+    let should_validate_gotify =
+        gotify_enabled || input.gotify_server_url.is_some() || input.gotify_token.is_some();
+    let should_validate_webhook =
+        webhook_enabled || input.webhook_url.is_some() || input.webhook_secret.is_some();
+
+    if should_validate_ntfy {
+        let Some(server_url) = ntfy_server_url.as_deref() else {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "ntfy requires a server URL and topic",
+            ));
+        };
+        if ntfy_topic.is_none() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "ntfy requires a server URL and topic",
+            ));
+        }
+        validate_notification_destination(server_url)
+            .await
+            .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.message))?;
+    }
+    if should_validate_gotify {
+        let Some(server_url) = gotify_server_url.as_deref() else {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Gotify requires a server URL and app token",
+            ));
+        };
+        if gotify_token.is_none() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Gotify requires a server URL and app token",
+            ));
+        }
+        validate_notification_destination(server_url)
+            .await
+            .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.message))?;
+    }
+    if should_validate_webhook {
+        let Some(webhook_url) = webhook_url.as_deref() else {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Webhook notifications require an endpoint URL",
+            ));
+        };
+        validate_notification_destination(webhook_url)
+            .await
+            .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.message))?;
+    }
+
+    let stored_ntfy_token = if input.ntfy_token.is_some() {
+        encrypt_notification_secret(ntfy_token_input.as_ref().and_then(Option::as_deref))?
+    } else {
+        existing_ntfy_token_raw.clone()
+    };
+    let stored_gotify_token = if input.gotify_token.is_some() {
+        encrypt_notification_secret(gotify_token_input.as_ref().and_then(Option::as_deref))?
+    } else {
+        existing_gotify_token_raw.clone()
+    };
+    let stored_webhook_secret = if input.webhook_secret.is_some() {
+        encrypt_notification_secret(webhook_secret_input.as_ref().and_then(Option::as_deref))?
+    } else {
+        existing_webhook_secret_raw.clone()
+    };
+    let task_assignment_enabled = input.task_assignment_enabled.unwrap_or(row_bool_from(
+        existing.as_ref(),
+        "task_assignment_enabled",
+        true,
+    )?);
+    let task_comment_enabled = input.task_comment_enabled.unwrap_or(row_bool_from(
+        existing.as_ref(),
+        "task_comment_enabled",
+        true,
+    )?);
+    let task_status_change_enabled = input.task_status_change_enabled.unwrap_or(row_bool_from(
+        existing.as_ref(),
+        "task_status_change_enabled",
+        true,
+    )?);
+    let due_date_reminder_enabled = input.due_date_reminder_enabled.unwrap_or(row_bool_from(
+        existing.as_ref(),
+        "due_date_reminder_enabled",
+        true,
+    )?);
+
+    if existing.is_some() {
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  UPDATE user_notification_preference
+                  SET email_enabled = $2, ntfy_enabled = $3,
+                      ntfy_server_url = $4, ntfy_topic = $5, ntfy_token = $6,
+                      gotify_enabled = $7, gotify_server_url = $8, gotify_token = $9,
+                      webhook_enabled = $10, webhook_url = $11, webhook_secret = $12,
+                      task_assignment_enabled = $13, task_comment_enabled = $14,
+                      task_status_change_enabled = $15, due_date_reminder_enabled = $16,
+                      due_date_reminder_lead_time_minutes = $17, updated_at = NOW()
+                  WHERE user_id = $1
+                "#,
+                &[
+                    &auth.user_id,
+                    &email_enabled,
+                    &ntfy_enabled,
+                    &ntfy_server_url,
+                    &ntfy_topic,
+                    &stored_ntfy_token,
+                    &gotify_enabled,
+                    &gotify_server_url,
+                    &stored_gotify_token,
+                    &webhook_enabled,
+                    &webhook_url,
+                    &stored_webhook_secret,
+                    &task_assignment_enabled,
+                    &task_comment_enabled,
+                    &task_status_change_enabled,
+                    &due_date_reminder_enabled,
+                    &due_date_reminder_lead_time_minutes,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+    } else {
+        let id = Uuid::new_v4().to_string();
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  INSERT INTO user_notification_preference
+                    (id, user_id, email_enabled, ntfy_enabled, ntfy_server_url,
+                     ntfy_topic, ntfy_token, gotify_enabled, gotify_server_url,
+                     gotify_token, webhook_enabled, webhook_url, webhook_secret,
+                     task_assignment_enabled, task_comment_enabled,
+                     task_status_change_enabled, due_date_reminder_enabled,
+                     due_date_reminder_lead_time_minutes, created_at, updated_at)
+                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                          $13, $14, $15, $16, $17, $18, NOW(), NOW())
+                "#,
+                &[
+                    &id,
+                    &auth.user_id,
+                    &email_enabled,
+                    &ntfy_enabled,
+                    &ntfy_server_url,
+                    &ntfy_topic,
+                    &stored_ntfy_token,
+                    &gotify_enabled,
+                    &gotify_server_url,
+                    &stored_gotify_token,
+                    &webhook_enabled,
+                    &webhook_url,
+                    &stored_webhook_secret,
+                    &task_assignment_enabled,
+                    &task_comment_enabled,
+                    &task_status_change_enabled,
+                    &due_date_reminder_enabled,
+                    &due_date_reminder_lead_time_minutes,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+
+    let previous_email_enabled = row_bool_from(existing.as_ref(), "email_enabled", false)?;
+    let previous_ntfy_enabled = row_bool_from(existing.as_ref(), "ntfy_enabled", false)?;
+    let previous_gotify_enabled = row_bool_from(existing.as_ref(), "gotify_enabled", false)?;
+    let previous_webhook_enabled = row_bool_from(existing.as_ref(), "webhook_enabled", false)?;
+    let disable_email = !email_enabled;
+    let enable_email = email_enabled && !previous_email_enabled && email_address.is_some();
+    let disable_ntfy = !ntfy_enabled || ntfy_server_url.is_none() || ntfy_topic.is_none();
+    let enable_ntfy =
+        ntfy_enabled && !previous_ntfy_enabled && ntfy_server_url.is_some() && ntfy_topic.is_some();
+    let disable_gotify = !gotify_enabled || gotify_server_url.is_none() || gotify_token.is_none();
+    let enable_gotify = gotify_enabled
+        && !previous_gotify_enabled
+        && gotify_server_url.is_some()
+        && gotify_token.is_some();
+    let disable_webhook = !webhook_enabled || webhook_url.is_none();
+    let enable_webhook = webhook_enabled && !previous_webhook_enabled && webhook_url.is_some();
+    if disable_email
+        || enable_email
+        || disable_ntfy
+        || enable_ntfy
+        || disable_gotify
+        || enable_gotify
+        || disable_webhook
+        || enable_webhook
+    {
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  UPDATE user_notification_workspace_rule
+                  SET email_enabled = CASE WHEN $2 THEN FALSE WHEN $3 THEN TRUE ELSE email_enabled END,
+                      ntfy_enabled = CASE WHEN $4 THEN FALSE WHEN $5 THEN TRUE ELSE ntfy_enabled END,
+                      gotify_enabled = CASE WHEN $6 THEN FALSE WHEN $7 THEN TRUE ELSE gotify_enabled END,
+                      webhook_enabled = CASE WHEN $8 THEN FALSE WHEN $9 THEN TRUE ELSE webhook_enabled END,
+                      updated_at = NOW()
+                  WHERE user_id = $1 AND is_active = TRUE
+                    AND (email_enabled = TRUE OR ntfy_enabled = TRUE
+                      OR gotify_enabled = TRUE OR webhook_enabled = TRUE)
+                "#,
+                &[
+                    &auth.user_id,
+                    &disable_email,
+                    &enable_email,
+                    &disable_ntfy,
+                    &enable_ntfy,
+                    &disable_gotify,
+                    &enable_gotify,
+                    &disable_webhook,
+                    &enable_webhook,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+
+    Ok(Json(
+        notification_preferences_json(&state, &auth.user_id).await?,
+    ))
+}
+
+async fn upsert_notification_workspace_rule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+    Json(input): Json<NotificationWorkspaceRuleInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    require_notification_workspace_membership(&state, &auth.user_id, &workspace_id).await?;
+    if !matches!(input.project_mode.as_str(), "all" | "selected") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid notification project mode",
+        ));
+    }
+    let selected_project_ids = input.selected_project_ids.clone().unwrap_or_default();
+    if input.project_mode == "selected" {
+        validate_notification_project_selection(&state, &workspace_id, &selected_project_ids)
+            .await?;
+    }
+
+    let preference = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT email_enabled, ntfy_enabled, ntfy_server_url, ntfy_topic,
+                     gotify_enabled, gotify_server_url, gotify_token,
+                     webhook_enabled, webhook_url
+              FROM user_notification_preference
+              WHERE user_id = $1
+              LIMIT 1
+            "#,
+            &[&auth.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let email_address = notification_user_email(&state, &auth.user_id).await?;
+    let global_email_enabled = row_bool_from(preference.as_ref(), "email_enabled", false)?;
+    let global_ntfy_enabled = row_bool_from(preference.as_ref(), "ntfy_enabled", false)?;
+    let global_gotify_enabled = row_bool_from(preference.as_ref(), "gotify_enabled", false)?;
+    let global_webhook_enabled = row_bool_from(preference.as_ref(), "webhook_enabled", false)?;
+    let global_ntfy_server_url = row_optional_string_from(preference.as_ref(), "ntfy_server_url")?;
+    let global_ntfy_topic = row_optional_string_from(preference.as_ref(), "ntfy_topic")?;
+    let global_gotify_server_url =
+        row_optional_string_from(preference.as_ref(), "gotify_server_url")?;
+    let global_gotify_token = row_optional_string_from(preference.as_ref(), "gotify_token")?;
+    let global_webhook_url = row_optional_string_from(preference.as_ref(), "webhook_url")?;
+
+    if input.email_enabled && (!global_email_enabled || email_address.is_none()) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Enable email notifications globally before using them here",
+        ));
+    }
+    if input.ntfy_enabled
+        && (!global_ntfy_enabled || global_ntfy_server_url.is_none() || global_ntfy_topic.is_none())
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Enable ntfy notifications globally before using them here",
+        ));
+    }
+    if input.webhook_enabled && (!global_webhook_enabled || global_webhook_url.is_none()) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Enable webhook notifications globally before using them here",
+        ));
+    }
+    if input.gotify_enabled
+        && (!global_gotify_enabled
+            || global_gotify_server_url.is_none()
+            || global_gotify_token.is_none())
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Enable Gotify notifications globally before using them here",
+        ));
+    }
+
+    let existing = state
+        .database
+        .client
+        .query_opt(
+            "SELECT id FROM user_notification_workspace_rule WHERE user_id = $1 AND workspace_id = $2 LIMIT 1",
+            &[&auth.user_id, &workspace_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let rule_id = existing
+        .as_ref()
+        .map(|row| row_string(row, "id"))
+        .transpose()?
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    if existing.is_some() {
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  UPDATE user_notification_workspace_rule
+                  SET is_active = $3, email_enabled = $4, ntfy_enabled = $5,
+                      gotify_enabled = $6, webhook_enabled = $7, project_mode = $8,
+                      updated_at = NOW()
+                  WHERE user_id = $1 AND workspace_id = $2
+                "#,
+                &[
+                    &auth.user_id,
+                    &workspace_id,
+                    &input.is_active,
+                    &input.email_enabled,
+                    &input.ntfy_enabled,
+                    &input.gotify_enabled,
+                    &input.webhook_enabled,
+                    &input.project_mode,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+    } else {
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  INSERT INTO user_notification_workspace_rule
+                    (id, user_id, workspace_id, is_active, email_enabled,
+                     ntfy_enabled, gotify_enabled, webhook_enabled, project_mode,
+                     created_at, updated_at)
+                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+                "#,
+                &[
+                    &rule_id,
+                    &auth.user_id,
+                    &workspace_id,
+                    &input.is_active,
+                    &input.email_enabled,
+                    &input.ntfy_enabled,
+                    &input.gotify_enabled,
+                    &input.webhook_enabled,
+                    &input.project_mode,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+
+    state
+        .database
+        .client
+        .execute(
+            "DELETE FROM user_notification_workspace_project WHERE workspace_rule_id = $1",
+            &[&rule_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if input.project_mode == "selected" {
+        for project_id in selected_project_ids {
+            let id = Uuid::new_v4().to_string();
+            state
+                .database
+                .client
+                .execute(
+                    r#"
+                      INSERT INTO user_notification_workspace_project
+                        (id, workspace_id, workspace_rule_id, project_id, created_at, updated_at)
+                      VALUES ($1, $2, $3, $4, NOW(), NOW())
+                    "#,
+                    &[&id, &workspace_id, &rule_id, &project_id],
+                )
+                .await
+                .map_err(database_error)?;
+        }
+    }
+
+    Ok(Json(
+        notification_preferences_json(&state, &auth.user_id).await?,
+    ))
+}
+
+async fn delete_notification_workspace_rule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    require_notification_workspace_membership(&state, &auth.user_id, &workspace_id).await?;
+    let existing = state
+        .database
+        .client
+        .query_opt(
+            "SELECT id FROM user_notification_workspace_rule WHERE user_id = $1 AND workspace_id = $2 LIMIT 1",
+            &[&auth.user_id, &workspace_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let Some(existing) = existing else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Workspace notification rule not found",
+        ));
+    };
+    let rule_id = row_string(&existing, "id")?;
+    state
+        .database
+        .client
+        .execute(
+            "DELETE FROM user_notification_workspace_rule WHERE id = $1",
+            &[&rule_id],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(
+        notification_preferences_json(&state, &auth.user_id).await?,
+    ))
+}
+
 async fn pending_invitations(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6940,6 +8025,14 @@ fn app(state: AppState) -> Router {
             patch(mark_all_notifications_as_read),
         )
         .route("/api/notification/clear-all", delete(clear_notifications))
+        .route(
+            "/api/notification-preferences",
+            get(get_notification_preferences).put(update_notification_preferences),
+        )
+        .route(
+            "/api/notification-preferences/workspaces/{workspace_id}",
+            put(upsert_notification_workspace_rule).delete(delete_notification_workspace_rule),
+        )
         .route("/api/invitation/pending", get(pending_invitations))
         .route(
             "/api/invitation/public/{id}",

@@ -12,8 +12,10 @@ cross-project move/export/import and bulk operations, external-link reads,
 activity and comment CRUD, task-relation CRUD, time-entry CRUD, organization
 membership and permission reads, notification inbox operations, pending
 invitations and public invitation details, custom-OAuth id-token reads, and
-workspace billing state. Native notification creation applies the same task
-preference gates and emits the user-socket invalidation event. Task, comment,
+workspace billing state. It also owns notification preference and workspace-rule
+CRUD, including the existing AES-256-GCM secret format. Native notification
+creation applies the same task preference gates and emits the user-socket
+invalidation event. Task, comment,
 relation, label, and time-entry mutations publish filtered events to connected
 project boards, so an agent changing a task is visible without waiting for a
 polling cycle.
