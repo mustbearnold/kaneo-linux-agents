@@ -19,7 +19,8 @@
     "icon": ["icons/icon.png"],
     "resources": {
       "../../../apps/desktop/runtime/rust/kaneo-api": "kaneo-api",
-      "../../../apps/desktop/runtime/web": "web"
+      "../../../apps/desktop/runtime/web": "web",
+      "../../../apps/desktop/runtime/default.env": "default.env"
     },
     "targets": ["appimage"]
   }

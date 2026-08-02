@@ -1,4 +1,6 @@
 use std::env;
+use std::fs;
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -11,6 +13,58 @@ use tower_http::services::{ServeDir, ServeFile};
 use url::Url;
 
 struct ApiChild(Mutex<Option<Child>>);
+
+fn configure_linux_webview() {
+    #[cfg(target_os = "linux")]
+    {
+        // WebKitGTK's accelerated compositor can fail to create a GBM surface
+        // on some Linux GPU/Wayland combinations, leaving the native window
+        // completely white. Keep an explicit user setting intact, but make
+        // the packaged app render reliably by default.
+        if env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
+            unsafe {
+                env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+            }
+        }
+    }
+}
+
+fn load_default_environment(resource_dir: Option<&Path>) {
+    let Some(resource_dir) = resource_dir else {
+        return;
+    };
+    let path = resource_dir.join("default.env");
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return;
+    };
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().strip_prefix("export ").unwrap_or(key.trim());
+        if key.is_empty() || env::var_os(key).is_some() {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+            .unwrap_or(value);
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+}
 
 fn configured_api_binary(resource_dir: Option<&Path>) -> String {
     if let Ok(path) = env::var("KANEO_RUST_API_BIN") {
@@ -78,14 +132,15 @@ fn web_root(app: &AppHandle) -> Option<PathBuf> {
         .then_some(bundled_root)
 }
 
-fn start_web_server(app: &AppHandle) {
+fn start_web_server(app: &AppHandle) -> Option<String> {
     let Some(root) = web_root(app) else {
         eprintln!(
             "[kaneo-rust-desktop] no bundled web root; using an already-running KANEO_WEB_URL"
         );
-        return;
+        return None;
     };
     let port = env::var("KANEO_WEB_PORT").unwrap_or_else(|_| "5173".to_string());
+    let ready_port = port.clone();
     std::thread::Builder::new()
         .name("kaneo-web".to_string())
         .spawn(move || {
@@ -113,6 +168,17 @@ fn start_web_server(app: &AppHandle) {
             });
         })
         .expect("could not create the Kaneo web server thread");
+    Some(ready_port)
+}
+
+fn wait_for_web_server(port: &str) {
+    for _ in 0..100 {
+        if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    eprintln!("[kaneo-rust-desktop] web server did not become ready on port {port}");
 }
 
 fn create_window(app: &AppHandle) -> Result<(), String> {
@@ -126,13 +192,16 @@ fn create_window(app: &AppHandle) -> Result<(), String> {
 }
 
 fn main() {
+    configure_linux_webview();
     tauri::Builder::default()
         .setup(|app| {
             let resource_dir = app.path().resource_dir().ok();
+            load_default_environment(resource_dir.as_deref());
             let api = start_api(resource_dir.as_deref()).map_err(std::io::Error::other)?;
             app.manage(ApiChild(Mutex::new(Some(api))));
-            start_web_server(app.handle());
-            std::thread::sleep(Duration::from_millis(100));
+            if let Some(port) = start_web_server(app.handle()) {
+                wait_for_web_server(&port);
+            }
             create_window(app.handle()).map_err(std::io::Error::other)?;
             Ok(())
         })
