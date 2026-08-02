@@ -35,6 +35,15 @@ Rust MCP URL into each Codex invocation. An agent launched by the Rust API can
 therefore use the board bridge without relying on a pre-existing Codex MCP
 configuration.
 
+The Rust runtime also exposes `/api/agent/orchestrators`: a parent Codex turn
+can chat through `/messages`, delegate bounded child runs with the
+`orchestrator_delegate` MCP tool, inspect them with `orchestrator_children`,
+and cancel the whole tree. Orchestrator and child lifecycle events are sent on
+the existing project WebSocket, so the board can remain open while agents
+work. Orchestrators are intentionally in-memory like the existing agent-run
+registry; active work should be cancelled or allowed to finish before an API
+restart.
+
 Slack, Discord, and Telegram project-integration configuration is native too:
 the Rust API validates webhook or bot credentials, preserves event settings,
 returns masked secrets, and dispatches configured task events directly.

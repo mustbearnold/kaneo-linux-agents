@@ -2,6 +2,7 @@ import { useLocation, useNavigate } from "@tanstack/react-router";
 import { CalendarDays, SquareKanban, SquircleDashed } from "lucide-react";
 import { type ReactNode, useState } from "react";
 import ProjectAgentDialog from "@/components/agent/project-agent-dialog";
+import ProjectOrchestratorDialog from "@/components/agent/project-orchestrator-dialog";
 import MobileProjectNav from "@/components/common/header/mobile-project-nav";
 import ProjectCrumbSelect from "@/components/common/header/project-crumb-select";
 import WorkspaceCrumbSelect from "@/components/common/header/workspace-crumb-select";
@@ -185,6 +186,7 @@ export default function ProjectLayout({
 
           <div className="flex shrink-0 items-center gap-1.5">
             <ProjectAgentDialog projectId={projectId} />
+            <ProjectOrchestratorDialog projectId={projectId} />
             {headerActions}
           </div>
         </div>
