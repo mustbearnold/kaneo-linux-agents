@@ -26,8 +26,9 @@ The Rust API also serves the authenticated `/api/mcp` JSON-RPC endpoint and its
 protected-resource metadata. It exposes the project, task, comment, label, and
 relation tools used by autonomous agents through the same session or API-key
 credential, so the agent-to-board path no longer depends on the TypeScript MCP
-server. OAuth client registration, consent, and token exchange remain on the
-compatibility surface until that auth flow is ported.
+server. The Rust runtime also owns dynamic client registration, trusted-origin
+consent, and PKCE authorization-code exchange; its in-memory OAuth state has the
+same restart semantics as the legacy implementation.
 
 The current TypeScript API remains a compatibility runtime while feature parity
 is built in Rust. In packaged Electron builds it runs privately on port 1338;

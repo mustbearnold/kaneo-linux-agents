@@ -31,8 +31,9 @@ use std::env;
 use std::net::IpAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, lookup_host};
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 use tokio_postgres::{Client, NoTls, Row};
 use url::Url;
 use uuid::Uuid;
@@ -109,6 +110,8 @@ struct AppState {
     runner: RunManager,
     http: reqwest::Client,
     api_base_url: String,
+    client_url: String,
+    mcp: Arc<Mutex<McpState>>,
     legacy_api_url: Option<String>,
     events: broadcast::Sender<SocketEvent>,
 }
@@ -125,6 +128,38 @@ impl AuthContext {
     fn is_admin(&self) -> bool {
         self.role.as_deref() == Some("admin")
     }
+}
+
+#[derive(Clone)]
+struct McpRegisteredClient {
+    redirect_uris: Vec<String>,
+    client_name: Option<String>,
+    issued_at: i64,
+}
+
+#[derive(Clone)]
+struct McpAuthorizationRequest {
+    client_id: String,
+    code_challenge: String,
+    redirect_uri: String,
+    state: Option<String>,
+    expires_at: i64,
+}
+
+#[derive(Clone)]
+struct McpAuthorizationCode {
+    client_id: String,
+    user_id: String,
+    code_challenge: String,
+    redirect_uri: String,
+    expires_at: i64,
+}
+
+#[derive(Default)]
+struct McpState {
+    clients: HashMap<String, McpRegisteredClient>,
+    authorization_requests: HashMap<String, McpAuthorizationRequest>,
+    codes: HashMap<String, McpAuthorizationCode>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -3640,6 +3675,429 @@ async fn mcp_authorization_server_metadata(State(state): State<AppState>) -> Jso
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
     }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct McpAuthorizationQuery {
+    response_type: Option<String>,
+    client_id: Option<String>,
+    redirect_uri: Option<String>,
+    code_challenge: Option<String>,
+    code_challenge_method: Option<String>,
+    state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpAuthorizationDecision {
+    approved: bool,
+}
+
+fn mcp_now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+fn mcp_valid_redirect_uri(value: &str) -> bool {
+    if value.len() > 2048 {
+        return false;
+    }
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    if url.fragment().is_some() || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    match url.scheme() {
+        "http" => matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")),
+        "https" => true,
+        scheme => {
+            let mut characters = scheme.chars();
+            characters
+                .next()
+                .is_some_and(|value| value.is_ascii_lowercase())
+                && characters
+                    .all(|value| value.is_ascii_alphanumeric() || matches!(value, '+' | '-' | '.'))
+        }
+    }
+}
+
+fn mcp_http_json(payload: Value, status: StatusCode) -> Response {
+    (status, Json(payload)).into_response()
+}
+
+fn mcp_oauth_error(status: StatusCode, error: &str) -> Response {
+    mcp_http_json(json!({"error": error}), status)
+}
+
+fn mcp_redirect_response(url: &str) -> Response {
+    match HeaderValue::from_str(url) {
+        Ok(location) => {
+            let mut response = StatusCode::FOUND.into_response();
+            response.headers_mut().insert(header::LOCATION, location);
+            response
+        }
+        Err(_) => mcp_oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid_redirect"),
+    }
+}
+
+fn mcp_build_authorization_redirect(
+    request: &McpAuthorizationRequest,
+    parameters: &[(&str, &str)],
+) -> Result<String, String> {
+    let mut url =
+        Url::parse(&request.redirect_uri).map_err(|_| "invalid_redirect_uri".to_string())?;
+    {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in parameters {
+            query.append_pair(key, value);
+        }
+        if let Some(state) = request.state.as_deref() {
+            query.append_pair("state", state);
+        }
+    }
+    Ok(url.to_string())
+}
+
+fn mcp_trusted_origin(client_url: &str, origin: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return false;
+    };
+    let Ok(expected) = Url::parse(client_url) else {
+        return false;
+    };
+    let Ok(actual) = Url::parse(origin) else {
+        return false;
+    };
+    expected.scheme() == actual.scheme()
+        && expected.host_str() == actual.host_str()
+        && expected.port_or_known_default() == actual.port_or_known_default()
+}
+
+async fn mcp_register(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+    let Some(redirect_values) = input.get("redirect_uris").and_then(Value::as_array) else {
+        return mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata");
+    };
+    if redirect_values.is_empty() {
+        return mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata");
+    }
+    let mut redirect_uris = Vec::with_capacity(redirect_values.len());
+    for value in redirect_values {
+        let Some(value) = value.as_str() else {
+            return mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata");
+        };
+        if !mcp_valid_redirect_uri(value) {
+            return mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata");
+        }
+        redirect_uris.push(value.to_string());
+    }
+    if input
+        .get("token_endpoint_auth_method")
+        .is_some_and(|value| value != "none")
+        || input
+            .get("grant_types")
+            .is_some_and(|value| value != &json!(["authorization_code"]))
+        || input
+            .get("response_types")
+            .is_some_and(|value| value != &json!(["code"]))
+    {
+        return mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata");
+    }
+    let client_name = match input.get("client_name") {
+        None => None,
+        Some(Value::String(value)) if value.len() <= 100 => Some(value.clone()),
+        Some(_) => return mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata"),
+    };
+    let client_id = Uuid::new_v4().to_string();
+    let client = McpRegisteredClient {
+        redirect_uris: redirect_uris.clone(),
+        client_name: client_name.clone(),
+        issued_at: mcp_now_millis() / 1000,
+    };
+    let issued_at = client.issued_at;
+    state
+        .mcp
+        .lock()
+        .await
+        .clients
+        .insert(client_id.clone(), client);
+    let mut response = json!({
+        "client_id": client_id,
+        "client_id_issued_at": issued_at,
+        "redirect_uris": redirect_uris,
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+    });
+    if let Some(client_name) = client_name {
+        response["client_name"] = json!(client_name);
+    }
+    mcp_http_json(response, StatusCode::OK)
+}
+
+async fn mcp_authorize(
+    State(state): State<AppState>,
+    Query(query): Query<McpAuthorizationQuery>,
+) -> Response {
+    if query.response_type.as_deref() != Some("code")
+        || query.code_challenge_method.as_deref() != Some("S256")
+    {
+        return mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let Some(client_id) = query.client_id.filter(|value| !value.trim().is_empty()) else {
+        return mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    let Some(redirect_uri) = query.redirect_uri.filter(|value| !value.trim().is_empty()) else {
+        return mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    let Some(code_challenge) = query
+        .code_challenge
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    if !mcp_valid_redirect_uri(&redirect_uri) {
+        return mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri");
+    }
+    {
+        let store = state.mcp.lock().await;
+        let Some(client) = store.clients.get(&client_id) else {
+            return mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_client");
+        };
+        if !client
+            .redirect_uris
+            .iter()
+            .any(|value| value == &redirect_uri)
+        {
+            return mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri");
+        }
+    }
+    let request_id = Uuid::new_v4().to_string();
+    let request = McpAuthorizationRequest {
+        client_id,
+        code_challenge,
+        redirect_uri,
+        state: query.state,
+        expires_at: mcp_now_millis() + 10 * 60 * 1000,
+    };
+    let mut store = state.mcp.lock().await;
+    store
+        .authorization_requests
+        .retain(|_, request| request.expires_at >= mcp_now_millis());
+    if store.authorization_requests.len() >= 10_000 {
+        if let Some(request_id) = store.authorization_requests.keys().next().cloned() {
+            store.authorization_requests.remove(&request_id);
+        }
+    }
+    store
+        .authorization_requests
+        .insert(request_id.clone(), request);
+    drop(store);
+
+    let Ok(mut consent_url) = Url::parse(&state.client_url) else {
+        return mcp_oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid_client_url");
+    };
+    consent_url.set_path("/mcp/authorize");
+    consent_url
+        .query_pairs_mut()
+        .append_pair("request_id", &request_id);
+    mcp_redirect_response(consent_url.as_str())
+}
+
+async fn mcp_authorization_request(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> Response {
+    let request = {
+        let mut store = state.mcp.lock().await;
+        let Some(request) = store.authorization_requests.get(&request_id).cloned() else {
+            return mcp_oauth_error(StatusCode::NOT_FOUND, "invalid_or_expired_request");
+        };
+        if request.expires_at < mcp_now_millis() {
+            store.authorization_requests.remove(&request_id);
+            return mcp_oauth_error(StatusCode::NOT_FOUND, "invalid_or_expired_request");
+        }
+        request
+    };
+    let store = state.mcp.lock().await;
+    let Some(client) = store.clients.get(&request.client_id) else {
+        return mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_client");
+    };
+    mcp_http_json(
+        json!({
+            "client_name": client.client_name.clone().unwrap_or_else(|| "MCP client".to_string()),
+            "redirect_uri": request.redirect_uri,
+        }),
+        StatusCode::OK,
+    )
+}
+
+async fn mcp_authorization_decision(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+    Json(input): Json<McpAuthorizationDecision>,
+) -> Result<Response, ApiError> {
+    if !mcp_trusted_origin(
+        &state.client_url,
+        headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+    ) {
+        return Ok(mcp_oauth_error(StatusCode::FORBIDDEN, "invalid_origin"));
+    }
+    let auth = match authenticate(&state, &headers).await {
+        Ok(auth) => auth,
+        Err(error) if error.status == StatusCode::UNAUTHORIZED => {
+            return Ok(mcp_oauth_error(StatusCode::UNAUTHORIZED, "unauthorized"));
+        }
+        Err(error) => return Err(error),
+    };
+    let (request, client) = {
+        let mut store = state.mcp.lock().await;
+        let Some(request) = store.authorization_requests.remove(&request_id) else {
+            return Ok(mcp_oauth_error(
+                StatusCode::NOT_FOUND,
+                "invalid_or_expired_request",
+            ));
+        };
+        if request.expires_at < mcp_now_millis() {
+            return Ok(mcp_oauth_error(
+                StatusCode::NOT_FOUND,
+                "invalid_or_expired_request",
+            ));
+        }
+        let Some(client) = store.clients.get(&request.client_id).cloned() else {
+            return Ok(mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_client"));
+        };
+        (request, client)
+    };
+    if !client
+        .redirect_uris
+        .iter()
+        .any(|value| value == &request.redirect_uri)
+    {
+        return Ok(mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_client"));
+    }
+    if !input.approved {
+        let redirect = mcp_build_authorization_redirect(&request, &[("error", "access_denied")])
+            .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error))?;
+        return Ok(mcp_redirect_response(&redirect));
+    }
+    let code = Uuid::new_v4().to_string();
+    state.mcp.lock().await.codes.insert(
+        code.clone(),
+        McpAuthorizationCode {
+            client_id: request.client_id.clone(),
+            user_id: auth.user_id,
+            code_challenge: request.code_challenge.clone(),
+            redirect_uri: request.redirect_uri.clone(),
+            expires_at: mcp_now_millis() + 5 * 60 * 1000,
+        },
+    );
+    let redirect = mcp_build_authorization_redirect(&request, &[("code", &code)])
+        .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error))?;
+    Ok(mcp_redirect_response(&redirect))
+}
+
+fn mcp_pkce_valid(verifier: &str, challenge: &str) -> bool {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) == challenge
+}
+
+async fn mcp_exchange_code(
+    state: &AppState,
+    code: &str,
+    client_id: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
+) -> Result<Option<(String, i64)>, ApiError> {
+    let Some(stored) = state.mcp.lock().await.codes.remove(code) else {
+        return Ok(None);
+    };
+    if stored.client_id != client_id
+        || stored.redirect_uri != redirect_uri
+        || stored.expires_at < mcp_now_millis()
+        || !mcp_pkce_valid(code_verifier, &stored.code_challenge)
+    {
+        return Ok(None);
+    }
+    let access_token = Uuid::new_v4().to_string();
+    let expires_in = 30 * 24 * 60 * 60_i64;
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO session (id, token, user_id, expires_at, created_at, updated_at)
+              VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', NOW(), NOW())
+            "#,
+            &[&Uuid::new_v4().to_string(), &access_token, &stored.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Some((access_token, expires_in)))
+}
+
+async fn mcp_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request<Body>,
+) -> Result<Response, ApiError> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let body = to_bytes(request.into_body(), DEFAULT_MAX_BODY_BYTES)
+        .await
+        .map_err(|error| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
+    let parameters: HashMap<String, String> =
+        if content_type.contains("application/x-www-form-urlencoded") {
+            url::form_urlencoded::parse(&body).into_owned().collect()
+        } else {
+            serde_json::from_slice(&body)
+                .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid_request"))?
+        };
+    if parameters.get("grant_type").map(String::as_str) != Some("authorization_code") {
+        return Ok(mcp_oauth_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_grant_type",
+        ));
+    }
+    let Some(code) = parameters.get("code").filter(|value| !value.is_empty()) else {
+        return Ok(mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_request"));
+    };
+    let Some(client_id) = parameters
+        .get("client_id")
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_request"));
+    };
+    let Some(code_verifier) = parameters
+        .get("code_verifier")
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_request"));
+    };
+    let Some(redirect_uri) = parameters
+        .get("redirect_uri")
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_request"));
+    };
+    let Some((access_token, expires_in)) =
+        mcp_exchange_code(&state, code, client_id, code_verifier, redirect_uri).await?
+    else {
+        return Ok(mcp_oauth_error(StatusCode::BAD_REQUEST, "invalid_grant"));
+    };
+    Ok(mcp_http_json(
+        json!({
+            "access_token": access_token,
+            "token_type": "bearer",
+            "expires_in": expires_in,
+        }),
+        StatusCode::OK,
+    ))
 }
 
 async fn list_projects(
@@ -9530,6 +9988,13 @@ fn app(state: AppState) -> Router {
             "/api/.well-known/oauth-authorization-server/api",
             get(mcp_authorization_server_metadata),
         )
+        .route("/api/mcp/register", post(mcp_register))
+        .route("/api/mcp/authorize", get(mcp_authorize))
+        .route(
+            "/api/mcp/authorize/request/{request_id}",
+            get(mcp_authorization_request).post(mcp_authorization_decision),
+        )
+        .route("/api/mcp/token", post(mcp_token))
         .route("/api/auth/organization/list", get(list_organizations))
         .route("/api/auth/organization/list-members", get(list_members))
         .route(
@@ -9702,6 +10167,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .map(|value| value.trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty());
+    let client_url = env::var("KANEO_CLIENT_URL")
+        .unwrap_or_else(|_| "http://localhost:5173".to_string())
+        .trim_end_matches('/')
+        .to_string();
     let (events, _) = broadcast::channel(512);
     let state = AppState {
         database,
@@ -9711,6 +10180,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| format!("http://{bind}"))
             .trim_end_matches('/')
             .to_string(),
+        client_url,
+        mcp: Arc::new(Mutex::new(McpState::default())),
         legacy_api_url,
         events,
     };

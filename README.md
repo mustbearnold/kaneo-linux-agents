@@ -64,8 +64,8 @@ invitations, public invitation details, custom-OAuth id-token reads, workspace
 billing state, notification preference/workspace-rule CRUD with compatible
 AES-GCM secret storage, native notification creation, and live project
 WebSockets, generic-webhook configuration CRUD, and the authenticated native
-MCP JSON-RPC bridge for autonomous project/task agents, plus a native Tauri
-shell.
+MCP JSON-RPC bridge with PKCE OAuth for autonomous project/task agents, plus a
+native Tauri shell.
 Packaged Linux desktop builds start the Rust API by default; the legacy
 TypeScript API remains on a private compatibility port for routes that have
 not moved yet, and can be selected explicitly with `KANEO_API_RUNTIME=node`.
