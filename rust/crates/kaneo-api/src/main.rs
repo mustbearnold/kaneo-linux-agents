@@ -232,6 +232,67 @@ struct DueDateInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct CreateActivityInput {
+    task_id: String,
+    user_id: String,
+    message: Option<String>,
+    #[serde(rename = "type")]
+    activity_type: String,
+    event_data: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityCommentInput {
+    task_id: String,
+    comment: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityUpdateCommentInput {
+    activity_id: String,
+    comment: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityDeleteCommentInput {
+    activity_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommentContentInput {
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskRelationInput {
+    source_task_id: String,
+    target_task_id: String,
+    relation_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateTimeEntryInput {
+    task_id: String,
+    start_time: String,
+    end_time: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateTimeEntryInput {
+    start_time: String,
+    end_time: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StartAgentInput {
     project_id: String,
     prompt: String,
@@ -382,6 +443,92 @@ struct AgentRunResponse {
     events: Vec<AgentEventResponse>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityRecord {
+    id: String,
+    task_id: String,
+    #[serde(rename = "type")]
+    activity_type: String,
+    created_at: String,
+    updated_at: String,
+    user_id: Option<String>,
+    content: Option<String>,
+    event_data: Value,
+    external_user_name: Option<String>,
+    external_user_avatar: Option<String>,
+    external_source: Option<String>,
+    external_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommentRecord {
+    id: String,
+    task_id: String,
+    user_id: String,
+    content: String,
+    created_at: String,
+    updated_at: String,
+    user: CommentUser,
+}
+
+#[derive(Debug, Serialize)]
+struct CommentUser {
+    name: Option<String>,
+    image: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TaskRelationRecord {
+    id: String,
+    source_task_id: String,
+    target_task_id: String,
+    relation_type: String,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RelationTask {
+    id: String,
+    title: String,
+    status: String,
+    priority: Option<String>,
+    number: Option<i32>,
+    project_id: String,
+    user_id: Option<String>,
+    assignee_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TaskRelationWithTasks {
+    id: String,
+    source_task_id: String,
+    target_task_id: String,
+    relation_type: String,
+    created_at: String,
+    source_task: RelationTask,
+    target_task: RelationTask,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TimeEntryRecord {
+    id: String,
+    task_id: String,
+    user_id: Option<String>,
+    description: Option<String>,
+    start_time: String,
+    end_time: Option<String>,
+    duration: Option<i32>,
+    created_at: String,
+    updated_at: String,
+    user_name: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct SocketQuery {
     #[serde(rename = "windowId")]
@@ -460,6 +607,25 @@ fn publish_task_move(
         task_id: Some(task_id.into()),
         source_task_id: None,
         target_task_id: None,
+        initiator_id: socket_initiator(auth, headers),
+    });
+}
+
+fn publish_relation_event(
+    state: &AppState,
+    event_type: &str,
+    project_id: impl Into<String>,
+    source_task_id: impl Into<String>,
+    target_task_id: impl Into<String>,
+    auth: &AuthContext,
+    headers: &HeaderMap,
+) {
+    let _ = state.events.send(SocketEvent {
+        event_type: event_type.to_string(),
+        project_id: Some(project_id.into()),
+        task_id: None,
+        source_task_id: Some(source_task_id.into()),
+        target_task_id: Some(target_task_id.into()),
         initiator_id: socket_initiator(auth, headers),
     });
 }
@@ -2259,6 +2425,912 @@ async fn has_permission(
     })))
 }
 
+const ACTIVITY_SELECT_SQL: &str = r#"
+    SELECT
+      a.id,
+      a.task_id,
+      a.type,
+      to_char(a.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+      to_char(a.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+      a.user_id,
+      a.content,
+      a.event_data::text AS event_data,
+      a.external_user_name,
+      a.external_user_avatar,
+      a.external_source,
+      a.external_url
+    FROM activity a
+"#;
+
+fn activity_from_row(row: &Row) -> Result<ActivityRecord, ApiError> {
+    let event_data = row_optional_string(row, "event_data")?
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    Ok(ActivityRecord {
+        id: row_string(row, "id")?,
+        task_id: row_string(row, "task_id")?,
+        activity_type: row_string(row, "type")?,
+        created_at: row_string(row, "created_at")?,
+        updated_at: row_string(row, "updated_at")?,
+        user_id: row_optional_string(row, "user_id")?,
+        content: row_optional_string(row, "content")?,
+        event_data,
+        external_user_name: row_optional_string(row, "external_user_name")?,
+        external_user_avatar: row_optional_string(row, "external_user_avatar")?,
+        external_source: row_optional_string(row, "external_source")?,
+        external_url: row_optional_string(row, "external_url")?,
+    })
+}
+
+fn normalize_activity_content(content: Option<String>) -> Option<String> {
+    content.map(|content| {
+        let mut normalized = String::with_capacity(content.len());
+        let mut previous_was_newline = false;
+        for character in content.chars() {
+            if character == '\n' {
+                if previous_was_newline {
+                    continue;
+                }
+                previous_was_newline = true;
+            } else {
+                previous_was_newline = false;
+            }
+            normalized.push(character);
+        }
+        normalized
+    })
+}
+
+async fn activity_by_id(state: &AppState, activity_id: &str) -> Result<ActivityRecord, ApiError> {
+    let sql = format!("{ACTIVITY_SELECT_SQL} WHERE a.id = $1 LIMIT 1");
+    let row = state
+        .database
+        .client
+        .query_opt(&sql, &[&activity_id])
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Activity not found"))?;
+    activity_from_row(&row)
+}
+
+async fn insert_activity(
+    state: &AppState,
+    task_id: &str,
+    activity_type: &str,
+    user_id: Option<&str>,
+    content: Option<&str>,
+    event_data: Option<&Value>,
+) -> Result<ActivityRecord, ApiError> {
+    let id = Uuid::new_v4().to_string();
+    let user_id = user_id.unwrap_or_default().to_owned();
+    let content = content.unwrap_or_default().to_owned();
+    let event_data = event_data
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))?
+        .unwrap_or_default();
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO activity
+                (id, task_id, type, user_id, content, event_data, created_at, updated_at)
+              VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, '')::jsonb, NOW(), NOW())
+            "#,
+            &[
+                &id,
+                &task_id,
+                &activity_type,
+                &user_id,
+                &content,
+                &event_data,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    activity_by_id(state, &id).await
+}
+
+async fn list_activities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> Result<Json<Vec<ActivityRecord>>, ApiError> {
+    let _ = auth_for_task(&state, &headers, &task_id).await?;
+    let sql = format!("{ACTIVITY_SELECT_SQL} WHERE a.task_id = $1 ORDER BY a.created_at DESC");
+    let rows = state
+        .database
+        .client
+        .query(&sql, &[&task_id])
+        .await
+        .map_err(database_error)?;
+    let activities = rows
+        .iter()
+        .map(activity_from_row)
+        .map(|activity| {
+            activity.map(|mut activity| {
+                activity.content = normalize_activity_content(activity.content);
+                activity
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(Json(activities))
+}
+
+async fn create_activity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateActivityInput>,
+) -> Result<Json<ActivityRecord>, ApiError> {
+    let _ = auth_for_task(&state, &headers, &input.task_id).await?;
+    let activity = insert_activity(
+        &state,
+        &input.task_id,
+        &input.activity_type,
+        Some(&input.user_id),
+        input.message.as_deref(),
+        input.event_data.as_ref(),
+    )
+    .await?;
+    let task = task_by_id(&state.database, &input.task_id).await?;
+    let auth = authenticate(&state, &headers).await?;
+    publish_task_event(
+        &state,
+        "TASK_UPDATED",
+        task.project_id,
+        input.task_id,
+        &auth,
+        &headers,
+    );
+    Ok(Json(activity))
+}
+
+async fn create_activity_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ActivityCommentInput>,
+) -> Result<Json<ActivityRecord>, ApiError> {
+    let (auth, _) = auth_for_task(&state, &headers, &input.task_id).await?;
+    let activity = insert_activity(
+        &state,
+        &input.task_id,
+        "comment",
+        Some(&auth.user_id),
+        Some(&input.comment),
+        None,
+    )
+    .await?;
+    let task = task_by_id(&state.database, &input.task_id).await?;
+    publish_task_event(
+        &state,
+        "COMMENT_UPDATED",
+        task.project_id,
+        input.task_id,
+        &auth,
+        &headers,
+    );
+    Ok(Json(activity))
+}
+
+async fn comment_identity(
+    state: &AppState,
+    activity_id: &str,
+) -> Result<(String, String), ApiError> {
+    let row = state
+        .database
+        .client
+        .query_opt(
+            "SELECT task_id, user_id, type FROM activity WHERE id = $1 LIMIT 1",
+            &[&activity_id],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "Comment not found or you are not the author",
+            )
+        })?;
+    let activity_type = row_string(&row, "type")?;
+    let user_id = row_optional_string(&row, "user_id")?;
+    if activity_type != "comment" || user_id.is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Comment not found or you are not the author",
+        ));
+    }
+    Ok((row_string(&row, "task_id")?, user_id.unwrap_or_default()))
+}
+
+async fn update_comment_by_id(
+    state: &AppState,
+    headers: &HeaderMap,
+    activity_id: &str,
+    content: &str,
+) -> Result<ActivityRecord, ApiError> {
+    let (task_id, author_id) = comment_identity(state, activity_id).await?;
+    let (auth, _) = auth_for_task(state, headers, &task_id).await?;
+    if auth.user_id != author_id && !auth.is_admin() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Comment not found or you are not the author",
+        ));
+    }
+    let updated = state
+        .database
+        .client
+        .execute(
+            "UPDATE activity SET content = $1, updated_at = NOW() WHERE id = $2 AND type = 'comment'",
+            &[&content, &activity_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if updated == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Comment not found or you are not the author",
+        ));
+    }
+    let task = task_by_id(&state.database, &task_id).await?;
+    let activity = activity_by_id(state, activity_id).await?;
+    publish_task_event(
+        state,
+        "COMMENT_UPDATED",
+        task.project_id,
+        task_id,
+        &auth,
+        headers,
+    );
+    Ok(activity)
+}
+
+async fn delete_comment_by_id(
+    state: &AppState,
+    headers: &HeaderMap,
+    activity_id: &str,
+) -> Result<ActivityRecord, ApiError> {
+    let (task_id, author_id) = comment_identity(state, activity_id).await?;
+    let (auth, _) = auth_for_task(state, headers, &task_id).await?;
+    if auth.user_id != author_id && !auth.is_admin() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Comment not found or you are not the author",
+        ));
+    }
+    let row = state
+        .database
+        .client
+        .query_opt(
+            &format!("{ACTIVITY_SELECT_SQL} WHERE a.id = $1 LIMIT 1"),
+            &[&activity_id],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Comment not found"))?;
+    let deleted = activity_from_row(&row)?;
+    let count = state
+        .database
+        .client
+        .execute(
+            "DELETE FROM activity WHERE id = $1 AND type = 'comment'",
+            &[&activity_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if count == 0 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "Comment not found"));
+    }
+    let task = task_by_id(&state.database, &task_id).await?;
+    publish_task_event(
+        state,
+        "COMMENT_UPDATED",
+        task.project_id,
+        task_id,
+        &auth,
+        headers,
+    );
+    Ok(deleted)
+}
+
+async fn list_comments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> Result<Json<Vec<CommentRecord>>, ApiError> {
+    let _ = auth_for_task(&state, &headers, &task_id).await?;
+    let rows = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT a.id, a.task_id, a.user_id, a.content,
+                     to_char(a.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     to_char(a.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+                     u.name AS user_name, u.image AS user_image
+              FROM activity a
+              INNER JOIN "user" u ON u.id = a.user_id
+              WHERE a.task_id = $1
+                AND a.type = 'comment'
+                AND a.user_id IS NOT NULL
+                AND a.content IS NOT NULL
+              ORDER BY a.created_at ASC
+            "#,
+            &[&task_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let comments = rows
+        .iter()
+        .map(|row| {
+            Ok(CommentRecord {
+                id: row_string(row, "id")?,
+                task_id: row_string(row, "task_id")?,
+                user_id: row_string(row, "user_id")?,
+                content: row_string(row, "content")?,
+                created_at: row_string(row, "created_at")?,
+                updated_at: row_string(row, "updated_at")?,
+                user: CommentUser {
+                    name: row_optional_string(row, "user_name")?,
+                    image: row_optional_string(row, "user_image")?,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(Json(comments))
+}
+
+async fn create_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+    Json(input): Json<CommentContentInput>,
+) -> Result<Json<ActivityRecord>, ApiError> {
+    let (auth, _) = auth_for_task(&state, &headers, &task_id).await?;
+    let activity = insert_activity(
+        &state,
+        &task_id,
+        "comment",
+        Some(&auth.user_id),
+        Some(&input.content),
+        None,
+    )
+    .await?;
+    let task = task_by_id(&state.database, &task_id).await?;
+    publish_task_event(
+        &state,
+        "COMMENT_UPDATED",
+        task.project_id,
+        task_id,
+        &auth,
+        &headers,
+    );
+    Ok(Json(activity))
+}
+
+async fn update_activity_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ActivityUpdateCommentInput>,
+) -> Result<Json<ActivityRecord>, ApiError> {
+    Ok(Json(
+        update_comment_by_id(&state, &headers, &input.activity_id, &input.comment).await?,
+    ))
+}
+
+async fn delete_activity_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ActivityDeleteCommentInput>,
+) -> Result<Json<ActivityRecord>, ApiError> {
+    Ok(Json(
+        delete_comment_by_id(&state, &headers, &input.activity_id).await?,
+    ))
+}
+
+async fn update_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(activity_id): Path<String>,
+    Json(input): Json<CommentContentInput>,
+) -> Result<Json<ActivityRecord>, ApiError> {
+    Ok(Json(
+        update_comment_by_id(&state, &headers, &activity_id, &input.content).await?,
+    ))
+}
+
+async fn delete_comment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(activity_id): Path<String>,
+) -> Result<Json<ActivityRecord>, ApiError> {
+    Ok(Json(
+        delete_comment_by_id(&state, &headers, &activity_id).await?,
+    ))
+}
+
+fn relation_from_row(row: &Row) -> Result<TaskRelationRecord, ApiError> {
+    Ok(TaskRelationRecord {
+        id: row_string(row, "id")?,
+        source_task_id: row_string(row, "source_task_id")?,
+        target_task_id: row_string(row, "target_task_id")?,
+        relation_type: row_string(row, "relation_type")?,
+        created_at: row_string(row, "created_at")?,
+    })
+}
+
+async fn relation_task(
+    state: &AppState,
+    task_id: &str,
+    workspace_id: &str,
+) -> Result<Option<RelationTask>, ApiError> {
+    let row = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT t.id, t.title, t.status, t.priority, t.number,
+                     t.project_id, t.assignee_id AS user_id, u.name AS assignee_name
+              FROM task t
+              INNER JOIN project p ON p.id = t.project_id
+              LEFT JOIN "user" u ON u.id = t.assignee_id
+              WHERE t.id = $1 AND p.workspace_id = $2
+              LIMIT 1
+            "#,
+            &[&task_id, &workspace_id],
+        )
+        .await
+        .map_err(database_error)?;
+    row.map(|row| {
+        Ok(RelationTask {
+            id: row_string(&row, "id")?,
+            title: row_string(&row, "title")?,
+            status: row_string(&row, "status")?,
+            priority: row_optional_string(&row, "priority")?,
+            number: row_optional_i32(&row, "number")?,
+            project_id: row_string(&row, "project_id")?,
+            user_id: row_optional_string(&row, "user_id")?,
+            assignee_name: row_optional_string(&row, "assignee_name")?,
+        })
+    })
+    .transpose()
+}
+
+async fn list_task_relations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> Result<Json<Vec<TaskRelationWithTasks>>, ApiError> {
+    let (_, workspace_id) = auth_for_task(&state, &headers, &task_id).await?;
+    let rows = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT id, source_task_id, target_task_id, relation_type,
+                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at
+              FROM task_relation
+              WHERE source_task_id = $1 OR target_task_id = $1
+              ORDER BY created_at ASC
+            "#,
+            &[&task_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let relations = rows
+        .iter()
+        .map(relation_from_row)
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let mut task_cache = HashMap::new();
+    for relation in &relations {
+        for related_task_id in [&relation.source_task_id, &relation.target_task_id] {
+            if !task_cache.contains_key(related_task_id) {
+                if let Some(task) = relation_task(&state, related_task_id, &workspace_id).await? {
+                    task_cache.insert(related_task_id.clone(), task);
+                }
+            }
+        }
+    }
+    let relations = relations
+        .into_iter()
+        .filter_map(|relation| {
+            let source_task = task_cache.get(&relation.source_task_id)?.clone();
+            let target_task = task_cache.get(&relation.target_task_id)?.clone();
+            Some(TaskRelationWithTasks {
+                id: relation.id,
+                source_task_id: relation.source_task_id,
+                target_task_id: relation.target_task_id,
+                relation_type: relation.relation_type,
+                created_at: relation.created_at,
+                source_task,
+                target_task,
+            })
+        })
+        .collect();
+    Ok(Json(relations))
+}
+
+fn validate_relation_type(relation_type: &str) -> Result<(), ApiError> {
+    if matches!(relation_type, "subtask" | "blocks" | "related") {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid task relation type",
+        ))
+    }
+}
+
+async fn create_task_relation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<TaskRelationInput>,
+) -> Result<Json<TaskRelationRecord>, ApiError> {
+    validate_relation_type(&input.relation_type)?;
+    if input.source_task_id == input.target_task_id {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Cannot create a relation between a task and itself",
+        ));
+    }
+    let (auth, workspace_id) = auth_for_task(&state, &headers, &input.source_task_id).await?;
+    let target_workspace = task_workspace(&state.database, &input.target_task_id).await?;
+    if target_workspace != workspace_id {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Target task not found",
+        ));
+    }
+    let existing = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT id
+              FROM task_relation
+              WHERE relation_type = $1
+                AND ((source_task_id = $2 AND target_task_id = $3)
+                  OR (source_task_id = $3 AND target_task_id = $2))
+              LIMIT 1
+            "#,
+            &[
+                &input.relation_type,
+                &input.source_task_id,
+                &input.target_task_id,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    if existing.is_some() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "This relation already exists",
+        ));
+    }
+    let id = Uuid::new_v4().to_string();
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO task_relation
+                (id, source_task_id, target_task_id, relation_type, created_at)
+              VALUES ($1, $2, $3, $4, NOW())
+            "#,
+            &[
+                &id,
+                &input.source_task_id,
+                &input.target_task_id,
+                &input.relation_type,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    let row = state
+        .database
+        .client
+        .query_one(
+            r#"
+              SELECT id, source_task_id, target_task_id, relation_type,
+                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at
+              FROM task_relation WHERE id = $1
+            "#,
+            &[&id],
+        )
+        .await
+        .map_err(database_error)?;
+    let relation = relation_from_row(&row)?;
+    let source_task = task_by_id(&state.database, &input.source_task_id).await?;
+    publish_relation_event(
+        &state,
+        "TASK_RELATION_UPDATED",
+        source_task.project_id,
+        input.source_task_id,
+        input.target_task_id,
+        &auth,
+        &headers,
+    );
+    Ok(Json(relation))
+}
+
+async fn delete_task_relation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<TaskRelationRecord>, ApiError> {
+    let row = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT id, source_task_id, target_task_id, relation_type,
+                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at
+              FROM task_relation WHERE id = $1 LIMIT 1
+            "#,
+            &[&id],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Task relation not found"))?;
+    let relation = relation_from_row(&row)?;
+    let (auth, _) = auth_for_task(&state, &headers, &relation.source_task_id).await?;
+    let deleted = state
+        .database
+        .client
+        .execute("DELETE FROM task_relation WHERE id = $1", &[&id])
+        .await
+        .map_err(database_error)?;
+    if deleted == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Task relation not found",
+        ));
+    }
+    let source_task = task_by_id(&state.database, &relation.source_task_id).await?;
+    publish_relation_event(
+        &state,
+        "TASK_RELATION_UPDATED",
+        source_task.project_id,
+        relation.source_task_id.clone(),
+        relation.target_task_id.clone(),
+        &auth,
+        &headers,
+    );
+    Ok(Json(relation))
+}
+
+const TIME_ENTRY_SELECT_SQL: &str = r#"
+    SELECT
+      te.id,
+      te.task_id,
+      te.user_id,
+      te.description,
+      to_char(te.start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS start_time,
+      CASE
+        WHEN te.end_time IS NULL THEN NULL
+        ELSE to_char(te.end_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+      END AS end_time,
+      te.duration,
+      to_char(te.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+      to_char(te.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+      u.name AS user_name
+    FROM time_entry te
+    LEFT JOIN "user" u ON u.id = te.user_id
+"#;
+
+fn time_entry_from_row(row: &Row) -> Result<TimeEntryRecord, ApiError> {
+    Ok(TimeEntryRecord {
+        id: row_string(row, "id")?,
+        task_id: row_string(row, "task_id")?,
+        user_id: row_optional_string(row, "user_id")?,
+        description: row_optional_string(row, "description")?,
+        start_time: row_string(row, "start_time")?,
+        end_time: row_optional_string(row, "end_time")?,
+        duration: row_optional_i32(row, "duration")?,
+        created_at: row_string(row, "created_at")?,
+        updated_at: row_string(row, "updated_at")?,
+        user_name: row_optional_string(row, "user_name")?,
+    })
+}
+
+async fn time_entry_context(
+    state: &AppState,
+    time_entry_id: &str,
+) -> Result<(String, String), ApiError> {
+    state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT te.task_id, p.workspace_id
+              FROM time_entry te
+              INNER JOIN task t ON t.id = te.task_id
+              INNER JOIN project p ON p.id = t.project_id
+              WHERE te.id = $1
+              LIMIT 1
+            "#,
+            &[&time_entry_id],
+        )
+        .await
+        .map_err(database_error)?
+        .map(|row| {
+            Ok((
+                row_string(&row, "task_id")?,
+                row_string(&row, "workspace_id")?,
+            ))
+        })
+        .transpose()?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Time entry not found"))
+}
+
+async fn time_entry_by_id(
+    state: &AppState,
+    time_entry_id: &str,
+) -> Result<TimeEntryRecord, ApiError> {
+    let sql = format!("{TIME_ENTRY_SELECT_SQL} WHERE te.id = $1 LIMIT 1");
+    let row = state
+        .database
+        .client
+        .query_opt(&sql, &[&time_entry_id])
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Time entry not found"))?;
+    time_entry_from_row(&row)
+}
+
+async fn list_time_entries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> Result<Json<Vec<TimeEntryRecord>>, ApiError> {
+    let _ = auth_for_task(&state, &headers, &task_id).await?;
+    let sql = format!("{TIME_ENTRY_SELECT_SQL} WHERE te.task_id = $1 ORDER BY te.start_time ASC");
+    let rows = state
+        .database
+        .client
+        .query(&sql, &[&task_id])
+        .await
+        .map_err(database_error)?;
+    let entries = rows
+        .iter()
+        .map(time_entry_from_row)
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(Json(entries))
+}
+
+async fn get_time_entry(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<TimeEntryRecord>, ApiError> {
+    let (task_id, workspace_id) = time_entry_context(&state, &id).await?;
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace(&state, &auth, &workspace_id).await?;
+    let _ = task_id;
+    Ok(Json(time_entry_by_id(&state, &id).await?))
+}
+
+async fn create_time_entry(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateTimeEntryInput>,
+) -> Result<Json<TimeEntryRecord>, ApiError> {
+    let (auth, _) = auth_for_task(&state, &headers, &input.task_id).await?;
+    let id = Uuid::new_v4().to_string();
+    let end_time = input.end_time.unwrap_or_default();
+    let description = input.description.unwrap_or_default();
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO time_entry
+                (id, task_id, user_id, description, start_time, end_time, duration, created_at, updated_at)
+              VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5::text::timestamptz AT TIME ZONE 'UTC',
+                NULLIF($6, '')::text::timestamptz AT TIME ZONE 'UTC',
+                CASE
+                  WHEN NULLIF($6, '') IS NULL THEN 0
+                  ELSE EXTRACT(EPOCH FROM ($6::text::timestamptz - $5::text::timestamptz))::integer
+                END,
+                NOW(),
+                NOW()
+              )
+            "#,
+            &[
+                &id,
+                &input.task_id,
+                &auth.user_id,
+                &description,
+                &input.start_time,
+                &end_time,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    let task = task_by_id(&state.database, &input.task_id).await?;
+    publish_task_event(
+        &state,
+        "TIME_ENTRY_UPDATED",
+        task.project_id,
+        input.task_id,
+        &auth,
+        &headers,
+    );
+    Ok(Json(time_entry_by_id(&state, &id).await?))
+}
+
+async fn update_time_entry(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateTimeEntryInput>,
+) -> Result<Json<TimeEntryRecord>, ApiError> {
+    let (task_id, workspace_id) = time_entry_context(&state, &id).await?;
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace(&state, &auth, &workspace_id).await?;
+    let end_time = input.end_time.unwrap_or_default();
+    let updated = if let Some(description) = input.description {
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  UPDATE time_entry
+                  SET start_time = $1::text::timestamptz AT TIME ZONE 'UTC',
+                      end_time = NULLIF($2, '')::text::timestamptz AT TIME ZONE 'UTC',
+                      duration = CASE
+                        WHEN NULLIF($2, '') IS NULL THEN NULL
+                        ELSE EXTRACT(EPOCH FROM ($2::text::timestamptz - $1::text::timestamptz))::integer
+                      END,
+                      description = $3,
+                      updated_at = NOW()
+                  WHERE id = $4
+                "#,
+                &[&input.start_time, &end_time, &description, &id],
+            )
+            .await
+            .map_err(database_error)?
+    } else {
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  UPDATE time_entry
+                  SET start_time = $1::text::timestamptz AT TIME ZONE 'UTC',
+                      end_time = NULLIF($2, '')::text::timestamptz AT TIME ZONE 'UTC',
+                      duration = CASE
+                        WHEN NULLIF($2, '') IS NULL THEN NULL
+                        ELSE EXTRACT(EPOCH FROM ($2::text::timestamptz - $1::text::timestamptz))::integer
+                      END,
+                      updated_at = NOW()
+                  WHERE id = $3
+                "#,
+                &[&input.start_time, &end_time, &id],
+            )
+            .await
+            .map_err(database_error)?
+    };
+    if updated == 0 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "Time entry not found"));
+    }
+    let task = task_by_id(&state.database, &task_id).await?;
+    publish_task_event(
+        &state,
+        "TIME_ENTRY_UPDATED",
+        task.project_id,
+        task_id,
+        &auth,
+        &headers,
+    );
+    Ok(Json(time_entry_by_id(&state, &id).await?))
+}
+
 async fn notifications_for_user(
     state: &AppState,
     user_id: &str,
@@ -3032,6 +4104,33 @@ fn app(state: AppState) -> Router {
         .route(
             "/api/external-link/task/{task_id}",
             get(list_external_links),
+        )
+        .route("/api/activity/{task_id}", get(list_activities))
+        .route("/api/activity/create", post(create_activity))
+        .route(
+            "/api/activity/comment",
+            post(create_activity_comment)
+                .put(update_activity_comment)
+                .delete(delete_activity_comment),
+        )
+        .route(
+            "/api/comment/{id}",
+            get(list_comments)
+                .post(create_comment)
+                .put(update_comment)
+                .delete(delete_comment),
+        )
+        .route("/api/task-relation", post(create_task_relation))
+        .route(
+            "/api/task-relation/{id}",
+            get(list_task_relations).delete(delete_task_relation),
+        )
+        .route("/api/time-entry", post(create_time_entry))
+        .route("/api/time-entry/", post(create_time_entry))
+        .route("/api/time-entry/task/{task_id}", get(list_time_entries))
+        .route(
+            "/api/time-entry/{id}",
+            get(get_time_entry).put(update_time_entry),
         )
         .route("/api/project", get(list_projects))
         .route("/api/project/{id}", get(get_project))
