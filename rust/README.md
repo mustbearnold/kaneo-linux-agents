@@ -35,6 +35,14 @@ the Rust API validates webhook or bot credentials, preserves event settings,
 and returns masked secrets while the existing delivery plugins remain the
 outbound execution boundary.
 
+GitHub and Gitea project-integration settings are native as well. The Rust API
+handles project-scoped CRUD, workspace permissions, repository conflict checks,
+Gitea token and repository verification, repository listing, masked tokens, and
+webhook URL generation. GitHub App repository discovery and verification, issue
+import, and both providers' inbound/outbound webhook handlers still use the
+compatibility plugin until their external API and event-processing code is
+ported.
+
 The current TypeScript API remains a compatibility runtime while feature parity
 is built in Rust. In packaged Electron builds it runs privately on port 1338;
 the Rust API owns port 1337 and proxies only the routes that have not moved.

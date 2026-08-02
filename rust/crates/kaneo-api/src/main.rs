@@ -31,7 +31,7 @@ use std::env;
 use std::net::IpAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, lookup_host};
 use tokio::sync::{Mutex, broadcast};
 use tokio_postgres::{Client, NoTls, Row};
@@ -477,6 +477,52 @@ struct UpdateGenericWebhookInput {
     is_active: Option<bool>,
     events: Option<GenericWebhookEventsInput>,
     due_date_reminder_lead_time_minutes: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateGithubIntegrationInput {
+    repository_owner: String,
+    repository_name: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct UpdateGithubIntegrationInput {
+    is_active: Option<bool>,
+    comment_task_link_on_github_issue: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GiteaRepositoriesInput {
+    base_url: String,
+    access_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VerifyGiteaInput {
+    base_url: String,
+    access_token: String,
+    repository_owner: String,
+    repository_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateGiteaIntegrationInput {
+    base_url: String,
+    access_token: Option<String>,
+    repository_owner: String,
+    repository_name: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct UpdateGiteaIntegrationInput {
+    is_active: Option<bool>,
+    comment_task_link_on_gitea_issue: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3406,6 +3452,780 @@ async fn delete_telegram_integration(
     Ok(Json(
         delete_project_integration(&state, &headers, &project_id, "telegram").await?,
     ))
+}
+
+async fn integration_row(
+    state: &AppState,
+    project_id: &str,
+    integration_type: &str,
+) -> Result<Option<Row>, ApiError> {
+    state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT id, project_id, config, COALESCE(is_active, TRUE) AS is_active,
+                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+              FROM integration
+              WHERE project_id = $1 AND type = $2
+              LIMIT 1
+            "#,
+            &[&project_id, &integration_type],
+        )
+        .await
+        .map_err(database_error)
+}
+
+async fn workspace_has_permission(
+    state: &AppState,
+    auth: &AuthContext,
+    workspace_id: &str,
+    resource: &str,
+    action: &str,
+) -> Result<bool, ApiError> {
+    if auth.is_admin() {
+        return Ok(true);
+    }
+
+    let Some(role) = state
+        .database
+        .client
+        .query_opt(
+            "SELECT role FROM workspace_member WHERE workspace_id = $1 AND user_id = $2 LIMIT 1",
+            &[&workspace_id, &auth.user_id],
+        )
+        .await
+        .map_err(database_error)?
+        .and_then(|row| row.try_get::<_, String>("role").ok())
+    else {
+        return Ok(false);
+    };
+
+    let granted = state
+        .database
+        .client
+        .query_opt(
+            "SELECT permission FROM workspace_role WHERE workspace_id = $1 AND role = $2 LIMIT 1",
+            &[&workspace_id, &role],
+        )
+        .await
+        .map_err(database_error)?
+        .and_then(|row| row_optional_string(&row, "permission").ok().flatten())
+        .and_then(|raw| serde_json::from_str::<HashMap<String, Vec<String>>>(&raw).ok())
+        .unwrap_or_else(|| built_in_permissions(&role));
+
+    Ok(granted
+        .get(resource)
+        .is_some_and(|actions| actions.iter().any(|value| value == action)))
+}
+
+fn integration_config(row: &Row) -> Result<Value, ApiError> {
+    serde_json::from_str(&row_string(row, "config")?).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Invalid integration config: {error}"),
+        )
+    })
+}
+
+fn github_integration_response(row: &Row) -> Result<Value, ApiError> {
+    let config = integration_config(row)?;
+    let object = config.as_object().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid GitHub integration config",
+        )
+    })?;
+    let repository_owner = object
+        .get("repositoryOwner")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "GitHub integration repository owner is missing",
+            )
+        })?;
+    let repository_name = object
+        .get("repositoryName")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "GitHub integration repository name is missing",
+            )
+        })?;
+    Ok(json!({
+        "id": row_string(row, "id")?,
+        "projectId": row_string(row, "project_id")?,
+        "repositoryOwner": repository_owner,
+        "repositoryName": repository_name,
+        "installationId": object.get("installationId").cloned().unwrap_or(Value::Null),
+        "branchPattern": object.get("branchPattern").and_then(Value::as_str).unwrap_or("{slug}-{number}"),
+        "commentTaskLinkOnGitHubIssue": object.get("commentTaskLinkOnGitHubIssue").and_then(Value::as_bool).unwrap_or(true),
+        "isActive": row.try_get::<_, bool>("is_active").map_err(database_error)?,
+        "createdAt": row_string(row, "created_at")?,
+        "updatedAt": row_string(row, "updated_at")?,
+    }))
+}
+
+fn github_app_configured() -> bool {
+    env_present("GITHUB_WEBHOOK_SECRET")
+        && env_present("GITHUB_APP_ID")
+        && (env_present("GITHUB_PRIVATE_KEY") || env_present("GITHUB_PRIVATE_KEY_BASE64"))
+}
+
+fn github_default_config(repository_owner: &str, repository_name: &str) -> Value {
+    json!({
+        "repositoryOwner": repository_owner,
+        "repositoryName": repository_name,
+        "installationId": Value::Null,
+        "branchPattern": "{slug}-{number}",
+        "commentTaskLinkOnGitHubIssue": true,
+        "statusTransitions": {
+            "onBranchPush": "in-progress",
+            "onPROpen": "in-review",
+            "onPRMerge": "done"
+        }
+    })
+}
+
+async fn github_app_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authenticate(&state, &headers).await?;
+    Ok(Json(json!({
+        "appName": env::var("GITHUB_APP_NAME").ok().filter(|value| !value.is_empty()),
+    })))
+}
+
+async fn get_github_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, _) = auth_for_project(&state, &headers, &project_id).await?;
+    let Some(row) = integration_row(&state, &project_id, "github").await? else {
+        return Ok(Json(Value::Null));
+    };
+    Ok(Json(github_integration_response(&row)?))
+}
+
+async fn create_github_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<CreateGithubIntegrationInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "workspace", "manage_settings")
+        .await?;
+    let owner = input.repository_owner.trim();
+    let repository = input.repository_name.trim();
+    if owner.is_empty() || repository.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "repositoryOwner and repositoryName are required",
+        ));
+    }
+    if !github_app_configured() {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "GitHub app not configured",
+        ));
+    }
+
+    for row in state
+        .database
+        .client
+        .query(
+            "SELECT project_id, config FROM integration WHERE type = 'github'",
+            &[],
+        )
+        .await
+        .map_err(database_error)?
+    {
+        if row_string(&row, "project_id")? == project_id {
+            continue;
+        }
+        let config = integration_config(&row)?;
+        if config.get("repositoryOwner").and_then(Value::as_str) == Some(owner)
+            && config.get("repositoryName").and_then(Value::as_str) == Some(repository)
+        {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("Repository {owner}/{repository} is already linked to another project"),
+            ));
+        }
+    }
+
+    let config =
+        serde_json::to_string(&github_default_config(owner, repository)).map_err(database_error)?;
+    if let Some(existing) = integration_row(&state, &project_id, "github").await? {
+        let id = row_string(&existing, "id")?;
+        let row = state
+            .database
+            .client
+            .query_one(
+                "UPDATE integration SET config = $2, is_active = TRUE, updated_at = NOW() WHERE id = $1 RETURNING id, project_id, config, COALESCE(is_active, TRUE) AS is_active, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS updated_at",
+                &[&id, &config],
+            )
+            .await
+            .map_err(database_error)?;
+        return Ok(Json(github_integration_response(&row)?));
+    }
+
+    let id = Uuid::new_v4().simple().to_string();
+    let row = state
+        .database
+        .client
+        .query_one(
+            "INSERT INTO integration (id, project_id, type, config, is_active) VALUES ($1, $2, 'github', $3, TRUE) RETURNING id, project_id, config, COALESCE(is_active, TRUE) AS is_active, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS updated_at",
+            &[&id, &project_id, &config],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(github_integration_response(&row)?))
+}
+
+async fn update_github_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<UpdateGithubIntegrationInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "workspace", "manage_settings")
+        .await?;
+    let Some(existing) = integration_row(&state, &project_id, "github").await? else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Integration not found",
+        ));
+    };
+    let mut config = integration_config(&existing)?;
+    if let Some(comment_link) = input.comment_task_link_on_github_issue {
+        config["commentTaskLinkOnGitHubIssue"] = Value::Bool(comment_link);
+    }
+    let serialized = serde_json::to_string(&config).map_err(database_error)?;
+    let id = row_string(&existing, "id")?;
+    let is_active = input.is_active.unwrap_or(
+        existing
+            .try_get::<_, bool>("is_active")
+            .map_err(database_error)?,
+    );
+    let row = state
+        .database
+        .client
+        .query_one(
+            "UPDATE integration SET config = $2, is_active = $3, updated_at = NOW() WHERE id = $1 RETURNING id, project_id, config, COALESCE(is_active, TRUE) AS is_active, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS updated_at",
+            &[&id, &serialized, &is_active],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(github_integration_response(&row)?))
+}
+
+async fn delete_github_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "workspace", "manage_settings")
+        .await?;
+    let Some(row) = integration_row(&state, &project_id, "github").await? else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "GitHub integration not found",
+        ));
+    };
+    let id = row_string(&row, "id")?;
+    state
+        .database
+        .client
+        .execute("DELETE FROM integration WHERE id = $1", &[&id])
+        .await
+        .map_err(database_error)?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "GitHub integration deleted"
+    })))
+}
+
+fn normalize_gitea_base_url(value: &str) -> Result<String, ApiError> {
+    let normalized = value.trim().trim_end_matches('/').to_string();
+    let url = Url::parse(&normalized).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "A valid Gitea base URL is required",
+        )
+    })?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "A valid Gitea base URL is required",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn gitea_path_segment(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+async fn gitea_json(
+    state: &AppState,
+    base_url: &str,
+    access_token: &str,
+    path: &str,
+) -> Result<Value, ApiError> {
+    let url = format!("{}/api/v1{}", base_url.trim_end_matches('/'), path);
+    let response = state
+        .http
+        .get(url)
+        .header("Authorization", format!("token {access_token}"))
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("Could not reach Gitea: {error}"),
+            )
+        })?;
+    let status = StatusCode::from_u16(response.status().as_u16()).map_err(database_error)?;
+    let body = response.text().await.map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("Could not read Gitea response: {error}"),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(ApiError::new(status, format!("Gitea API error {status}")));
+    }
+    if body.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&body).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("Gitea API returned invalid JSON: {error}"),
+        )
+    })
+}
+
+fn gitea_repo_json(value: &Value) -> Value {
+    let owner = value
+        .get("owner")
+        .and_then(|owner| owner.get("login").or_else(|| owner.get("username")))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json!({
+        "id": value.get("id").and_then(Value::as_i64).unwrap_or_default(),
+        "name": value.get("name").and_then(Value::as_str).unwrap_or_default(),
+        "full_name": value.get("full_name").and_then(Value::as_str).unwrap_or_default(),
+        "owner": { "login": owner },
+        "private": value.get("private").and_then(Value::as_bool).unwrap_or(false),
+        "html_url": value.get("html_url").and_then(Value::as_str).unwrap_or_default(),
+    })
+}
+
+fn mask_integration_secret(value: &str) -> String {
+    if value.chars().count() <= 8 {
+        return "••••••••".to_string();
+    }
+    let prefix: String = value.chars().take(4).collect();
+    let suffix: String = value
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{prefix}••••••{suffix}")
+}
+
+fn gitea_integration_response(
+    row: &Row,
+    include_webhook_secret: bool,
+    api_base_url: &str,
+) -> Result<Value, ApiError> {
+    let config = integration_config(row)?;
+    let object = config.as_object().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid Gitea integration config",
+        )
+    })?;
+    let base_url = object
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let access_token = object
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let integration_id = row_string(row, "id")?;
+    Ok(json!({
+        "id": integration_id,
+        "projectId": row_string(row, "project_id")?,
+        "baseUrl": base_url,
+        "repositoryOwner": object.get("repositoryOwner").and_then(Value::as_str).unwrap_or_default(),
+        "repositoryName": object.get("repositoryName").and_then(Value::as_str).unwrap_or_default(),
+        "maskedAccessToken": mask_integration_secret(access_token),
+        "webhookUrl": format!("{}/api/gitea-integration/webhook/{integration_id}", api_base_url.trim_end_matches('/')),
+        "webhookSecret": if include_webhook_secret { object.get("webhookSecret").and_then(Value::as_str).unwrap_or_default() } else { "" },
+        "branchPattern": object.get("branchPattern").and_then(Value::as_str).unwrap_or("{slug}-{number}"),
+        "commentTaskLinkOnGiteaIssue": object.get("commentTaskLinkOnGiteaIssue").and_then(Value::as_bool).unwrap_or(true),
+        "isActive": row.try_get::<_, bool>("is_active").map_err(database_error)?,
+        "createdAt": row_string(row, "created_at")?,
+        "updatedAt": row_string(row, "updated_at")?,
+    }))
+}
+
+async fn list_gitea_repositories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<GiteaRepositoriesInput>,
+) -> Result<Json<Value>, ApiError> {
+    authenticate(&state, &headers).await?;
+    let base_url = normalize_gitea_base_url(&input.base_url)?;
+    let access_token = input.access_token.trim();
+    if access_token.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "accessToken is required",
+        ));
+    }
+
+    let mut repositories = Vec::new();
+    for page in 1..=50 {
+        let path = format!("/user/repos?page={page}&limit=50");
+        let batch = gitea_json(&state, &base_url, access_token, &path).await?;
+        let Some(items) = batch.as_array() else {
+            return Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "Gitea repositories response was not an array",
+            ));
+        };
+        if items.is_empty() {
+            break;
+        }
+        repositories.extend(items.iter().map(gitea_repo_json));
+        if items.len() < 50 {
+            break;
+        }
+    }
+    Ok(Json(json!({ "repositories": repositories })))
+}
+
+async fn verify_gitea_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<VerifyGiteaInput>,
+) -> Result<Json<Value>, ApiError> {
+    authenticate(&state, &headers).await?;
+    let base_url = normalize_gitea_base_url(&input.base_url)?;
+    let access_token = input.access_token.trim();
+    if access_token.is_empty()
+        || input.repository_owner.trim().is_empty()
+        || input.repository_name.trim().is_empty()
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "baseUrl, accessToken, repositoryOwner, and repositoryName are required",
+        ));
+    }
+
+    if let Err(error) = gitea_json(&state, &base_url, access_token, "/user").await {
+        if error.status == StatusCode::UNAUTHORIZED {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "Invalid Gitea token or unauthorized.",
+            ));
+        }
+        return Err(error);
+    }
+
+    let repository_path = format!(
+        "/repos/{}/{}",
+        gitea_path_segment(input.repository_owner.trim()),
+        gitea_path_segment(input.repository_name.trim())
+    );
+    let repository = match gitea_json(&state, &base_url, access_token, &repository_path).await {
+        Ok(repository) => repository,
+        Err(error) if error.status == StatusCode::NOT_FOUND => {
+            return Ok(Json(json!({
+                "isInstalled": false,
+                "hasRequiredPermissions": false,
+                "repositoryExists": false,
+                "repositoryPrivate": Value::Null,
+                "missingPermissions": [],
+                "message": "Repository not found or not accessible with this token."
+            })));
+        }
+        Err(error) => return Err(error),
+    };
+    let permissions = repository.get("permissions");
+    let has_issues_write = permissions
+        .and_then(|value| value.get("admin").or_else(|| value.get("push")))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(Json(json!({
+        "isInstalled": true,
+        "hasRequiredPermissions": has_issues_write,
+        "repositoryExists": true,
+        "repositoryPrivate": repository.get("private").and_then(Value::as_bool),
+        "missingPermissions": if has_issues_write { Vec::<String>::new() } else { vec!["issues (write)".to_string()] },
+        "message": if has_issues_write { "Token can access the repository." } else { "Token may not have sufficient permissions to manage issues." }
+    })))
+}
+
+async fn get_gitea_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
+    let Some(row) = integration_row(&state, &project_id, "gitea").await? else {
+        return Ok(Json(Value::Null));
+    };
+    let include_secret =
+        workspace_has_permission(&state, &auth, &workspace_id, "workspace", "manage_settings")
+            .await?;
+    Ok(Json(gitea_integration_response(
+        &row,
+        include_secret,
+        &state.api_base_url,
+    )?))
+}
+
+async fn create_gitea_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<CreateGiteaIntegrationInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "workspace", "manage_settings")
+        .await?;
+    let base_url = normalize_gitea_base_url(&input.base_url)?;
+    let owner = input.repository_owner.trim();
+    let repository_name = input.repository_name.trim();
+    if owner.is_empty() || repository_name.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "repositoryOwner and repositoryName are required",
+        ));
+    }
+
+    let existing = integration_row(&state, &project_id, "gitea").await?;
+    let previous_config = existing
+        .as_ref()
+        .and_then(|row| integration_config(row).ok());
+    let access_token = input
+        .access_token
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let access_token = if access_token.is_empty() {
+        previous_config
+            .as_ref()
+            .and_then(|config| config.get("accessToken"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        access_token
+    };
+    if access_token.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Personal access token is required",
+        ));
+    }
+
+    gitea_json(&state, &base_url, &access_token, "/user")
+        .await
+        .map_err(|error| {
+            if error.status == StatusCode::UNAUTHORIZED {
+                ApiError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid Gitea token or unauthorized.",
+                )
+            } else {
+                error
+            }
+        })?;
+    let repository_path = format!(
+        "/repos/{}/{}",
+        gitea_path_segment(owner),
+        gitea_path_segment(repository_name)
+    );
+    gitea_json(&state, &base_url, &access_token, &repository_path).await?;
+
+    for row in state
+        .database
+        .client
+        .query(
+            "SELECT project_id, config FROM integration WHERE type = 'gitea' AND COALESCE(is_active, TRUE) = TRUE",
+            &[],
+        )
+        .await
+        .map_err(database_error)?
+    {
+        if row_string(&row, "project_id")? == project_id {
+            continue;
+        }
+        let config = integration_config(&row)?;
+        let other_base = config
+            .get("baseUrl")
+            .and_then(Value::as_str)
+            .map(|value| value.trim_end_matches('/'))
+            .unwrap_or_default();
+        if other_base == base_url
+            && config.get("repositoryOwner").and_then(Value::as_str) == Some(owner)
+            && config.get("repositoryName").and_then(Value::as_str) == Some(repository_name)
+        {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("Repository {owner}/{repository_name} on this Gitea instance is already linked to another project"),
+            ));
+        }
+    }
+
+    let webhook_secret = previous_config
+        .as_ref()
+        .and_then(|config| config.get("webhookSecret"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()));
+    let config = json!({
+        "baseUrl": base_url,
+        "accessToken": access_token,
+        "repositoryOwner": owner,
+        "repositoryName": repository_name,
+        "webhookSecret": webhook_secret,
+        "branchPattern": "{slug}-{number}",
+        "commentTaskLinkOnGiteaIssue": true,
+        "statusTransitions": {
+            "onBranchPush": "in-progress",
+            "onPROpen": "in-review",
+            "onPRMerge": "done"
+        }
+    });
+    let serialized = serde_json::to_string(&config).map_err(database_error)?;
+    if let Some(existing) = existing {
+        let id = row_string(&existing, "id")?;
+        state
+            .database
+            .client
+            .execute(
+                "UPDATE integration SET config = $2, is_active = TRUE, updated_at = NOW() WHERE id = $1",
+                &[&id, &serialized],
+            )
+            .await
+            .map_err(database_error)?;
+    } else {
+        let id = Uuid::new_v4().simple().to_string();
+        state
+            .database
+            .client
+            .execute(
+                "INSERT INTO integration (id, project_id, type, config, is_active) VALUES ($1, $2, 'gitea', $3, TRUE)",
+                &[&id, &project_id, &serialized],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+    let row = integration_row(&state, &project_id, "gitea")
+        .await?
+        .ok_or_else(|| database_error("Gitea integration was not saved"))?;
+    Ok(Json(gitea_integration_response(
+        &row,
+        true,
+        &state.api_base_url,
+    )?))
+}
+
+async fn update_gitea_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<UpdateGiteaIntegrationInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "workspace", "manage_settings")
+        .await?;
+    let Some(existing) = integration_row(&state, &project_id, "gitea").await? else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Integration not found",
+        ));
+    };
+    let mut config = integration_config(&existing)?;
+    if let Some(comment_link) = input.comment_task_link_on_gitea_issue {
+        config["commentTaskLinkOnGiteaIssue"] = Value::Bool(comment_link);
+    }
+    let serialized = serde_json::to_string(&config).map_err(database_error)?;
+    let id = row_string(&existing, "id")?;
+    let is_active = input.is_active.unwrap_or(
+        existing
+            .try_get::<_, bool>("is_active")
+            .map_err(database_error)?,
+    );
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE integration SET config = $2, is_active = $3, updated_at = NOW() WHERE id = $1",
+            &[&id, &serialized, &is_active],
+        )
+        .await
+        .map_err(database_error)?;
+    let row = integration_row(&state, &project_id, "gitea")
+        .await?
+        .ok_or_else(|| database_error("Gitea integration was not saved"))?;
+    Ok(Json(gitea_integration_response(
+        &row,
+        true,
+        &state.api_base_url,
+    )?))
+}
+
+async fn delete_gitea_integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &project_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "workspace", "manage_settings")
+        .await?;
+    let Some(row) = integration_row(&state, &project_id, "gitea").await? else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Gitea integration not found",
+        ));
+    };
+    let id = row_string(&row, "id")?;
+    state
+        .database
+        .client
+        .execute("DELETE FROM integration WHERE id = $1", &[&id])
+        .await
+        .map_err(database_error)?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "Gitea integration deleted"
+    })))
 }
 
 fn mcp_object_schema(properties: Value, required: &[&str]) -> Value {
@@ -10850,6 +11670,26 @@ fn app(state: AppState) -> Router {
                 .post(create_telegram_integration)
                 .patch(update_telegram_integration)
                 .delete(delete_telegram_integration),
+        )
+        .route("/api/github-integration/app-info", get(github_app_info))
+        .route(
+            "/api/github-integration/project/{project_id}",
+            get(get_github_integration)
+                .post(create_github_integration)
+                .patch(update_github_integration)
+                .delete(delete_github_integration),
+        )
+        .route(
+            "/api/gitea-integration/repositories",
+            post(list_gitea_repositories),
+        )
+        .route("/api/gitea-integration/verify", post(verify_gitea_access))
+        .route(
+            "/api/gitea-integration/project/{project_id}",
+            get(get_gitea_integration)
+                .post(create_gitea_integration)
+                .patch(update_gitea_integration)
+                .delete(delete_gitea_integration),
         )
         .route("/api/invitation/pending", get(pending_invitations))
         .route(
