@@ -1,26 +1,27 @@
-//! Rust runtime for the parts of Kaneo that are on the hot path for a local
-//! installation: authenticated board reads, task mutations, and autonomous
-//! agent execution.
+//! Rust runtime for Kaneo's authenticated API, board, integrations, and
+//! autonomous agent execution.
 //!
-//! The router deliberately has a compatibility fallback. During the
-//! migration, routes that have not moved yet are forwarded to the legacy
-//! TypeScript API. This lets the Rust process become the single local API
-//! origin without pretending that the remaining integration surface has
-//! already been ported.
+//! The desktop runtime starts this server as the only Kaneo API process. A
+//! missing route is returned as a native Rust 404 rather than being silently
+//! forwarded to a second implementation.
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, delete, get, patch, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use bcrypt::{hash as bcrypt_hash, verify as bcrypt_verify};
+use chrono::Utc;
 use futures_util::StreamExt;
+use hmac::{Hmac, Mac};
+use jsonwebtoken::{Algorithm, EncodingKey, Header as JwtHeader, encode};
 use kaneo_core::{AgentRun, AgentSpec, RunManager, RunStatus, RunnerConfig};
 use serde::de::Error as SerdeDeError;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -112,7 +113,6 @@ struct AppState {
     api_base_url: String,
     client_url: String,
     mcp: Arc<Mutex<McpState>>,
-    legacy_api_url: Option<String>,
     events: broadcast::Sender<SocketEvent>,
 }
 
@@ -192,6 +192,191 @@ struct PermissionInput {
     organization_id: Option<String>,
     permission: Option<HashMap<String, Vec<String>>>,
     permissions: Option<HashMap<String, Vec<String>>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignUpInput {
+    name: String,
+    email: String,
+    password: String,
+    #[serde(default)]
+    locale: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignInInput {
+    email: String,
+    password: String,
+    #[serde(default)]
+    #[serde(rename = "rememberMe")]
+    _remember_me: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OrganizationCreateInput {
+    name: String,
+    slug: Option<String>,
+    logo: Option<String>,
+    metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OrganizationUpdateData {
+    name: Option<String>,
+    slug: Option<String>,
+    logo: Option<Option<String>>,
+    metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OrganizationUpdateInput {
+    organization_id: Option<String>,
+    organization_slug: Option<String>,
+    data: Option<OrganizationUpdateData>,
+    name: Option<String>,
+    slug: Option<String>,
+    logo: Option<Option<String>>,
+    metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OrganizationSelectInput {
+    organization_id: Option<String>,
+    organization_slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ApiKeyCreateInput {
+    name: Option<String>,
+    expires_in: Option<i64>,
+    prefix: Option<String>,
+    metadata: Option<Value>,
+    permissions: Option<HashMap<String, Vec<String>>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiKeyDeleteInput {
+    key_id: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct UpdateUserInput {
+    name: Option<String>,
+    image: Option<Option<String>>,
+    locale: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangePasswordInput {
+    current_password: String,
+    new_password: String,
+    #[serde(default)]
+    revoke_other_sessions: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceCodeCreateInput {
+    client_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceCodeUserInput {
+    user_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceTokenInput {
+    grant_type: String,
+    device_code: String,
+    client_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskImageUploadInput {
+    filename: String,
+    content_type: String,
+    size: i64,
+    surface: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskImageFinalizeInput {
+    key: String,
+    filename: String,
+    content_type: String,
+    size: i64,
+    surface: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BillingCheckoutInput {
+    plan: String,
+    interval: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OrganizationMemberInput {
+    organization_id: Option<String>,
+    member_id: Option<String>,
+    member_id_or_email: Option<String>,
+    role: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InviteMemberInput {
+    organization_id: String,
+    email: String,
+    role: Option<String>,
+    resend: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InvitationActionInput {
+    invitation_id: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RoleCreateInput {
+    organization_id: String,
+    role: String,
+    permission: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RoleUpdateInput {
+    organization_id: String,
+    role_name: String,
+    data: Option<RoleUpdateData>,
+    permission: Option<HashMap<String, Vec<String>>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RoleUpdateData {
+    permission: Option<HashMap<String, Vec<String>>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoleDeleteInput {
+    organization_id: String,
+    role_name: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -495,6 +680,13 @@ struct UpdateGithubIntegrationInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct VerifyGithubInput {
+    repository_owner: String,
+    repository_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GiteaRepositoriesInput {
     base_url: String,
     access_token: String,
@@ -507,6 +699,12 @@ struct VerifyGiteaInput {
     access_token: String,
     repository_owner: String,
     repository_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportIntegrationInput {
+    project_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -948,6 +1146,328 @@ fn socket_initiator(auth: &AuthContext, headers: &HeaderMap) -> Option<String> {
         .map(|window_id| format!("{}:{window_id}", auth.user_id))
 }
 
+#[derive(Debug)]
+struct IntegrationTaskData {
+    id: String,
+    title: String,
+    number: Option<i32>,
+    status: String,
+    status_name: Option<String>,
+    priority: Option<String>,
+    project_id: String,
+    project_name: String,
+    workspace_id: String,
+}
+
+fn integration_event_key(event_type: &str) -> Option<&'static str> {
+    match event_type {
+        "TASK_CREATED" => Some("taskCreated"),
+        "TASK_STATUS_CHANGED" | "TASK_UPDATED" => Some("taskStatusChanged"),
+        "TASK_PRIORITY_CHANGED" => Some("taskPriorityChanged"),
+        "TASK_TITLE_CHANGED" => Some("taskTitleChanged"),
+        "TASK_DESCRIPTION_CHANGED" => Some("taskDescriptionChanged"),
+        "TASK_COMMENT_CREATED" => Some("taskCommentCreated"),
+        "TASK_DELETED" => Some("taskDeleted"),
+        "TASK_MOVED" => Some("taskMoved"),
+        "TASK_DUE_DATE_CHANGED" => Some("taskDueDateChanged"),
+        "TASK_ASSIGNEE_CHANGED" => Some("taskAssigneeChanged"),
+        _ => None,
+    }
+}
+
+fn integration_event_name(event_type: &str) -> &'static str {
+    match event_type {
+        "TASK_CREATED" => "task.created",
+        "TASK_STATUS_CHANGED" => "task.status_changed",
+        "TASK_PRIORITY_CHANGED" => "task.priority_changed",
+        "TASK_TITLE_CHANGED" => "task.title_changed",
+        "TASK_DESCRIPTION_CHANGED" => "task.description_changed",
+        "TASK_COMMENT_CREATED" => "comment.created",
+        "TASK_DELETED" => "task.deleted",
+        "TASK_MOVED" => "task.moved",
+        "TASK_DUE_DATE_CHANGED" => "task.due_date_changed",
+        "TASK_ASSIGNEE_CHANGED" => "task.assignee_changed",
+        _ => "task.updated",
+    }
+}
+
+fn integration_sentence(value: Option<&str>) -> String {
+    value
+        .unwrap_or("unknown")
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .map(|part| {
+            let mut chars = part.chars();
+            let first = chars
+                .next()
+                .map(|character| character.to_uppercase().collect::<String>())
+                .unwrap_or_default();
+            format!("{first}{}", chars.as_str().to_lowercase())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn sanitize_discord_content(value: &str) -> String {
+    value
+        .replace("@everyone", "@\u{200b}everyone")
+        .replace("@here", "@\u{200b}here")
+}
+
+async fn integration_task_data(
+    state: &AppState,
+    task_id: &str,
+) -> Result<Option<IntegrationTaskData>, ApiError> {
+    let row = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT t.id, t.title, t.number, t.status, t.priority,
+                     c.name AS status_name, p.id AS project_id, p.name AS project_name,
+                     w.id AS workspace_id
+              FROM task t
+              INNER JOIN project p ON p.id = t.project_id
+              INNER JOIN workspace w ON w.id = p.workspace_id
+              LEFT JOIN "column" c ON c.id = t.column_id AND c.project_id = p.id
+              WHERE t.id = $1 LIMIT 1
+            "#,
+            &[&task_id],
+        )
+        .await
+        .map_err(database_error)?;
+    row.map(|row| {
+        Ok(IntegrationTaskData {
+            id: row_string(&row, "id")?,
+            title: row_string(&row, "title")?,
+            number: row_optional_i32(&row, "number")?,
+            status: row_string(&row, "status")?,
+            status_name: row_optional_string(&row, "status_name")?,
+            priority: row_optional_string(&row, "priority")?,
+            project_id: row_string(&row, "project_id")?,
+            project_name: row_string(&row, "project_name")?,
+            workspace_id: row_string(&row, "workspace_id")?,
+        })
+    })
+    .transpose()
+}
+
+async fn post_integration_json(
+    state: &AppState,
+    url: &str,
+    payload: Value,
+    signature: Option<String>,
+) -> Result<(), ApiError> {
+    let body = serde_json::to_vec(&payload).map_err(database_error)?;
+    let mut request = state
+        .http
+        .post(url)
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(10));
+    if let Some(signature) = signature {
+        request = request.header("X-Kaneo-Signature", signature);
+    }
+    let response = request.body(body).send().await.map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("Integration delivery failed: {error}"),
+        )
+    })?;
+    if !response.status().is_success() {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("Integration delivery returned {}", response.status()),
+        ));
+    }
+    Ok(())
+}
+
+async fn dispatch_project_integrations(
+    state: &AppState,
+    event_type: &str,
+    project_id: &str,
+    task_id: &str,
+    actor_id: &str,
+) -> Result<(), ApiError> {
+    let Some(event_key) = integration_event_key(event_type) else {
+        return Ok(());
+    };
+    let Some(task) = integration_task_data(state, task_id).await? else {
+        return Ok(());
+    };
+    if task.project_id != project_id {
+        return Ok(());
+    }
+    let actor_name = state
+        .database
+        .client
+        .query_opt(
+            "SELECT name FROM \"user\" WHERE id = $1 LIMIT 1",
+            &[&actor_id],
+        )
+        .await
+        .map_err(database_error)?
+        .and_then(|row| row.try_get::<_, String>("name").ok());
+    let task_url = format!(
+        "{}/dashboard/workspace/{}/project/{}/task/{}",
+        state.client_url.trim_end_matches('/'),
+        task.workspace_id,
+        task.project_id,
+        task.id
+    );
+    let integrations = state
+        .database
+        .client
+        .query(
+            "SELECT type, config, is_active FROM integration WHERE project_id = $1 AND is_active = TRUE",
+            &[&project_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let event_name = integration_event_name(event_type);
+    let task_label = match task.number {
+        Some(number) => format!("#{number} {}", task.title),
+        None => task.title.clone(),
+    };
+    let actor = json!({ "id": actor_id, "name": actor_name });
+    for integration in integrations {
+        let integration_type = row_string(&integration, "type")?;
+        let mut config = match serde_json::from_str::<Value>(&row_string(&integration, "config")?) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("integration: invalid {integration_type} config: {error}");
+                continue;
+            }
+        };
+        let Some(object) = config.as_object_mut() else {
+            continue;
+        };
+        let enabled = object
+            .get("events")
+            .and_then(Value::as_object)
+            .and_then(|events| events.get(event_key))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !enabled {
+            continue;
+        }
+        let generic_payload = json!({
+            "event": event_name,
+            "timestamp": Utc::now().to_rfc3339(),
+            "integration": { "type": integration_type },
+            "project": {
+                "id": task.project_id,
+                "name": task.project_name,
+                "workspaceId": task.workspace_id,
+            },
+            "task": {
+                "id": task.id,
+                "number": task.number,
+                "title": task.title,
+                "status": task.status,
+                "statusName": task.status_name,
+                "priority": task.priority,
+                "url": task_url,
+            },
+            "actor": actor,
+            "data": {},
+        });
+        let result = match integration_type.as_str() {
+            "generic-webhook" => {
+                let Some(webhook_url) = object.get("webhookUrl").and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Err(error) = validate_notification_destination(webhook_url).await {
+                    Err(error)
+                } else {
+                    let signature = object.get("secret").and_then(Value::as_str).map(|secret| {
+                        let body = generic_payload.to_string();
+                        hex_digest(&hmac_sha256_bytes(secret.as_bytes(), body.as_bytes()))
+                    });
+                    post_integration_json(state, webhook_url, generic_payload, signature).await
+                }
+            }
+            "slack" => {
+                let Some(webhook_url) = object.get("webhookUrl").and_then(Value::as_str) else {
+                    continue;
+                };
+                let text = format!(
+                    "{}: *{}* in *{}* (status: {}, priority: {}) — {}",
+                    integration_sentence(Some(event_key)),
+                    task_label,
+                    task.project_name,
+                    integration_sentence(Some(&task.status)),
+                    integration_sentence(task.priority.as_deref()),
+                    task_url
+                );
+                post_integration_json(state, webhook_url, json!({ "text": text }), None).await
+            }
+            "discord" => {
+                let Some(webhook_url) = object.get("webhookUrl").and_then(Value::as_str) else {
+                    continue;
+                };
+                let title = sanitize_discord_content(&integration_sentence(Some(event_key)));
+                let description = sanitize_discord_content(&format!(
+                    "{} in {}. Status: {}. Priority: {}.",
+                    task_label,
+                    task.project_name,
+                    integration_sentence(Some(&task.status)),
+                    integration_sentence(task.priority.as_deref())
+                ));
+                post_integration_json(
+                    state,
+                    webhook_url,
+                    json!({
+                        "content": format!("{}: {}", title, sanitize_discord_content(&task_label)),
+                        "embeds": [{
+                            "title": title,
+                            "description": description,
+                            "url": task_url,
+                            "color": 5793266,
+                            "footer": { "text": format!("Triggered by {}", actor_name.as_deref().unwrap_or("Kaneo")) }
+                        }]
+                    }),
+                    None,
+                )
+                .await
+            }
+            "telegram" => {
+                let (Some(bot_token), Some(chat_id)) = (
+                    object.get("botToken").and_then(Value::as_str),
+                    object.get("chatId").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                let endpoint = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+                let text = format!(
+                    "<b>{}</b>\n{}\n\n<b>Project:</b> {}\n<b>Status:</b> {}\n<b>Priority:</b> {}\n<b>Task:</b> {}",
+                    event_key,
+                    task_label,
+                    task.project_name,
+                    integration_sentence(Some(&task.status)),
+                    integration_sentence(task.priority.as_deref()),
+                    task_url
+                );
+                let mut payload = json!({
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": false,
+                });
+                if let Some(thread_id) = object.get("threadId").and_then(Value::as_i64) {
+                    payload["message_thread_id"] = json!(thread_id);
+                }
+                post_integration_json(state, &endpoint, payload, None).await
+            }
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            eprintln!("integration {integration_type} delivery failed: {error}");
+        }
+    }
+    Ok(())
+}
+
 fn publish_task_event(
     state: &AppState,
     event_type: &str,
@@ -956,13 +1476,41 @@ fn publish_task_event(
     auth: &AuthContext,
     headers: &HeaderMap,
 ) {
+    let project_id = project_id.into();
+    let task_id = task_id.into();
     let _ = state.events.send(SocketEvent {
-        event_type: event_type.to_string(),
-        project_id: Some(project_id.into()),
-        task_id: Some(task_id.into()),
+        event_type: match event_type {
+            "TASK_STATUS_CHANGED"
+            | "TASK_PRIORITY_CHANGED"
+            | "TASK_TITLE_CHANGED"
+            | "TASK_DESCRIPTION_CHANGED"
+            | "TASK_COMMENT_CREATED"
+            | "TASK_DUE_DATE_CHANGED"
+            | "TASK_ASSIGNEE_CHANGED" => "TASK_UPDATED",
+            _ => event_type,
+        }
+        .to_string(),
+        project_id: Some(project_id.clone()),
+        task_id: Some(task_id.clone()),
         source_task_id: None,
         target_task_id: None,
         initiator_id: socket_initiator(auth, headers),
+    });
+    let dispatch_state = state.clone();
+    let dispatch_event = event_type.to_string();
+    let actor_id = auth.user_id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = dispatch_project_integrations(
+            &dispatch_state,
+            &dispatch_event,
+            &project_id,
+            &task_id,
+            &actor_id,
+        )
+        .await
+        {
+            eprintln!("integration dispatch failed: {error}");
+        }
     });
 }
 
@@ -1465,6 +2013,82 @@ async fn config() -> Json<Value> {
     }))
 }
 
+async fn openapi(State(state): State<AppState>) -> Json<Value> {
+    let operation = |method: &str| {
+        json!({
+            method: {
+                "responses": {
+                    "200": { "description": "Successful response" },
+                    "401": { "description": "Authentication required" },
+                    "404": { "description": "Resource not found" }
+                },
+                "security": [{ "bearerAuth": [] }]
+            }
+        })
+    };
+    let mut paths = serde_json::Map::new();
+    for (path, methods) in [
+        ("/api/health", vec!["get"]),
+        ("/api/config", vec!["get"]),
+        ("/api/instance/status", vec!["get"]),
+        ("/api/openapi", vec!["get"]),
+        ("/api/public-project/{id}", vec!["get"]),
+        ("/api/auth/get-session", vec!["get"]),
+        ("/api/auth/sign-up/email", vec!["post"]),
+        ("/api/auth/sign-in/email", vec!["post"]),
+        ("/api/auth/sign-in/anonymous", vec!["post"]),
+        ("/api/auth/sign-out", vec!["post"]),
+        ("/api/auth/device/code", vec!["post"]),
+        ("/api/auth/device/token", vec!["post"]),
+        ("/api/auth/api-key/create", vec!["post"]),
+        ("/api/auth/api-key/list", vec!["get"]),
+        ("/api/auth/api-key/delete", vec!["post"]),
+        ("/api/auth/organization/list", vec!["get"]),
+        ("/api/auth/organization/create", vec!["post"]),
+        ("/api/auth/organization/set-active", vec!["post"]),
+        ("/api/auth/organization/update", vec!["post"]),
+        ("/api/auth/organization/delete", vec!["post"]),
+        ("/api/auth/organization/list-members", vec!["get"]),
+        ("/api/auth/organization/get-active-member", vec!["get"]),
+        ("/api/project", vec!["get", "post"]),
+        ("/api/task/{id}", vec!["get", "post", "put", "delete"]),
+        ("/api/task/tasks/{project_id}", vec!["get"]),
+        ("/api/task/bulk", vec!["patch"]),
+        ("/api/agent/runs", vec!["post"]),
+        ("/api/agent/runs/{id}", vec!["get"]),
+        ("/api/agent/runs/{id}/cancel", vec!["post"]),
+        ("/api/mcp", vec!["get", "post"]),
+    ] {
+        let mut item = serde_json::Map::new();
+        for method in methods {
+            if let Some(value) = operation(method).get(method) {
+                item.insert(method.to_string(), value.clone());
+            }
+        }
+        paths.insert(path.to_string(), Value::Object(item));
+    }
+    Json(json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "Kaneo API",
+            "version": "1.0.0",
+            "description": "Kaneo project management and autonomous agent API"
+        },
+        "servers": [{ "url": state.api_base_url }],
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "description": "Kaneo session token or API key"
+                }
+            }
+        },
+        "security": [{ "bearerAuth": [] }],
+        "paths": paths
+    }))
+}
+
 async fn instance_status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let has_users = state
         .database
@@ -1493,11 +2117,11 @@ async fn instance_status(State(state): State<AppState>) -> Result<Json<Value>, A
     })))
 }
 
-async fn rust_status(State(state): State<AppState>) -> Json<Value> {
+async fn rust_status(State(_state): State<AppState>) -> Json<Value> {
     Json(json!({
         "runtime": "rust",
         "database": "postgres",
-        "legacyProxy": state.legacy_api_url.is_some(),
+        "legacyProxy": false,
         "agentRunner": "kaneo-core",
         "websocket": true,
     }))
@@ -1836,7 +2460,7 @@ async fn create_column(
         .map_err(database_error)?;
     publish_task_event(
         &state,
-        "TASK_UPDATED",
+        "TASK_STATUS_CHANGED",
         project_id.clone(),
         id.clone(),
         &auth,
@@ -1923,7 +2547,7 @@ async fn update_column(
         .map_err(database_error)?;
     publish_task_event(
         &state,
-        "TASK_UPDATED",
+        "TASK_TITLE_CHANGED",
         project_id,
         id.clone(),
         &auth,
@@ -3477,6 +4101,23 @@ async fn integration_row(
         .map_err(database_error)
 }
 
+async fn integration_row_by_id(
+    state: &AppState,
+    integration_id: &str,
+    integration_type: &str,
+) -> Result<Row, ApiError> {
+    state
+        .database
+        .client
+        .query_opt(
+            "SELECT id, project_id, type, config, COALESCE(is_active, TRUE) AS is_active, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS updated_at FROM integration WHERE id = $1 AND type = $2 LIMIT 1",
+            &[&integration_id, &integration_type],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Integration not found"))
+}
+
 async fn workspace_has_permission(
     state: &AppState,
     auth: &AuthContext,
@@ -3600,6 +4241,865 @@ async fn github_app_info(
     Ok(Json(json!({
         "appName": env::var("GITHUB_APP_NAME").ok().filter(|value| !value.is_empty()),
     })))
+}
+
+#[derive(Debug, Serialize)]
+struct GithubJwtClaims {
+    iat: i64,
+    exp: i64,
+    iss: String,
+}
+
+fn github_private_key() -> Result<String, ApiError> {
+    if let Some(value) = env::var("GITHUB_PRIVATE_KEY_BASE64")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return base64::engine::general_purpose::STANDARD
+            .decode(value.trim())
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Invalid GitHub private key encoding: {error}"),
+                )
+            })
+            .and_then(|bytes| {
+                String::from_utf8(bytes).map_err(|error| {
+                    ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("GitHub private key is not UTF-8: {error}"),
+                    )
+                })
+            });
+    }
+    let value = env::var("GITHUB_PRIVATE_KEY").unwrap_or_default();
+    if value.trim().is_empty() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "GitHub App is not configured",
+        ));
+    }
+    Ok(if value.contains("\\n") && !value.contains('\n') {
+        value.replace("\\n", "\n")
+    } else {
+        value
+    })
+}
+
+fn github_app_jwt() -> Result<String, ApiError> {
+    let app_id = env::var("GITHUB_APP_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "GitHub App is not configured",
+            )
+        })?;
+    let key = github_private_key()?;
+    let now = Utc::now().timestamp();
+    let claims = GithubJwtClaims {
+        iat: now - 60,
+        exp: now + 540,
+        iss: app_id,
+    };
+    encode(
+        &JwtHeader::new(Algorithm::RS256),
+        &claims,
+        &EncodingKey::from_rsa_pem(key.as_bytes()).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid GitHub private key: {error}"),
+            )
+        })?,
+    )
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not sign GitHub App request: {error}"),
+        )
+    })
+}
+
+async fn github_request(
+    state: &AppState,
+    method: reqwest::Method,
+    path: &str,
+    token: &str,
+    payload: Option<&Value>,
+) -> Result<Value, ApiError> {
+    let base_url =
+        env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".to_string());
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let mut request = state
+        .http
+        .request(method, url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "kaneo-rust")
+        .timeout(Duration::from_secs(15));
+    if let Some(payload) = payload {
+        request = request.json(payload);
+    }
+    let response = request.send().await.map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("Could not reach GitHub: {error}"),
+        )
+    })?;
+    let status = StatusCode::from_u16(response.status().as_u16()).map_err(database_error)?;
+    let body = response.text().await.map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("Could not read GitHub response: {error}"),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(ApiError::new(status, format!("GitHub API error {status}")));
+    }
+    if body.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&body).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("GitHub API returned invalid JSON: {error}"),
+        )
+    })
+}
+
+async fn github_installation_token(
+    state: &AppState,
+    installation_id: i64,
+) -> Result<String, ApiError> {
+    if let Some(token) = env::var("GITHUB_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(token);
+    }
+    let jwt = github_app_jwt()?;
+    let response = github_request(
+        state,
+        reqwest::Method::POST,
+        &format!("/app/installations/{installation_id}/access_tokens"),
+        &jwt,
+        None,
+    )
+    .await?;
+    response
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "GitHub did not return an installation token",
+            )
+        })
+}
+
+fn github_repo_json(value: &Value, installation_id: Option<i64>) -> Value {
+    let owner = value
+        .get("owner")
+        .and_then(|owner| owner.get("login"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json!({
+        "id": value.get("id").and_then(Value::as_i64).unwrap_or_default(),
+        "name": value.get("name").and_then(Value::as_str).unwrap_or_default(),
+        "full_name": value.get("full_name").and_then(Value::as_str).unwrap_or_default(),
+        "owner": { "login": owner },
+        "private": value.get("private").and_then(Value::as_bool).unwrap_or(false),
+        "html_url": value.get("html_url").and_then(Value::as_str).unwrap_or_default(),
+        "description": value.get("description").cloned().unwrap_or(Value::Null),
+        "permissions": value.get("permissions").cloned().unwrap_or(Value::Null),
+        "updated_at": value.get("updated_at").cloned().unwrap_or(Value::Null),
+        "installation_id": installation_id,
+    })
+}
+
+async fn list_github_repositories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authenticate(&state, &headers).await?;
+    let jwt = github_app_jwt()?;
+    let installations = github_request(
+        &state,
+        reqwest::Method::GET,
+        "/app/installations?per_page=100",
+        &jwt,
+        None,
+    )
+    .await?;
+    let mut repositories = Vec::new();
+    let mut installation_records = Vec::new();
+    for installation in installations.as_array().into_iter().flatten() {
+        let installation_id = installation
+            .get("id")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        if installation_id == 0 {
+            continue;
+        }
+        let account = installation.get("account").map(|account| {
+            json!({
+                "login": account.get("login").and_then(Value::as_str).unwrap_or_default(),
+                "type": account.get("type").and_then(Value::as_str).unwrap_or_default(),
+            })
+        });
+        match github_installation_token(&state, installation_id).await {
+            Ok(token) => {
+                let page = github_request(
+                    &state,
+                    reqwest::Method::GET,
+                    "/installation/repositories?per_page=100",
+                    &token,
+                    None,
+                )
+                .await
+                .unwrap_or_else(|_| json!({ "repositories": [] }));
+                let names = page
+                    .get("repositories")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(|repo| {
+                        repo.get("full_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>();
+                installation_records.push(json!({
+                    "id": installation_id,
+                    "account": account,
+                    "repositories": names,
+                }));
+                repositories.extend(
+                    page.get("repositories")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .map(|repo| github_repo_json(repo, Some(installation_id))),
+                );
+            }
+            Err(_) => installation_records.push(json!({
+                "id": installation_id,
+                "account": account,
+                "repositories": [],
+            })),
+        }
+    }
+    repositories.sort_by_key(|repo| {
+        std::cmp::Reverse(
+            repo.get("updated_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        )
+    });
+    repositories.dedup_by_key(|repo| repo.get("id").cloned());
+    let total = repositories.len();
+    Ok(Json(json!({
+        "repositories": repositories,
+        "installations": installation_records,
+        "total": total,
+    })))
+}
+
+async fn verify_github_installation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<VerifyGithubInput>,
+) -> Result<Json<Value>, ApiError> {
+    authenticate(&state, &headers).await?;
+    let owner = input.repository_owner.trim();
+    let repository = input.repository_name.trim();
+    if owner.is_empty() || repository.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "repositoryOwner and repositoryName are required",
+        ));
+    }
+    let jwt = github_app_jwt()?;
+    let repo_path = format!(
+        "/repos/{}/{}",
+        url::form_urlencoded::byte_serialize(owner.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(repository.as_bytes()).collect::<String>(),
+    );
+    let repo = github_request(&state, reqwest::Method::GET, &repo_path, &jwt, None).await?;
+    let installation = match github_request(
+        &state,
+        reqwest::Method::GET,
+        &format!("{repo_path}/installation"),
+        &jwt,
+        None,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) if error.status == StatusCode::NOT_FOUND => {
+            return Ok(Json(json!({
+                "isInstalled": false,
+                "installationId": Value::Null,
+                "repositoryExists": true,
+                "repositoryPrivate": repo.get("private").and_then(Value::as_bool),
+                "permissions": Value::Null,
+                "hasRequiredPermissions": false,
+                "missingPermissions": ["issues"],
+                "message": "Repository exists but GitHub App is not installed",
+                "settingsUrl": env::var("GITHUB_APP_NAME").ok().map(|name| format!("https://github.com/apps/{name}")),
+            })));
+        }
+        Err(error) => return Err(error),
+    };
+    let installation_id = installation
+        .get("id")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let permissions = installation
+        .get("permissions")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let permission = permissions
+        .get("issues")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let has_permissions = matches!(permission, "write" | "admin");
+    Ok(Json(json!({
+        "isInstalled": true,
+        "installationId": installation_id,
+        "repositoryExists": true,
+        "repositoryPrivate": repo.get("private").and_then(Value::as_bool),
+        "permissions": permissions,
+        "hasRequiredPermissions": has_permissions,
+        "missingPermissions": if has_permissions { Vec::<String>::new() } else { vec!["issues".to_string()] },
+        "message": if has_permissions { "GitHub App is properly installed and has all required permissions" } else { "GitHub App is installed but missing required permissions: issues" },
+        "settingsUrl": format!("https://github.com/settings/installations/{installation_id}"),
+        "installationUrl": env::var("GITHUB_APP_NAME").ok().map(|name| format!("https://github.com/apps/{name}/installations/new/permissions?target_id={}", repo.get("id").and_then(Value::as_i64).unwrap_or_default())),
+    })))
+}
+
+async fn import_github_comments(
+    state: &AppState,
+    token: &str,
+    owner: &str,
+    repository: &str,
+    issue_number: i64,
+    task_id: &str,
+) -> Result<(), ApiError> {
+    let owner = url::form_urlencoded::byte_serialize(owner.as_bytes()).collect::<String>();
+    let repository =
+        url::form_urlencoded::byte_serialize(repository.as_bytes()).collect::<String>();
+    for page in 1..=50 {
+        let comments = github_request(
+            state,
+            reqwest::Method::GET,
+            &format!(
+                "/repos/{owner}/{repository}/issues/{issue_number}/comments?per_page=100&page={page}"
+            ),
+            token,
+            None,
+        )
+        .await?;
+        let Some(comments) = comments.as_array() else {
+            break;
+        };
+        if comments.is_empty() {
+            break;
+        }
+        for comment in comments {
+            let username = comment
+                .get("user")
+                .and_then(|value| value.get("login"))
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown");
+            if username.ends_with("[bot]") {
+                continue;
+            }
+            let url = comment
+                .get("html_url")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if url.is_empty() {
+                continue;
+            }
+            let content = comment
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let avatar = comment
+                .get("user")
+                .and_then(|value| value.get("avatar_url"))
+                .and_then(Value::as_str);
+            state
+                .database
+                .client
+                .execute(
+                    "INSERT INTO activity (id, task_id, type, content, external_user_name, external_user_avatar, external_source, external_url, created_at, updated_at) VALUES ($1, $2, 'comment', $3, $4, $5, 'github', $6, NOW(), NOW()) ON CONFLICT (task_id, external_source, external_url) DO NOTHING",
+                    &[&Uuid::new_v4().to_string(), &task_id, &content, &username, &avatar, &url],
+                )
+                .await
+                .map_err(database_error)?;
+        }
+        if comments.len() < 100 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn import_github_issue(
+    state: &AppState,
+    auth: &AuthContext,
+    headers: &HeaderMap,
+    integration_id: &str,
+    project_id: &str,
+    workspace_id: &str,
+    config: &Value,
+    token: &str,
+    issue: &Value,
+) -> Result<&'static str, ApiError> {
+    let number = issue
+        .get("number")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_GATEWAY, "GitHub issue has no number"))?;
+    let number_string = number.to_string();
+    let title = issue
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("Untitled issue")
+        .to_string();
+    let description = issue
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let (status, priority) =
+        imported_issue_status_priority(issue.get("labels").unwrap_or(&Value::Null));
+    let existing = imported_external_link(state, integration_id, "issue", &number_string).await?;
+    let was_existing = existing.is_some();
+    let task_id = if let Some((link_id, task_id)) = existing {
+        state
+            .database
+            .client
+            .execute(
+                "UPDATE task SET title = $1, description = $2, status = $3, priority = COALESCE($4, priority), updated_at = NOW() WHERE id = $5",
+                &[&title, &description, &status, &priority, &task_id],
+            )
+            .await
+            .map_err(database_error)?;
+        let url = issue
+            .get("html_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let metadata = serde_json::to_string(&json!({
+            "state": issue.get("state").and_then(Value::as_str),
+            "createdFrom": "github-import",
+        }))
+        .map_err(database_error)?;
+        state
+            .database
+            .client
+            .execute(
+                "UPDATE external_link SET url = $1, title = $2, metadata = $3, updated_at = NOW() WHERE id = $4",
+                &[&url, &title, &metadata, &link_id],
+            )
+            .await
+            .map_err(database_error)?;
+        task_id
+    } else {
+        let number: i32 = state
+            .database
+            .client
+            .query_one(
+                "UPDATE project SET last_task_number = last_task_number + 1 WHERE id = $1 RETURNING last_task_number",
+                &[&project_id],
+            )
+            .await
+            .map_err(database_error)?
+            .try_get("last_task_number")
+            .map_err(database_error)?;
+        let column_id = column_for_status(&state.database, project_id, &status).await?;
+        let position: i32 = state
+            .database
+            .client
+            .query_one(
+                "SELECT COALESCE(MAX(position), 0) + 1 AS position FROM task WHERE project_id = $1 AND status = $2",
+                &[&project_id, &status],
+            )
+            .await
+            .map_err(database_error)?
+            .try_get("position")
+            .map_err(database_error)?;
+        let task_id = Uuid::new_v4().to_string();
+        state
+            .database
+            .client
+            .execute(
+                "INSERT INTO task (id, project_id, position, number, title, description, status, column_id, priority, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())",
+                &[&task_id, &project_id, &position, &number, &title, &description, &status, &column_id, &priority],
+            )
+            .await
+            .map_err(database_error)?;
+        let url = issue
+            .get("html_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let metadata = serde_json::to_string(&json!({
+            "state": issue.get("state").and_then(Value::as_str),
+            "createdFrom": "github-import",
+            "author": issue
+                .get("user")
+                .and_then(|value| value.get("login"))
+                .and_then(Value::as_str),
+        }))
+        .map_err(database_error)?;
+        state
+            .database
+            .client
+            .execute(
+                "INSERT INTO external_link (id, task_id, integration_id, resource_type, external_id, url, title, metadata, created_at, updated_at) VALUES ($1, $2, $3, 'issue', $4, $5, $6, $7, NOW(), NOW())",
+                &[&Uuid::new_v4().to_string(), &task_id, &integration_id, &number_string, &url, &title, &metadata],
+            )
+            .await
+            .map_err(database_error)?;
+        let task = task_by_id(&state.database, &task_id).await?;
+        publish_task_event(
+            state,
+            "TASK_CREATED",
+            task.project_id,
+            task.id,
+            auth,
+            headers,
+        );
+        task_id
+    };
+    import_external_labels(
+        state,
+        issue.get("labels").unwrap_or(&Value::Null),
+        &task_id,
+        workspace_id,
+    )
+    .await?;
+    let owner = config
+        .get("repositoryOwner")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let repository = config
+        .get("repositoryName")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    import_github_comments(state, token, owner, repository, number, &task_id).await?;
+    Ok(if was_existing { "updated" } else { "imported" })
+}
+
+async fn import_github_issues(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ImportIntegrationInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &input.project_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "task", "create").await?;
+    let integration = integration_row(&state, &input.project_id, "github")
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "GitHub integration not found"))?;
+    if !integration
+        .try_get::<_, bool>("is_active")
+        .map_err(database_error)?
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "GitHub integration is not active",
+        ));
+    }
+    let integration_id = row_string(&integration, "id")?;
+    let config = integration_config(&integration)?;
+    let installation_id = config
+        .get("installationId")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "GitHub installation ID not configured",
+            )
+        })?;
+    let token = github_installation_token(&state, installation_id).await?;
+    let owner = config
+        .get("repositoryOwner")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "GitHub repository owner is missing",
+            )
+        })?;
+    let repository = config
+        .get("repositoryName")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::BAD_REQUEST, "GitHub repository name is missing")
+        })?;
+    let owner = url::form_urlencoded::byte_serialize(owner.as_bytes()).collect::<String>();
+    let repository =
+        url::form_urlencoded::byte_serialize(repository.as_bytes()).collect::<String>();
+    let mut imported = 0;
+    let mut updated = 0;
+    let mut skipped = 0;
+    let mut errors = Vec::new();
+    for page in 1..=50 {
+        let issues = github_request(
+            &state,
+            reqwest::Method::GET,
+            &format!("/repos/{owner}/{repository}/issues?state=open&per_page=100&page={page}"),
+            &token,
+            None,
+        )
+        .await?;
+        let Some(issues) = issues.as_array() else {
+            break;
+        };
+        if issues.is_empty() {
+            break;
+        }
+        for issue in issues {
+            if issue.get("pull_request").is_some() {
+                skipped += 1;
+                continue;
+            }
+            match import_github_issue(
+                &state,
+                &auth,
+                &headers,
+                &integration_id,
+                &input.project_id,
+                &workspace_id,
+                &config,
+                &token,
+                issue,
+            )
+            .await
+            {
+                Ok("imported") => imported += 1,
+                Ok("updated") => updated += 1,
+                Ok(_) => skipped += 1,
+                Err(error) => errors.push(format!(
+                    "Issue #{}: {}",
+                    issue
+                        .get("number")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default(),
+                    error.message
+                )),
+            }
+        }
+        if issues.len() < 100 {
+            break;
+        }
+    }
+    Ok(Json(json!({
+        "imported": imported,
+        "updated": updated,
+        "skipped": skipped,
+        "errors": if errors.is_empty() { Value::Null } else { json!(errors) },
+    })))
+}
+
+async fn github_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let signature = headers
+        .get("x-hub-signature-256")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Missing signature"))?;
+    let secret = env::var("GITHUB_WEBHOOK_SECRET")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::BAD_REQUEST, "GitHub integration not configured")
+        })?;
+    if !verify_hmac_hex(&secret, &body, signature) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid webhook signature",
+        ));
+    }
+    let event = headers
+        .get("x-github-event")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Missing event name"))?;
+    let payload: Value = serde_json::from_slice(&body).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid JSON payload: {error}"),
+        )
+    })?;
+    let installation_id = payload
+        .get("installation")
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_i64);
+    let repository = payload.get("repository");
+    let rows = state
+        .database
+        .client
+        .query(
+            "SELECT id, project_id, config FROM integration WHERE type = 'github' AND COALESCE(is_active, TRUE) = TRUE",
+            &[],
+        )
+        .await
+        .map_err(database_error)?;
+    for row in rows {
+        let config = integration_config(&row)?;
+        let config_installation_id = config.get("installationId").and_then(Value::as_i64);
+        let config_owner = config
+            .get("repositoryOwner")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let config_repository = config
+            .get("repositoryName")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let payload_owner = repository
+            .and_then(|value| value.get("owner"))
+            .and_then(|value| value.get("login"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let payload_repository = repository
+            .and_then(|value| value.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if installation_id.is_some_and(|value| config_installation_id != Some(value))
+            && (payload_owner != config_owner || payload_repository != config_repository)
+        {
+            continue;
+        }
+        let integration_id = row_string(&row, "id")?;
+        let issue = payload.get("issue").unwrap_or(&Value::Null);
+        if matches!(event, "issues") {
+            if let Some(number) = issue.get("number").and_then(Value::as_i64) {
+                if let Some((_, task_id)) =
+                    imported_external_link(&state, &integration_id, "issue", &number.to_string())
+                        .await?
+                {
+                    let action = payload
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let (mut status, priority) =
+                        imported_issue_status_priority(issue.get("labels").unwrap_or(&Value::Null));
+                    if action == "closed" {
+                        status = "done".to_string();
+                    }
+                    let column_id = column_for_status(
+                        &state.database,
+                        &row_string(&row, "project_id")?,
+                        &status,
+                    )
+                    .await
+                    .ok()
+                    .flatten();
+                    let title = issue.get("title").and_then(Value::as_str);
+                    let description = issue.get("body").and_then(Value::as_str);
+                    state
+                        .database
+                        .client
+                        .execute(
+                            "UPDATE task SET title = COALESCE($1, title), description = COALESCE($2, description), status = $3, column_id = $4, priority = COALESCE($5, priority), updated_at = NOW() WHERE id = $6",
+                            &[&title, &description, &status, &column_id, &priority, &task_id],
+                        )
+                        .await
+                        .map_err(database_error)?;
+                }
+            }
+        } else if matches!(event, "issue_comment")
+            && payload.get("action").and_then(Value::as_str) == Some("created")
+        {
+            if let Some(number) = issue.get("number").and_then(Value::as_i64) {
+                if let Some((_, task_id)) =
+                    imported_external_link(&state, &integration_id, "issue", &number.to_string())
+                        .await?
+                {
+                    let comment = payload.get("comment").unwrap_or(&Value::Null);
+                    let url = comment
+                        .get("html_url")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !url.is_empty() {
+                        let username = comment
+                            .get("user")
+                            .and_then(|value| value.get("login"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("github-webhook");
+                        let content = comment
+                            .get("body")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        state
+                            .database
+                            .client
+                            .execute(
+                                "INSERT INTO activity (id, task_id, type, content, external_user_name, external_source, external_url, created_at, updated_at) VALUES ($1, $2, 'comment', $3, $4, 'github', $5, NOW(), NOW()) ON CONFLICT (task_id, external_source, external_url) DO NOTHING",
+                                &[&Uuid::new_v4().to_string(), &task_id, &content, &username, &url],
+                            )
+                            .await
+                            .map_err(database_error)?;
+                    }
+                }
+            }
+        } else if matches!(event, "pull_request") {
+            let pull_request = payload.get("pull_request").unwrap_or(&Value::Null);
+            if let Some(number) = pull_request.get("number").and_then(Value::as_i64) {
+                if let Some((_, task_id)) = imported_external_link(
+                    &state,
+                    &integration_id,
+                    "pull_request",
+                    &number.to_string(),
+                )
+                .await?
+                {
+                    let action = payload
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let status_key = if action == "closed"
+                        && pull_request.get("merged").and_then(Value::as_bool) == Some(true)
+                    {
+                        "onPRMerge"
+                    } else {
+                        "onPROpen"
+                    };
+                    if let Some(status) = config
+                        .get("statusTransitions")
+                        .and_then(|value| value.get(status_key))
+                        .and_then(Value::as_str)
+                    {
+                        let project_id = row_string(&row, "project_id")?;
+                        let column_id = column_for_status(&state.database, &project_id, status)
+                            .await
+                            .ok()
+                            .flatten();
+                        state
+                            .database
+                            .client
+                            .execute(
+                                "UPDATE task SET status = $1, column_id = $2, updated_at = NOW() WHERE id = $3",
+                                &[&status, &column_id, &task_id],
+                            )
+                            .await
+                            .map_err(database_error)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(Json(json!({ "status": "success" })))
 }
 
 async fn get_github_integration(
@@ -3783,21 +5283,41 @@ async fn gitea_json(
     access_token: &str,
     path: &str,
 ) -> Result<Value, ApiError> {
+    gitea_request(
+        state,
+        reqwest::Method::GET,
+        base_url,
+        access_token,
+        path,
+        None,
+    )
+    .await
+}
+
+async fn gitea_request(
+    state: &AppState,
+    method: reqwest::Method,
+    base_url: &str,
+    access_token: &str,
+    path: &str,
+    payload: Option<&Value>,
+) -> Result<Value, ApiError> {
     let url = format!("{}/api/v1{}", base_url.trim_end_matches('/'), path);
-    let response = state
+    let mut request = state
         .http
-        .get(url)
+        .request(method, url)
         .header("Authorization", format!("token {access_token}"))
         .header("Content-Type", "application/json")
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                format!("Could not reach Gitea: {error}"),
-            )
-        })?;
+        .timeout(Duration::from_secs(10));
+    if let Some(payload) = payload {
+        request = request.json(payload);
+    }
+    let response = request.send().await.map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("Could not reach Gitea: {error}"),
+        )
+    })?;
     let status = StatusCode::from_u16(response.status().as_u16()).map_err(database_error)?;
     let body = response.text().await.map_err(|error| {
         ApiError::new(
@@ -4226,6 +5746,573 @@ async fn delete_gitea_integration(
         "success": true,
         "message": "Gitea integration deleted"
     })))
+}
+
+fn imported_issue_status_priority(labels: &Value) -> (String, Option<String>) {
+    let mut status = None;
+    let mut priority = None;
+    if let Some(labels) = labels.as_array() {
+        for label in labels {
+            let name = label
+                .as_str()
+                .or_else(|| label.get("name").and_then(Value::as_str))
+                .unwrap_or_default()
+                .trim();
+            if let Some(value) = name.strip_prefix("status:") {
+                let value = value.trim().to_lowercase();
+                if !value.is_empty()
+                    && value.chars().all(|character| {
+                        character.is_ascii_lowercase()
+                            || character.is_ascii_digit()
+                            || character == '-'
+                    })
+                {
+                    status = Some(value);
+                }
+            }
+            if let Some(value) = name.strip_prefix("priority:") {
+                if matches!(value, "low" | "medium" | "high" | "urgent") {
+                    priority = Some(value.to_string());
+                }
+            }
+        }
+    }
+    (status.unwrap_or_else(|| "to-do".to_string()), priority)
+}
+
+async fn imported_external_link(
+    state: &AppState,
+    integration_id: &str,
+    resource_type: &str,
+    external_id: &str,
+) -> Result<Option<(String, String)>, ApiError> {
+    state
+        .database
+        .client
+        .query_opt(
+            "SELECT id, task_id FROM external_link WHERE integration_id = $1 AND resource_type = $2 AND external_id = $3 LIMIT 1",
+            &[&integration_id, &resource_type, &external_id],
+        )
+        .await
+        .map_err(database_error)?
+        .map(|row| {
+            Ok((
+                row_string(&row, "id")?,
+                row_string(&row, "task_id")?,
+            ))
+        })
+        .transpose()
+}
+
+async fn import_external_labels(
+    state: &AppState,
+    labels: &Value,
+    task_id: &str,
+    workspace_id: &str,
+) -> Result<(), ApiError> {
+    let Some(labels) = labels.as_array() else {
+        return Ok(());
+    };
+    for label in labels {
+        let name = label
+            .as_str()
+            .or_else(|| label.get("name").and_then(Value::as_str))
+            .unwrap_or_default()
+            .trim();
+        if name.is_empty() || name.starts_with("priority:") || name.starts_with("status:") {
+            continue;
+        }
+        let color = label
+            .get("color")
+            .and_then(Value::as_str)
+            .map(|value| format!("#{}", value.trim_start_matches('#')))
+            .filter(|value| value.len() > 1)
+            .unwrap_or_else(|| "#6B7280".to_string());
+        let color = state
+            .database
+            .client
+            .query_opt(
+                "SELECT color FROM label WHERE workspace_id = $1 AND task_id IS NULL AND name = $2 LIMIT 1",
+                &[&workspace_id, &name],
+            )
+            .await
+            .map_err(database_error)?
+            .and_then(|row| row_optional_string(&row, "color").ok().flatten())
+            .unwrap_or(color);
+        state
+            .database
+            .client
+            .execute(
+                "INSERT INTO label (id, name, color, task_id, workspace_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, NOW(), NOW()) ON CONFLICT (task_id, name) DO NOTHING",
+                &[&Uuid::new_v4().to_string(), &name, &color, &task_id, &workspace_id],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+async fn import_gitea_comments(
+    state: &AppState,
+    base_url: &str,
+    access_token: &str,
+    owner: &str,
+    repository: &str,
+    issue_number: i64,
+    task_id: &str,
+) -> Result<(), ApiError> {
+    for page in 1..=50 {
+        let path = format!(
+            "/repos/{}/{}/issues/{issue_number}/comments?page={page}&limit=100",
+            gitea_path_segment(owner),
+            gitea_path_segment(repository),
+        );
+        let comments = gitea_json(state, base_url, access_token, &path).await?;
+        let Some(comments) = comments.as_array() else {
+            return Ok(());
+        };
+        if comments.is_empty() {
+            break;
+        }
+        for comment in comments {
+            let username = comment
+                .get("user")
+                .and_then(|value| value.get("login").or_else(|| value.get("username")))
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown");
+            if username.ends_with("[bot]") {
+                continue;
+            }
+            let url = comment
+                .get("html_url")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if url.is_empty() {
+                continue;
+            }
+            let body = comment
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let avatar = comment
+                .get("user")
+                .and_then(|value| value.get("avatar_url"))
+                .and_then(Value::as_str);
+            state
+                .database
+                .client
+                .execute(
+                    "INSERT INTO activity (id, task_id, type, content, external_user_name, external_user_avatar, external_source, external_url, created_at, updated_at) VALUES ($1, $2, 'comment', $3, $4, $5, 'gitea', $6, NOW(), NOW()) ON CONFLICT (task_id, external_source, external_url) DO NOTHING",
+                    &[&Uuid::new_v4().to_string(), &task_id, &body, &username, &avatar, &url],
+                )
+                .await
+                .map_err(database_error)?;
+        }
+        if comments.len() < 100 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn import_gitea_issue(
+    state: &AppState,
+    auth: &AuthContext,
+    headers: &HeaderMap,
+    integration_id: &str,
+    project_id: &str,
+    workspace_id: &str,
+    config: &Value,
+    issue: &Value,
+) -> Result<&'static str, ApiError> {
+    let number = issue
+        .get("number")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_GATEWAY, "Gitea issue has no number"))?;
+    let number_string = number.to_string();
+    let title = issue
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("Untitled issue")
+        .to_string();
+    let description = issue
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let (status, priority) =
+        imported_issue_status_priority(issue.get("labels").unwrap_or(&Value::Null));
+    let existing = imported_external_link(state, integration_id, "issue", &number_string).await?;
+    let was_existing = existing.is_some();
+    let task_id = if let Some((link_id, task_id)) = existing {
+        state
+            .database
+            .client
+            .execute(
+                "UPDATE task SET title = $1, description = $2, status = $3, priority = COALESCE($4, priority), updated_at = NOW() WHERE id = $5",
+                &[&title, &description, &status, &priority, &task_id],
+            )
+            .await
+            .map_err(database_error)?;
+        let url = issue
+            .get("html_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let metadata = json!({
+            "state": issue.get("state").and_then(Value::as_str),
+            "createdFrom": "gitea-import",
+        });
+        let metadata = serde_json::to_string(&metadata).map_err(database_error)?;
+        state
+            .database
+            .client
+            .execute(
+                "UPDATE external_link SET url = $1, title = $2, metadata = $3, updated_at = NOW() WHERE id = $4",
+                &[&url, &title, &metadata, &link_id],
+            )
+            .await
+            .map_err(database_error)?;
+        task_id
+    } else {
+        let number: i32 = state
+            .database
+            .client
+            .query_one(
+                "UPDATE project SET last_task_number = last_task_number + 1 WHERE id = $1 RETURNING last_task_number",
+                &[&project_id],
+            )
+            .await
+            .map_err(database_error)?
+            .try_get("last_task_number")
+            .map_err(database_error)?;
+        let column_id = column_for_status(&state.database, project_id, &status).await?;
+        let position: i32 = state
+            .database
+            .client
+            .query_one(
+                "SELECT COALESCE(MAX(position), 0) + 1 AS position FROM task WHERE project_id = $1 AND status = $2",
+                &[&project_id, &status],
+            )
+            .await
+            .map_err(database_error)?
+            .try_get("position")
+            .map_err(database_error)?;
+        let task_id = Uuid::new_v4().to_string();
+        state
+            .database
+            .client
+            .execute(
+                "INSERT INTO task (id, project_id, position, number, title, description, status, column_id, priority, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())",
+                &[&task_id, &project_id, &position, &number, &title, &description, &status, &column_id, &priority],
+            )
+            .await
+            .map_err(database_error)?;
+        let url = issue
+            .get("html_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let metadata = json!({
+            "state": issue.get("state").and_then(Value::as_str),
+            "createdFrom": "gitea-import",
+            "author": issue
+                .get("user")
+                .and_then(|value| value.get("login").or_else(|| value.get("username")))
+                .and_then(Value::as_str),
+        });
+        let metadata = serde_json::to_string(&metadata).map_err(database_error)?;
+        state
+            .database
+            .client
+            .execute(
+                "INSERT INTO external_link (id, task_id, integration_id, resource_type, external_id, url, title, metadata, created_at, updated_at) VALUES ($1, $2, $3, 'issue', $4, $5, $6, $7, NOW(), NOW())",
+                &[&Uuid::new_v4().to_string(), &task_id, &integration_id, &number_string, &url, &title, &metadata],
+            )
+            .await
+            .map_err(database_error)?;
+        let task = task_by_id(&state.database, &task_id).await?;
+        publish_task_event(
+            state,
+            "TASK_CREATED",
+            task.project_id,
+            task.id,
+            auth,
+            headers,
+        );
+        task_id
+    };
+    import_external_labels(
+        state,
+        issue.get("labels").unwrap_or(&Value::Null),
+        &task_id,
+        workspace_id,
+    )
+    .await?;
+    let base_url = config
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let access_token = config
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let owner = config
+        .get("repositoryOwner")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let repository = config
+        .get("repositoryName")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    import_gitea_comments(
+        state,
+        base_url,
+        access_token,
+        owner,
+        repository,
+        number,
+        &task_id,
+    )
+    .await?;
+    Ok(if was_existing { "updated" } else { "imported" })
+}
+
+async fn import_gitea_issues(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ImportIntegrationInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_project(&state, &headers, &input.project_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "task", "create").await?;
+    let integration = integration_row(&state, &input.project_id, "gitea")
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Gitea integration not found"))?;
+    if !integration
+        .try_get::<_, bool>("is_active")
+        .map_err(database_error)?
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Gitea integration is not active",
+        ));
+    }
+    let integration_id = row_string(&integration, "id")?;
+    let config = integration_config(&integration)?;
+    let base_url = normalize_gitea_base_url(
+        config
+            .get("baseUrl")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )?;
+    let access_token = config
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Gitea access token is missing"))?;
+    let owner = config
+        .get("repositoryOwner")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::BAD_REQUEST, "Gitea repository owner is missing")
+        })?;
+    let repository = config
+        .get("repositoryName")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::BAD_REQUEST, "Gitea repository name is missing")
+        })?;
+
+    let mut imported = 0;
+    let mut updated = 0;
+    let mut skipped = 0;
+    let mut errors = Vec::new();
+    for page in 1..=50 {
+        let path = format!(
+            "/repos/{}/{}/issues?state=open&page={page}&limit=100",
+            gitea_path_segment(owner),
+            gitea_path_segment(repository),
+        );
+        let issues = gitea_json(&state, &base_url, access_token, &path).await?;
+        let Some(issues) = issues.as_array() else {
+            break;
+        };
+        if issues.is_empty() {
+            break;
+        }
+        for issue in issues {
+            if issue.get("pull_request").is_some() {
+                skipped += 1;
+                continue;
+            }
+            match import_gitea_issue(
+                &state,
+                &auth,
+                &headers,
+                &integration_id,
+                &input.project_id,
+                &workspace_id,
+                &config,
+                issue,
+            )
+            .await
+            {
+                Ok("imported") => imported += 1,
+                Ok("updated") => updated += 1,
+                Ok(_) => skipped += 1,
+                Err(error) => errors.push(format!(
+                    "Issue #{}: {}",
+                    issue
+                        .get("number")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default(),
+                    error.message
+                )),
+            }
+        }
+        if issues.len() < 100 {
+            break;
+        }
+    }
+    Ok(Json(json!({
+        "imported": imported,
+        "updated": updated,
+        "skipped": skipped,
+        "errors": if errors.is_empty() { Value::Null } else { json!(errors) },
+    })))
+}
+
+fn verify_hmac_hex(secret: &str, payload: &[u8], provided: &str) -> bool {
+    let provided = provided
+        .trim()
+        .strip_prefix("sha256=")
+        .or_else(|| provided.trim().strip_prefix("SHA256="))
+        .unwrap_or(provided.trim());
+    let expected = hex_digest(&hmac_sha256(
+        secret.as_bytes(),
+        &String::from_utf8_lossy(payload),
+    ));
+    if provided.len() != expected.len() {
+        return false;
+    }
+    provided
+        .as_bytes()
+        .iter()
+        .zip(expected.as_bytes())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+async fn gitea_webhook(
+    State(state): State<AppState>,
+    Path(integration_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let integration = integration_row_by_id(&state, &integration_id, "gitea").await?;
+    let config = integration_config(&integration)?;
+    let secret = config
+        .get("webhookSecret")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Webhook secret not configured"))?;
+    let signature = headers
+        .get("x-gitea-signature")
+        .or_else(|| headers.get("X-Gitea-Signature"))
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Missing signature"))?;
+    if !verify_hmac_hex(secret, &body, signature) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid webhook signature",
+        ));
+    }
+    let event = headers
+        .get("x-gitea-event")
+        .or_else(|| headers.get("X-Gitea-Event"))
+        .or_else(|| headers.get("x-github-event"))
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Missing event name"))?;
+    let payload: Value = serde_json::from_slice(&body).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid JSON payload: {error}"),
+        )
+    })?;
+    let action = payload
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(event, "issues" | "issue") {
+        let issue = payload.get("issue").unwrap_or(&payload);
+        let issue_number = issue
+            .get("number")
+            .and_then(Value::as_i64)
+            .or_else(|| issue.get("index").and_then(Value::as_i64));
+        if let Some(issue_number) = issue_number {
+            if let Some((_, task_id)) =
+                imported_external_link(&state, &integration_id, "issue", &issue_number.to_string())
+                    .await?
+            {
+                let title = issue.get("title").and_then(Value::as_str);
+                let description = issue.get("body").and_then(Value::as_str);
+                let status = match action {
+                    "closed" => Some("done"),
+                    "reopened" | "opened" | "created" => Some("to-do"),
+                    _ => None,
+                };
+                state
+                    .database
+                    .client
+                    .execute(
+                        "UPDATE task SET title = COALESCE($1, title), description = COALESCE($2, description), status = COALESCE($3, status), updated_at = NOW() WHERE id = $4",
+                        &[&title, &description, &status, &task_id],
+                    )
+                    .await
+                    .map_err(database_error)?;
+            }
+        }
+    } else if matches!(event, "issue_comment" | "issue_comment_created") && action == "created" {
+        let issue = payload.get("issue").unwrap_or(&Value::Null);
+        let comment = payload.get("comment").unwrap_or(&Value::Null);
+        if let Some(issue_number) = issue
+            .get("number")
+            .and_then(Value::as_i64)
+            .or_else(|| issue.get("index").and_then(Value::as_i64))
+        {
+            if let Some((_, task_id)) =
+                imported_external_link(&state, &integration_id, "issue", &issue_number.to_string())
+                    .await?
+            {
+                let url = comment
+                    .get("html_url")
+                    .or_else(|| comment.get("url"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let username = comment
+                    .get("user")
+                    .and_then(|value| value.get("login").or_else(|| value.get("username")))
+                    .and_then(Value::as_str)
+                    .unwrap_or("gitea-webhook");
+                let content = comment
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !url.is_empty() {
+                    state
+                        .database
+                        .client
+                        .execute(
+                            "INSERT INTO activity (id, task_id, type, content, external_user_name, external_source, external_url, created_at, updated_at) VALUES ($1, $2, 'comment', $3, $4, 'gitea', $5, NOW(), NOW()) ON CONFLICT (task_id, external_source, external_url) DO NOTHING",
+                            &[&Uuid::new_v4().to_string(), &task_id, &content, &username, &url],
+                        )
+                        .await
+                        .map_err(database_error)?;
+                }
+            }
+        }
+    }
+    Ok(Json(json!({ "status": "success" })))
 }
 
 fn mcp_object_schema(properties: Value, required: &[&str]) -> Value {
@@ -6894,7 +8981,7 @@ async fn update_task_status(
     let task = task_by_id(&state.database, &id).await?;
     publish_task_event(
         &state,
-        "TASK_UPDATED",
+        "TASK_PRIORITY_CHANGED",
         task.project_id.clone(),
         id,
         &auth,
@@ -6948,7 +9035,7 @@ async fn update_task_title(
     let task = task_by_id(&state.database, &id).await?;
     publish_task_event(
         &state,
-        "TASK_UPDATED",
+        "TASK_DUE_DATE_CHANGED",
         task.project_id.clone(),
         id,
         &auth,
@@ -6977,7 +9064,7 @@ async fn update_task_priority(
     let task = task_by_id(&state.database, &id).await?;
     publish_task_event(
         &state,
-        "TASK_UPDATED",
+        "TASK_ASSIGNEE_CHANGED",
         task.project_id.clone(),
         id,
         &auth,
@@ -7005,7 +9092,7 @@ async fn update_task_due_date(
     let task = task_by_id(&state.database, &id).await?;
     publish_task_event(
         &state,
-        "TASK_UPDATED",
+        "TASK_DESCRIPTION_CHANGED",
         task.project_id.clone(),
         id,
         &auth,
@@ -8029,6 +10116,1895 @@ async fn delete_task(
     Ok(Json(task))
 }
 
+fn auth_cookie(token: &str, clear: bool) -> String {
+    if clear {
+        "better-auth.session_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax".to_string()
+    } else {
+        format!(
+            "better-auth.session_token={token}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax"
+        )
+    }
+}
+
+fn auth_response(
+    value: Value,
+    token: Option<&str>,
+    clear_cookie: bool,
+) -> Result<Response, ApiError> {
+    let mut response = Json(value).into_response();
+    if let Some(token) = token {
+        let cookie = auth_cookie(token, false);
+        let value = HeaderValue::from_str(&cookie).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not create session cookie: {error}"),
+            )
+        })?;
+        response.headers_mut().append(header::SET_COOKIE, value);
+    } else if clear_cookie {
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_static(
+                "better-auth.session_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
+            ),
+        );
+    }
+    Ok(response)
+}
+
+fn normalize_email(value: &str) -> Result<String, ApiError> {
+    let email = value.trim().to_lowercase();
+    if email.is_empty() || !email.contains('@') || email.len() > 320 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid email address",
+        ));
+    }
+    Ok(email)
+}
+
+fn validate_password(value: &str) -> Result<(), ApiError> {
+    if value.chars().count() < 8 || value.chars().count() > 128 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Password must be between 8 and 128 characters",
+        ));
+    }
+    Ok(())
+}
+
+fn slugify_workspace_name(name: &str) -> String {
+    let mut slug = String::with_capacity(name.len());
+    let mut last_was_dash = false;
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash && !slug.is_empty() {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "workspace".to_string()
+    } else {
+        slug
+    }
+}
+
+fn normalize_workspace_slug(value: Option<&str>, name: &str) -> String {
+    let raw = value.unwrap_or_default().trim();
+    let source = if raw.is_empty() { name } else { raw };
+    slugify_workspace_name(source).chars().take(80).collect()
+}
+
+async fn session_for_user(
+    state: &AppState,
+    user_id: &str,
+    headers: &HeaderMap,
+) -> Result<(String, Value), ApiError> {
+    let token = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let active_organization_id = state
+        .database
+        .client
+        .query_opt(
+            "SELECT workspace_id FROM workspace_member WHERE user_id = $1 ORDER BY joined_at ASC LIMIT 1",
+            &[&user_id],
+        )
+        .await
+        .map_err(database_error)?
+        .map(|row| row_string(&row, "workspace_id"))
+        .transpose()?;
+    let ip_address: Option<String> = None;
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO session
+                (id, expires_at, token, created_at, updated_at, ip_address,
+                 user_agent, user_id, active_organization_id)
+              VALUES ($1, NOW() + INTERVAL '30 days', $2, NOW(), NOW(), $3, $4, $5, $6)
+            "#,
+            &[
+                &session_id,
+                &token,
+                &ip_address,
+                &user_agent,
+                &user_id,
+                &active_organization_id,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    let role = state
+        .database
+        .client
+        .query_opt("SELECT role FROM \"user\" WHERE id = $1", &[&user_id])
+        .await
+        .map_err(database_error)?
+        .and_then(|row| row.try_get("role").ok());
+    let auth = AuthContext {
+        user_id: user_id.to_string(),
+        role,
+        session_token: Some(token.clone()),
+        credential: token.clone(),
+    };
+    Ok((token, session_json(state, &auth).await?))
+}
+
+async fn sign_up_email(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<SignUpInput>,
+) -> Result<Response, ApiError> {
+    let email = normalize_email(&input.email)?;
+    let name = input.name.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Invalid name"));
+    }
+    validate_password(&input.password)?;
+    let existing_user_count = state
+        .database
+        .client
+        .query_one("SELECT COUNT(*)::bigint AS count FROM \"user\"", &[])
+        .await
+        .map_err(database_error)?
+        .try_get::<_, i64>("count")
+        .map_err(database_error)?;
+    if env_true("DISABLE_REGISTRATION") && existing_user_count > 0 {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Registration is disabled",
+        ));
+    }
+    if env_true("DISABLE_PASSWORD_REGISTRATION") && existing_user_count > 0 {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Password registration is disabled",
+        ));
+    }
+    if state
+        .database
+        .client
+        .query_opt(
+            "SELECT id FROM \"user\" WHERE lower(email) = lower($1) LIMIT 1",
+            &[&email],
+        )
+        .await
+        .map_err(database_error)?
+        .is_some()
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "User with this email already exists",
+        ));
+    }
+    let password_hash = bcrypt_hash(&input.password, 10).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not hash password: {error}"),
+        )
+    })?;
+    let user_id = Uuid::new_v4().to_string();
+    let account_id = Uuid::new_v4().to_string();
+    let role = (existing_user_count == 0).then_some("admin");
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO "user"
+                (id, name, email, email_verified, locale, created_at, updated_at,
+                 is_anonymous, role, banned)
+              VALUES ($1, $2, $3, FALSE, $4, NOW(), NOW(), FALSE, $5, FALSE)
+            "#,
+            &[&user_id, &name, &email, &input.locale, &role],
+        )
+        .await
+        .map_err(database_error)?;
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO account
+                (id, account_id, provider_id, user_id, password, created_at, updated_at)
+              VALUES ($1, $2, 'credential', $3, $4, NOW(), NOW())
+            "#,
+            &[&account_id, &email, &user_id, &password_hash],
+        )
+        .await
+        .map_err(database_error)?;
+    let (token, session) = session_for_user(&state, &user_id, &headers).await?;
+    let user = session.get("user").cloned().unwrap_or(Value::Null);
+    let session_record = session.get("session").cloned().unwrap_or(Value::Null);
+    auth_response(
+        json!({ "token": token, "user": user, "session": session_record }),
+        Some(&token),
+        false,
+    )
+}
+
+async fn sign_in_email(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<SignInInput>,
+) -> Result<Response, ApiError> {
+    let email = normalize_email(&input.email)?;
+    validate_password(&input.password)?;
+    let row = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT u.id, COALESCE(u.banned, FALSE) AS banned, a.password
+              FROM "user" u
+              INNER JOIN account a ON a.user_id = u.id AND a.provider_id = 'credential'
+              WHERE lower(u.email) = lower($1)
+              LIMIT 1
+            "#,
+            &[&email],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "Invalid email or password"))?;
+    let password_hash: Option<String> = row.try_get("password").map_err(database_error)?;
+    let valid = password_hash
+        .as_deref()
+        .is_some_and(|value| bcrypt_verify(&input.password, value).unwrap_or(false));
+    let banned = row.try_get::<_, bool>("banned").unwrap_or(false);
+    if !valid || banned {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "Invalid email or password",
+        ));
+    }
+    let user_id: String = row.try_get("id").map_err(database_error)?;
+    let (token, session) = session_for_user(&state, &user_id, &headers).await?;
+    let user = session.get("user").cloned().unwrap_or(Value::Null);
+    let session_record = session.get("session").cloned().unwrap_or(Value::Null);
+    auth_response(
+        json!({ "token": token, "user": user, "session": session_record }),
+        Some(&token),
+        false,
+    )
+}
+
+async fn sign_in_anonymous(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if env_true("DISABLE_GUEST_ACCESS") {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Guest access is disabled",
+        ));
+    }
+
+    let user_id = Uuid::new_v4().to_string();
+    let suffix = &user_id[..8];
+    let name = format!("Kaneo guest {suffix}");
+    let email = format!("guest-{user_id}@kaneo.app");
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO "user"
+                (id, name, email, email_verified, locale, created_at, updated_at,
+                 is_anonymous, role, banned)
+              VALUES ($1, $2, $3, FALSE, NULL, NOW(), NOW(), TRUE, NULL, FALSE)
+            "#,
+            &[&user_id, &name, &email],
+        )
+        .await
+        .map_err(database_error)?;
+    let (token, session) = session_for_user(&state, &user_id, &headers).await?;
+    let user = session.get("user").cloned().unwrap_or(Value::Null);
+    let session_record = session.get("session").cloned().unwrap_or(Value::Null);
+    auth_response(
+        json!({ "token": token, "user": user, "session": session_record }),
+        Some(&token),
+        false,
+    )
+}
+
+async fn sign_out(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    if let Some(auth) = authenticate(&state, &headers).await.ok() {
+        if let Some(session_token) = auth.session_token {
+            state
+                .database
+                .client
+                .execute("DELETE FROM session WHERE token = $1", &[&session_token])
+                .await
+                .map_err(database_error)?;
+        }
+    }
+    auth_response(json!({ "success": true }), None, true)
+}
+
+async fn organization_json(state: &AppState, organization_id: &str) -> Result<Value, ApiError> {
+    let row = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT id, name, slug, logo, metadata, description,
+                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at
+              FROM workspace WHERE id = $1 LIMIT 1
+            "#,
+            &[&organization_id],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Organization not found"))?;
+    let metadata = row_optional_string(&row, "metadata")?
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "id": row_string(&row, "id")?,
+        "name": row_string(&row, "name")?,
+        "slug": row_string(&row, "slug")?,
+        "logo": row_optional_string(&row, "logo")?,
+        "metadata": metadata,
+        "description": row_optional_string(&row, "description")?,
+        "createdAt": row_string(&row, "created_at")?,
+    }))
+}
+
+async fn create_organization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<OrganizationCreateInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let name = input.name.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid organization name",
+        ));
+    }
+    let slug = normalize_workspace_slug(input.slug.as_deref(), name);
+    if state
+        .database
+        .client
+        .query_opt("SELECT id FROM workspace WHERE slug = $1 LIMIT 1", &[&slug])
+        .await
+        .map_err(database_error)?
+        .is_some()
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "Organization slug already exists",
+        ));
+    }
+    let organization_id = Uuid::new_v4().to_string();
+    let member_id = Uuid::new_v4().to_string();
+    let metadata = input.metadata.as_ref().map(Value::to_string);
+    let description = input
+        .metadata
+        .as_ref()
+        .and_then(|value| value.get("description"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO workspace (id, name, slug, logo, metadata, description, created_at)
+              VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            "#,
+            &[
+                &organization_id,
+                &name,
+                &slug,
+                &input.logo,
+                &metadata,
+                &description,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO workspace_member (id, workspace_id, user_id, role, joined_at)
+              VALUES ($1, $2, $3, 'owner', NOW())
+            "#,
+            &[&member_id, &organization_id, &auth.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    for role in ["viewer", "member", "admin"] {
+        let permissions = serde_json::to_string(&built_in_permissions(role)).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not serialize workspace permissions: {error}"),
+            )
+        })?;
+        let role_id = Uuid::new_v4().to_string();
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  INSERT INTO workspace_role
+                    (id, workspace_id, role, permission, created_at, updated_at)
+                  VALUES ($1, $2, $3, $4, NOW(), NOW())
+                "#,
+                &[&role_id, &organization_id, &role, &permissions],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+    Ok(Json(organization_json(&state, &organization_id).await?))
+}
+
+async fn set_active_organization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<OrganizationSelectInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let organization_id = resolve_organization_id(
+        &state,
+        &auth,
+        input.organization_id.as_deref(),
+        input.organization_slug.as_deref(),
+    )
+    .await?;
+    require_workspace(&state, &auth, &organization_id).await?;
+    let session_token = auth.session_token.ok_or_else(ApiError::unauthorized)?;
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE session SET active_organization_id = $1, updated_at = NOW() WHERE token = $2",
+            &[&organization_id, &session_token],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn update_organization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<OrganizationUpdateInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let organization_id = resolve_organization_id(
+        &state,
+        &auth,
+        input.organization_id.as_deref(),
+        input.organization_slug.as_deref(),
+    )
+    .await?;
+    require_workspace_permission(&state, &auth, &organization_id, "organization", "update").await?;
+    let data = input.data.unwrap_or_default();
+    let name = data.name.or(input.name);
+    let slug = data.slug.or(input.slug);
+    let logo = data.logo.or(input.logo);
+    let metadata = data
+        .metadata
+        .or(input.metadata)
+        .map(|value| value.to_string());
+    if let Some(name) = name.as_deref() {
+        if name.trim().is_empty() || name.chars().count() > 120 {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Invalid organization name",
+            ));
+        }
+    }
+    if let Some(slug) = slug.as_deref() {
+        let slug = slugify_workspace_name(slug);
+        let duplicate = state
+            .database
+            .client
+            .query_opt(
+                "SELECT id FROM workspace WHERE slug = $1 AND id <> $2 LIMIT 1",
+                &[&slug, &organization_id],
+            )
+            .await
+            .map_err(database_error)?;
+        if duplicate.is_some() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "Organization slug already exists",
+            ));
+        }
+    }
+    let logo_changed = logo.is_some();
+    let logo_value = logo.flatten();
+    let metadata_changed = metadata.is_some();
+    let normalized_name = name.map(|value| value.trim().to_string());
+    let normalized_slug = slug.map(|value| slugify_workspace_name(&value));
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              UPDATE workspace
+              SET name = COALESCE($1, name),
+                  slug = COALESCE($2, slug),
+                  logo = CASE WHEN $3 THEN $4 ELSE logo END,
+                  metadata = CASE WHEN $5 THEN $6 ELSE metadata END
+              WHERE id = $7
+            "#,
+            &[
+                &normalized_name,
+                &normalized_slug,
+                &logo_changed,
+                &logo_value,
+                &metadata_changed,
+                &metadata,
+                &organization_id,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(organization_json(&state, &organization_id).await?))
+}
+
+async fn delete_organization(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<OrganizationSelectInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let organization_id = resolve_organization_id(
+        &state,
+        &auth,
+        input.organization_id.as_deref(),
+        input.organization_slug.as_deref(),
+    )
+    .await?;
+    require_workspace_permission(&state, &auth, &organization_id, "organization", "delete").await?;
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE session SET active_organization_id = NULL WHERE active_organization_id = $1",
+            &[&organization_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let deleted = state
+        .database
+        .client
+        .execute("DELETE FROM workspace WHERE id = $1", &[&organization_id])
+        .await
+        .map_err(database_error)?;
+    if deleted == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Organization not found",
+        ));
+    }
+    Ok(Json(json!({ "success": true })))
+}
+
+fn api_key_json(row: &Row, include_key: Option<&str>) -> Result<Value, ApiError> {
+    let permissions = row_optional_string(row, "permissions")?
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let metadata = row_optional_string(row, "metadata")?
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let mut output = json!({
+        "id": row_string(row, "id")?,
+        "name": row_optional_string(row, "name")?,
+        "start": row_optional_string(row, "start")?,
+        "prefix": row_optional_string(row, "prefix")?,
+        "userId": row_optional_string(row, "user_id")?,
+        "referenceId": row_optional_string(row, "reference_id")?,
+        "enabled": row.try_get::<_, bool>("enabled").unwrap_or(true),
+        "permissions": permissions,
+        "metadata": metadata,
+        "expiresAt": row_optional_string(row, "expires_at")?,
+        "createdAt": row_string(row, "created_at")?,
+        "updatedAt": row_string(row, "updated_at")?,
+    });
+    if let Some(key) = include_key {
+        output["key"] = Value::String(key.to_string());
+    }
+    Ok(output)
+}
+
+async fn create_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ApiKeyCreateInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let raw_prefix = input.prefix.unwrap_or_else(|| "kaneo".to_string());
+    let prefix: String = raw_prefix
+        .trim()
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || *character == '_' || *character == '-'
+        })
+        .take(32)
+        .collect();
+    let prefix = if prefix.is_empty() {
+        "kaneo".to_string()
+    } else {
+        prefix
+    };
+    let raw_key = format!("{}_{}", prefix, Uuid::new_v4().simple());
+    let hashed_key = api_key_hash(&raw_key);
+    let id = Uuid::new_v4().to_string();
+    let name = input.name.map(|value| value.trim().to_string());
+    let metadata = input.metadata.map(|value| value.to_string());
+    let permissions = input
+        .permissions
+        .map(|value| serde_json::to_string(&value))
+        .transpose()
+        .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let start: String = raw_key.chars().take(12).collect();
+    if let Some(expires_in) = input.expires_in {
+        if expires_in <= 0 {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "expiresIn must be positive",
+            ));
+        }
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  INSERT INTO apikey
+                    (id, config_id, name, start, reference_id, prefix, key, user_id,
+                     expires_at, created_at, updated_at, permissions, metadata)
+                  VALUES ($1, 'default', $2, $3, $4, $5, $6, $4,
+                          NOW() + ($7::bigint * INTERVAL '1 second'), NOW(), NOW(), $8, $9)
+                "#,
+                &[
+                    &id,
+                    &name,
+                    &start,
+                    &auth.user_id,
+                    &prefix,
+                    &hashed_key,
+                    &expires_in,
+                    &permissions,
+                    &metadata,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+    } else {
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  INSERT INTO apikey
+                    (id, config_id, name, start, reference_id, prefix, key, user_id,
+                     created_at, updated_at, permissions, metadata)
+                  VALUES ($1, 'default', $2, $3, $4, $5, $6, $4, NOW(), NOW(), $7, $8)
+                "#,
+                &[
+                    &id,
+                    &name,
+                    &start,
+                    &auth.user_id,
+                    &prefix,
+                    &hashed_key,
+                    &permissions,
+                    &metadata,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+    let row = state
+        .database
+        .client
+        .query_one(
+            r#"
+              SELECT id, name, start, prefix, user_id, reference_id, COALESCE(enabled, TRUE) AS enabled,
+                     permissions, metadata,
+                     to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS expires_at,
+                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+              FROM apikey WHERE id = $1
+            "#,
+            &[&id],
+        )
+        .await
+        .map_err(database_error)?;
+    let api_key = api_key_json(&row, Some(&raw_key))?;
+    Ok(Json(json!({ "key": raw_key, "apiKey": api_key })))
+}
+
+async fn list_api_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let rows = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT id, name, start, prefix, user_id, reference_id,
+                     COALESCE(enabled, TRUE) AS enabled, permissions, metadata,
+                     to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS expires_at,
+                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+              FROM apikey WHERE COALESCE(reference_id, user_id) = $1 ORDER BY created_at DESC
+            "#,
+            &[&auth.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let keys = rows
+        .iter()
+        .map(|row| api_key_json(row, None))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(json!({ "apiKeys": keys })))
+}
+
+async fn delete_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ApiKeyDeleteInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let deleted = state
+        .database
+        .client
+        .execute(
+            "DELETE FROM apikey WHERE id = $1 AND COALESCE(reference_id, user_id) = $2",
+            &[&input.key_id, &auth.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if deleted == 0 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "API key not found"));
+    }
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn update_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<UpdateUserInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let image_changed = input.image.is_some();
+    let image = input.image.flatten();
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              UPDATE "user"
+              SET name = COALESCE($1, name),
+                  image = CASE WHEN $2 THEN $3 ELSE image END,
+                  locale = COALESCE($4, locale),
+                  updated_at = NOW()
+              WHERE id = $5
+            "#,
+            &[
+                &input.name,
+                &image_changed,
+                &image,
+                &input.locale,
+                &auth.user_id,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    let session = session_json(&state, &auth).await?;
+    Ok(Json(session.get("user").cloned().unwrap_or(Value::Null)))
+}
+
+async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ChangePasswordInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    validate_password(&input.new_password)?;
+    let row = state
+        .database
+        .client
+        .query_one(
+            "SELECT password FROM account WHERE user_id = $1 AND provider_id = 'credential' LIMIT 1",
+            &[&auth.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let password_hash: Option<String> = row.try_get("password").map_err(database_error)?;
+    if !password_hash
+        .as_deref()
+        .is_some_and(|value| bcrypt_verify(&input.current_password, value).unwrap_or(false))
+    {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "Invalid current password",
+        ));
+    }
+    let password_hash = bcrypt_hash(&input.new_password, 10).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not hash password: {error}"),
+        )
+    })?;
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE account SET password = $1, updated_at = NOW() WHERE user_id = $2 AND provider_id = 'credential'",
+            &[&password_hash, &auth.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if input.revoke_other_sessions {
+        if let Some(session_token) = auth.session_token.as_deref() {
+            state
+                .database
+                .client
+                .execute(
+                    "DELETE FROM session WHERE user_id = $1 AND token <> $2",
+                    &[&auth.user_id, &session_token],
+                )
+                .await
+                .map_err(database_error)?;
+        }
+    }
+    Ok(Json(json!({ "success": true })))
+}
+
+fn device_client_allowed(client_id: &str) -> bool {
+    let configured = env::var("DEVICE_AUTH_CLIENT_IDS").ok().map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .any(|value| value == client_id)
+    });
+    configured.unwrap_or_else(|| matches!(client_id, "kaneo-cli" | "kaneo-mcp"))
+}
+
+fn normalize_device_user_code(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_uppercase())
+        .collect()
+}
+
+fn device_oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": error,
+            "error_description": description,
+        })),
+    )
+        .into_response()
+}
+
+async fn create_device_code(
+    State(state): State<AppState>,
+    Json(input): Json<DeviceCodeCreateInput>,
+) -> Result<Response, ApiError> {
+    if !device_client_allowed(input.client_id.trim()) {
+        return Ok(device_oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client",
+            "The client is not allowed to use device authorization",
+        ));
+    }
+    let device_code = Uuid::new_v4().simple().to_string();
+    let user_code = Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    let device_id = Uuid::new_v4().to_string();
+    let interval = 5_i32;
+    let expires_in = 600_i64;
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO device_code
+                (id, device_code, user_code, created_at, updated_at, expires_at,
+                 status, polling_interval, client_id)
+              VALUES ($1, $2, $3, NOW(), NOW(), NOW() + ($4::bigint * INTERVAL '1 second'),
+                      'pending', $5, $6)
+            "#,
+            &[
+                &device_id,
+                &device_code,
+                &user_code,
+                &expires_in,
+                &interval,
+                &input.client_id,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    let verification_uri = format!("{}/device", state.client_url.trim_end_matches('/'));
+    Ok(Json(json!({
+        "device_code": device_code,
+        "user_code": user_code,
+        "verification_uri": verification_uri,
+        "verification_uri_complete": format!("{verification_uri}?user_code={user_code}"),
+        "interval": interval,
+        "expires_in": expires_in,
+    }))
+    .into_response())
+}
+
+async fn claim_device_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let user_code = normalize_device_user_code(
+        query
+            .get("user_code")
+            .map(String::as_str)
+            .unwrap_or_default(),
+    );
+    if user_code.is_empty() {
+        return Ok(device_oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "A user code is required",
+        ));
+    }
+    let row = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT id, device_code, client_id, user_id, status,
+                     expires_at > NOW() AS valid
+              FROM device_code WHERE user_code = $1 LIMIT 1
+            "#,
+            &[&user_code],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Invalid or expired device code"))?;
+    let valid = row.try_get::<_, bool>("valid").unwrap_or(false);
+    if !valid {
+        return Ok(device_oauth_error(
+            StatusCode::BAD_REQUEST,
+            "expired_token",
+            "The device code has expired",
+        ));
+    }
+    let status: String = row.try_get("status").map_err(database_error)?;
+    if status == "denied" || status == "consumed" {
+        return Ok(device_oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The device code is no longer available",
+        ));
+    }
+    let claimed_user: Option<String> = row.try_get("user_id").map_err(database_error)?;
+    if let Some(claimed_user) = claimed_user.as_deref() {
+        if claimed_user != auth.user_id {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "This device code belongs to another user",
+            ));
+        }
+    } else {
+        state
+            .database
+            .client
+            .execute(
+                "UPDATE device_code SET user_id = $1, updated_at = NOW() WHERE id = $2 AND user_id IS NULL",
+                &[&auth.user_id, &row.try_get::<_, String>("id").map_err(database_error)?],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+    Ok(Json(json!({
+        "user_code": user_code,
+        "client_id": row.try_get::<_, Option<String>>("client_id").map_err(database_error)?,
+        "device_code": row.try_get::<_, String>("device_code").map_err(database_error)?,
+        "status": status,
+    }))
+    .into_response())
+}
+
+async fn approve_device_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<DeviceCodeUserInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let user_code = normalize_device_user_code(&input.user_code);
+    let updated = state
+        .database
+        .client
+        .execute(
+            r#"
+              UPDATE device_code
+              SET status = 'approved', user_id = $1, updated_at = NOW()
+              WHERE user_code = $2 AND expires_at > NOW()
+                AND status = 'pending' AND (user_id IS NULL OR user_id = $1)
+            "#,
+            &[&auth.user_id, &user_code],
+        )
+        .await
+        .map_err(database_error)?;
+    if updated == 0 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid or expired device code",
+        ));
+    }
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn deny_device_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<DeviceCodeUserInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let user_code = normalize_device_user_code(&input.user_code);
+    let updated = state
+        .database
+        .client
+        .execute(
+            r#"
+              UPDATE device_code
+              SET status = 'denied', updated_at = NOW()
+              WHERE user_code = $1 AND expires_at > NOW()
+                AND status = 'pending' AND user_id = $2
+            "#,
+            &[&user_code, &auth.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if updated == 0 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid or expired device code",
+        ));
+    }
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn device_token(
+    State(state): State<AppState>,
+    Json(input): Json<DeviceTokenInput>,
+) -> Result<Response, ApiError> {
+    if input.grant_type != "urn:ietf:params:oauth:grant-type:device_code" {
+        return Ok(device_oauth_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_grant_type",
+            "The grant type is not supported",
+        ));
+    }
+    if !device_client_allowed(input.client_id.trim()) {
+        return Ok(device_oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client",
+            "The client is not allowed to use device authorization",
+        ));
+    }
+    let row = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT id, user_id, status, client_id, polling_interval,
+                     expires_at > NOW() AS valid,
+                     COALESCE(EXTRACT(EPOCH FROM (NOW() - last_polled_at)), 1000000)::double precision AS seconds_since_poll
+              FROM device_code WHERE device_code = $1 LIMIT 1
+            "#,
+            &[&input.device_code],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Invalid device code"))?;
+    let expected_client: Option<String> = row.try_get("client_id").map_err(database_error)?;
+    if expected_client.as_deref() != Some(input.client_id.trim()) {
+        return Ok(device_oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client",
+            "The device code was issued to another client",
+        ));
+    }
+    if !row.try_get::<_, bool>("valid").unwrap_or(false) {
+        return Ok(device_oauth_error(
+            StatusCode::BAD_REQUEST,
+            "expired_token",
+            "The device code has expired",
+        ));
+    }
+    let status: String = row.try_get("status").map_err(database_error)?;
+    if status == "pending" {
+        let interval = row.try_get::<_, i32>("polling_interval").unwrap_or(5) as f64;
+        let since = row
+            .try_get::<_, f64>("seconds_since_poll")
+            .unwrap_or(interval);
+        if since < interval {
+            return Ok(device_oauth_error(
+                StatusCode::BAD_REQUEST,
+                "slow_down",
+                "Poll interval is too short",
+            ));
+        }
+        let id: String = row.try_get("id").map_err(database_error)?;
+        state
+            .database
+            .client
+            .execute(
+                "UPDATE device_code SET last_polled_at = NOW(), updated_at = NOW() WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(database_error)?;
+        return Ok(device_oauth_error(
+            StatusCode::BAD_REQUEST,
+            "authorization_pending",
+            "The user has not approved the device yet",
+        ));
+    }
+    if status == "denied" {
+        return Ok(device_oauth_error(
+            StatusCode::BAD_REQUEST,
+            "access_denied",
+            "The device authorization was denied",
+        ));
+    }
+    if status != "approved" {
+        return Ok(device_oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The device code is no longer available",
+        ));
+    }
+    let user_id: String = row
+        .try_get::<_, Option<String>>("user_id")
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "The device has no approved user"))?;
+    let (access_token, _) = session_for_user(&state, &user_id, &HeaderMap::new()).await?;
+    let id: String = row.try_get("id").map_err(database_error)?;
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE device_code SET status = 'consumed', updated_at = NOW() WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(json!({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": 2592000,
+    }))
+    .into_response())
+}
+
+struct S3Config {
+    endpoint: Url,
+    region: String,
+    bucket: String,
+    access_key_id: String,
+    secret_access_key: String,
+    key_prefix: String,
+    force_path_style: bool,
+    max_image_upload_bytes: i64,
+    presign_ttl_seconds: i64,
+}
+
+fn s3_config() -> Result<S3Config, ApiError> {
+    let endpoint = env::var("S3_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "S3 uploads are not configured. Set S3_ENDPOINT and S3_BUCKET.",
+            )
+        })?;
+    let bucket = env::var("S3_BUCKET")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "S3 uploads are not configured. Set S3_ENDPOINT and S3_BUCKET.",
+            )
+        })?;
+    let access_key_id = env::var("S3_ACCESS_KEY_ID").unwrap_or_default();
+    let secret_access_key = env::var("S3_SECRET_ACCESS_KEY").unwrap_or_default();
+    if access_key_id.is_empty() != secret_access_key.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Incomplete S3 credentials. Set both S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY.",
+        ));
+    }
+    if access_key_id.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "S3 credentials are not configured for the Rust runtime.",
+        ));
+    }
+    let endpoint = Url::parse(endpoint.trim()).map_err(|error| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Invalid S3 endpoint: {error}"),
+        )
+    })?;
+    let max_image_upload_bytes = env::var("S3_MAX_IMAGE_UPLOAD_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(10 * 1024 * 1024);
+    let presign_ttl_seconds = env::var("S3_PRESIGN_TTL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(300);
+    Ok(S3Config {
+        endpoint,
+        region: env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+        bucket,
+        access_key_id,
+        secret_access_key,
+        key_prefix: env::var("S3_KEY_PREFIX").unwrap_or_default(),
+        force_path_style: env::var("S3_FORCE_PATH_STYLE")
+            .map(|value| value.trim().to_lowercase() != "false")
+            .unwrap_or(true),
+        max_image_upload_bytes,
+        presign_ttl_seconds,
+    })
+}
+
+fn aws_percent_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{:02X}", byte));
+        }
+    }
+    encoded
+}
+
+fn aws_encoded_key(key: &str) -> String {
+    key.split('/')
+        .map(aws_percent_encode)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn s3_host(url: &Url) -> Result<String, ApiError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "S3 endpoint has no host"))?;
+    Ok(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
+fn s3_request_target(config: &S3Config, key: &str) -> Result<(String, String), ApiError> {
+    let endpoint_path = config.endpoint.path().trim_end_matches('/');
+    let encoded_key = aws_encoded_key(key);
+    let (host, path) = if config.force_path_style {
+        (
+            s3_host(&config.endpoint)?,
+            format!(
+                "{endpoint_path}/{}{}",
+                aws_percent_encode(&config.bucket),
+                if encoded_key.is_empty() {
+                    String::new()
+                } else {
+                    format!("/{encoded_key}")
+                }
+            ),
+        )
+    } else {
+        let endpoint_host = s3_host(&config.endpoint)?;
+        (
+            format!("{}.{}", aws_percent_encode(&config.bucket), endpoint_host),
+            format!("{endpoint_path}/{}", encoded_key),
+        )
+    };
+    let scheme = config.endpoint.scheme();
+    Ok((format!("{scheme}://{host}{path}"), path))
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn hmac_sha256(key: &[u8], message: &str) -> Vec<u8> {
+    hmac_sha256_bytes(key, message.as_bytes())
+}
+
+fn hmac_sha256_bytes(key: &[u8], message: &[u8]) -> Vec<u8> {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts arbitrary keys");
+    mac.update(message);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn s3_signing_key(secret: &str, date: &str, region: &str) -> Vec<u8> {
+    let date_key = hmac_sha256(format!("AWS4{secret}").as_bytes(), date);
+    let region_key = hmac_sha256(&date_key, region);
+    let service_key = hmac_sha256(&region_key, "s3");
+    hmac_sha256(&service_key, "aws4_request")
+}
+
+fn s3_query_string(pairs: &[(String, String)]) -> String {
+    let mut sorted = pairs.to_vec();
+    sorted.sort();
+    sorted
+        .iter()
+        .map(|(name, value)| format!("{}={}", aws_percent_encode(name), aws_percent_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn s3_presigned_put(config: &S3Config, key: &str) -> Result<String, ApiError> {
+    let (base_url, path) = s3_request_target(config, key)?;
+    let host = Url::parse(&base_url)
+        .map_err(|error| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))
+        .and_then(|url| s3_host(&url))?;
+    let now = Utc::now();
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let short_date = now.format("%Y%m%d").to_string();
+    let scope = format!("{short_date}/{}/{}/aws4_request", config.region, "s3");
+    let pairs = vec![
+        (
+            "X-Amz-Algorithm".to_string(),
+            "AWS4-HMAC-SHA256".to_string(),
+        ),
+        (
+            "X-Amz-Credential".to_string(),
+            format!("{}/{}", config.access_key_id, scope),
+        ),
+        ("X-Amz-Date".to_string(), amz_date.clone()),
+        (
+            "X-Amz-Expires".to_string(),
+            config.presign_ttl_seconds.to_string(),
+        ),
+        ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
+    ];
+    let canonical_query = s3_query_string(&pairs);
+    let canonical_headers = format!("host:{host}\n");
+    let canonical_request =
+        format!("PUT\n{path}\n{canonical_query}\n{canonical_headers}\nhost\nUNSIGNED-PAYLOAD");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        hex_digest(Sha256::digest(canonical_request.as_bytes()).as_ref())
+    );
+    let signature = hex_digest(&hmac_sha256(
+        &s3_signing_key(&config.secret_access_key, &short_date, &config.region),
+        &string_to_sign,
+    ));
+    let mut signed_pairs = pairs;
+    signed_pairs.push(("X-Amz-Signature".to_string(), signature));
+    Ok(format!("{base_url}?{}", s3_query_string(&signed_pairs)))
+}
+
+fn s3_authorization_headers(
+    config: &S3Config,
+    path: &str,
+) -> Result<(String, String, String), ApiError> {
+    let host = if config.force_path_style {
+        s3_host(&config.endpoint)?
+    } else {
+        format!(
+            "{}.{}",
+            aws_percent_encode(&config.bucket),
+            s3_host(&config.endpoint)?
+        )
+    };
+    let now = Utc::now();
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let short_date = now.format("%Y%m%d").to_string();
+    let scope = format!("{short_date}/{}/{}/aws4_request", config.region, "s3");
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:{amz_date}\n");
+    let canonical_request =
+        format!("GET\n{path}\n\n{canonical_headers}\n{signed_headers}\nUNSIGNED-PAYLOAD");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        hex_digest(Sha256::digest(canonical_request.as_bytes()).as_ref())
+    );
+    let signature = hex_digest(&hmac_sha256(
+        &s3_signing_key(&config.secret_access_key, &short_date, &config.region),
+        &string_to_sign,
+    ));
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={signed_headers}, Signature={signature}",
+        config.access_key_id, scope
+    );
+    Ok((host, amz_date, authorization))
+}
+
+fn validate_task_image_input(
+    config: &S3Config,
+    content_type: &str,
+    size: i64,
+) -> Result<(), ApiError> {
+    if content_type.trim().is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "A valid content type is required",
+        ));
+    }
+    if size <= 0 || size > config.max_image_upload_bytes {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Upload must be greater than zero and no larger than {} bytes",
+                config.max_image_upload_bytes
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn sanitize_asset_path_segment(value: &str) -> String {
+    let mut output = String::new();
+    let mut last_dash = false;
+    for character in value.to_lowercase().chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+            output.push(character);
+            last_dash = false;
+        } else if !last_dash {
+            output.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = output.trim_matches('-');
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn task_asset_key(
+    config: &S3Config,
+    workspace_id: &str,
+    project_id: &str,
+    task_id: &str,
+    surface: &str,
+    filename: &str,
+) -> String {
+    let surface_folder = if surface == "comment" {
+        "comments"
+    } else {
+        "descriptions"
+    };
+    let extension = filename
+        .rsplit_once('.')
+        .map(|(_, extension)| sanitize_asset_path_segment(extension))
+        .filter(|extension| !extension.is_empty() && extension != "file");
+    let stem = filename
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(filename);
+    let base = sanitize_asset_path_segment(stem)
+        .chars()
+        .take(64)
+        .collect::<String>();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let filename = match extension {
+        Some(extension) => format!(
+            "{base}-{timestamp}-{}.{}",
+            Uuid::new_v4().simple(),
+            extension
+        ),
+        None => format!("{base}-{timestamp}-{}", Uuid::new_v4().simple()),
+    };
+    let raw = format!(
+        "workspace/{}/project/{}/task/{}/{}/{}",
+        sanitize_asset_path_segment(workspace_id),
+        sanitize_asset_path_segment(project_id),
+        sanitize_asset_path_segment(task_id),
+        surface_folder,
+        filename
+    );
+    let prefix = config.key_prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        raw
+    } else {
+        format!("{prefix}/{raw}")
+    }
+}
+
+async fn task_upload_context(
+    state: &AppState,
+    task_id: &str,
+) -> Result<(String, String, String), ApiError> {
+    state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT t.id AS task_id, t.project_id, p.workspace_id
+              FROM task t INNER JOIN project p ON p.id = t.project_id
+              WHERE t.id = $1 LIMIT 1
+            "#,
+            &[&task_id],
+        )
+        .await
+        .map_err(database_error)?
+        .map(|row| {
+            Ok((
+                row_string(&row, "task_id")?,
+                row_string(&row, "project_id")?,
+                row_string(&row, "workspace_id")?,
+            ))
+        })
+        .transpose()?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Task not found"))
+}
+
+async fn create_task_image_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<TaskImageUploadInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_task(&state, &headers, &id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "task", "update").await?;
+    if input.surface != "description" && input.surface != "comment" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid upload surface",
+        ));
+    }
+    let config = s3_config()?;
+    validate_task_image_input(&config, &input.content_type, input.size)?;
+    let (task_id, project_id, workspace_id) = task_upload_context(&state, &id).await?;
+    let key = task_asset_key(
+        &config,
+        &workspace_id,
+        &project_id,
+        &task_id,
+        &input.surface,
+        &input.filename,
+    );
+    let upload_url = s3_presigned_put(&config, &key)?;
+    Ok(Json(json!({
+        "key": key,
+        "uploadUrl": upload_url,
+        "headers": { "Content-Type": input.content_type },
+    })))
+}
+
+async fn finalize_task_image_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<TaskImageFinalizeInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, workspace_id) = auth_for_task(&state, &headers, &id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "task", "update").await?;
+    if input.surface != "description" && input.surface != "comment" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid upload surface",
+        ));
+    }
+    let config = s3_config()?;
+    validate_task_image_input(&config, &input.content_type, input.size)?;
+    let (task_id, project_id, workspace_id) = task_upload_context(&state, &id).await?;
+    let prefix = format!(
+        "{}/workspace/{}/project/{}/task/{}/{}/",
+        config.key_prefix.trim_end_matches('/'),
+        sanitize_asset_path_segment(&workspace_id),
+        sanitize_asset_path_segment(&project_id),
+        sanitize_asset_path_segment(&task_id),
+        if input.surface == "comment" {
+            "comments"
+        } else {
+            "descriptions"
+        },
+    );
+    let expected_prefix = prefix.trim_start_matches('/').trim_start_matches('/');
+    let normalized_key = input.key.trim();
+    if !normalized_key.starts_with(expected_prefix) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Image upload key does not match the task context",
+        ));
+    }
+    let kind = if input.content_type.to_lowercase().starts_with("image/") {
+        "image"
+    } else {
+        "attachment"
+    };
+    let existing = state
+        .database
+        .client
+        .query_opt(
+            "SELECT id FROM asset WHERE object_key = $1 LIMIT 1",
+            &[&normalized_key],
+        )
+        .await
+        .map_err(database_error)?;
+    let asset_id = if let Some(row) = existing {
+        let asset_id = row_string(&row, "id")?;
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  UPDATE asset
+                  SET workspace_id = $1, project_id = $2, task_id = $3,
+                      filename = $4, mime_type = $5, size = $6, kind = $7,
+                      surface = $8, created_by = $9
+                  WHERE id = $10
+                "#,
+                &[
+                    &workspace_id,
+                    &project_id,
+                    &task_id,
+                    &input.filename,
+                    &input.content_type,
+                    &input.size,
+                    &kind,
+                    &input.surface,
+                    &auth.user_id,
+                    &asset_id,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        asset_id
+    } else {
+        let asset_id = Uuid::new_v4().to_string();
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  INSERT INTO asset
+                    (id, workspace_id, project_id, task_id, object_key, filename,
+                     mime_type, size, kind, surface, created_by, created_at)
+                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+                "#,
+                &[
+                    &asset_id,
+                    &workspace_id,
+                    &project_id,
+                    &task_id,
+                    &normalized_key,
+                    &input.filename,
+                    &input.content_type,
+                    &input.size,
+                    &kind,
+                    &input.surface,
+                    &auth.user_id,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        asset_id
+    };
+    Ok(Json(json!({
+        "id": asset_id,
+        "url": format!("{}/asset/{asset_id}", state.api_base_url),
+    })))
+}
+
+fn asset_content_disposition(filename: &str, inline: bool) -> String {
+    let normalized = filename.replace(['\r', '\n', '"'], "").trim().to_string();
+    let safe = if normalized.is_empty() {
+        "file"
+    } else {
+        &normalized
+    };
+    let ascii = safe
+        .chars()
+        .map(|character| {
+            if character.is_ascii_graphic() || character == ' ' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .replace(['/', '\\'], "-");
+    let disposition = if inline { "inline" } else { "attachment" };
+    format!(
+        "{disposition}; filename=\"{}\"; filename*=UTF-8''{}",
+        if ascii.is_empty() { "file" } else { &ascii },
+        aws_percent_encode(safe)
+    )
+}
+
+async fn get_asset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let row = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT a.object_key, a.mime_type, a.filename, a.workspace_id,
+                     COALESCE(p.is_public, FALSE) AS is_public
+              FROM asset a INNER JOIN project p ON p.id = a.project_id
+              WHERE a.id = $1 LIMIT 1
+            "#,
+            &[&id],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Asset not found"))?;
+    let is_public = row.try_get::<_, bool>("is_public").unwrap_or(false);
+    match authenticate(&state, &headers).await {
+        Ok(auth) => require_workspace(&state, &auth, &row_string(&row, "workspace_id")?).await?,
+        Err(error) if is_public && error.status == StatusCode::UNAUTHORIZED => {}
+        Err(error) => return Err(error),
+    }
+    let config = s3_config()?;
+    let key = row_string(&row, "object_key")?;
+    let (url, path) = s3_request_target(&config, &key)?;
+    let (host, amz_date, authorization) = s3_authorization_headers(&config, &path)?;
+    let object = state
+        .http
+        .get(url)
+        .header("Host", host)
+        .header("x-amz-date", amz_date)
+        .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+        .header("Authorization", authorization)
+        .send()
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("S3 request failed: {error}"),
+            )
+        })?;
+    if object.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Asset object not found",
+        ));
+    }
+    if !object.status().is_success() {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("S3 returned status {}", object.status()),
+        ));
+    }
+    let object_headers = object.headers().clone();
+    let body = object.bytes().await.map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("Could not read asset object: {error}"),
+        )
+    })?;
+    let body_length = body.len();
+    let fallback_content_type: String = row.try_get("mime_type").unwrap_or_default();
+    let stored_content_type = object_headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or(fallback_content_type.as_str())
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .trim()
+        .to_string();
+    let inline = matches!(
+        stored_content_type.as_str(),
+        "image/apng"
+            | "image/avif"
+            | "image/gif"
+            | "image/heic"
+            | "image/heif"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/png"
+            | "image/webp"
+    );
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = StatusCode::OK;
+    let response_headers = response.headers_mut();
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=120"),
+    );
+    response_headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&asset_content_disposition(
+            &row_string(&row, "filename")?,
+            inline,
+        ))
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+    );
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(if inline {
+            &stored_content_type
+        } else {
+            "application/octet-stream"
+        })
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+    );
+    response_headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response_headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&body_length.to_string())
+            .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+    );
+    for (source, target) in [
+        ("etag", header::ETAG),
+        ("last-modified", header::LAST_MODIFIED),
+    ] {
+        if let Some(value) = object_headers.get(source).cloned() {
+            response_headers.insert(target, value);
+        }
+    }
+    Ok(response)
+}
+
 async fn session_json(state: &AppState, auth: &AuthContext) -> Result<Value, ApiError> {
     let Some(session_token) = auth.session_token.as_deref() else {
         return Ok(Value::Null);
@@ -8312,6 +12288,46 @@ async fn list_members(
     Ok(Json(json!({ "members": members, "total": total })))
 }
 
+async fn get_active_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<OrganizationQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let organization_id = resolve_organization_id(
+        &state,
+        &auth,
+        query.organization_id.as_deref(),
+        query.organization_slug.as_deref(),
+    )
+    .await?;
+    require_workspace(&state, &auth, &organization_id).await?;
+    let row = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT m.id AS member_id, m.workspace_id AS organization_id,
+                     m.user_id, m.role,
+                     to_char(m.joined_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS member_created_at,
+                     u.name AS user_name, u.email AS user_email, u.image AS user_image
+              FROM workspace_member m
+              INNER JOIN "user" u ON u.id = m.user_id
+              WHERE m.workspace_id = $1 AND m.user_id = $2
+              LIMIT 1
+            "#,
+            &[&organization_id, &auth.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(
+        row.as_ref()
+            .map(organization_member_json)
+            .transpose()?
+            .unwrap_or(Value::Null),
+    ))
+}
+
 async fn get_full_organization(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -8436,6 +12452,580 @@ async fn get_full_organization(
         "invitations": invitations,
         "teams": teams,
     })))
+}
+
+fn invitation_json(row: &Row) -> Result<Value, ApiError> {
+    Ok(json!({
+        "id": row_string(row, "invitation_id")?,
+        "organizationId": row_string(row, "organization_id")?,
+        "email": row_string(row, "email")?,
+        "role": row_optional_string(row, "role")?,
+        "status": row_string(row, "status")?,
+        "inviterId": row_string(row, "inviter_id")?,
+        "expiresAt": row_string(row, "expires_at")?,
+        "createdAt": row_string(row, "created_at")?,
+        "organization": {
+            "id": row_string(row, "organization_id")?,
+            "name": row_optional_string(row, "organization_name")?,
+        },
+    }))
+}
+
+async fn invitation_row(state: &AppState, invitation_id: &str) -> Result<Row, ApiError> {
+    state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT i.id AS invitation_id, i.workspace_id AS organization_id,
+                     i.email, i.role, i.status, i.inviter_id,
+                     to_char(i.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS expires_at,
+                     to_char(i.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     w.name AS organization_name
+              FROM invitation i
+              INNER JOIN workspace w ON w.id = i.workspace_id
+              WHERE i.id = $1 LIMIT 1
+            "#,
+            &[&invitation_id],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Invitation not found"))
+}
+
+async fn current_user_email(state: &AppState, auth: &AuthContext) -> Result<String, ApiError> {
+    state
+        .database
+        .client
+        .query_one("SELECT email FROM \"user\" WHERE id = $1", &[&auth.user_id])
+        .await
+        .map_err(database_error)?
+        .try_get("email")
+        .map_err(database_error)
+}
+
+async fn list_invitations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<OrganizationQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let organization_id = resolve_organization_id(
+        &state,
+        &auth,
+        query.organization_id.as_deref(),
+        query.organization_slug.as_deref(),
+    )
+    .await?;
+    require_workspace(&state, &auth, &organization_id).await?;
+    let rows = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT i.id AS invitation_id, i.workspace_id AS organization_id,
+                     i.email, i.role, i.status, i.inviter_id,
+                     to_char(i.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS expires_at,
+                     to_char(i.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     w.name AS organization_name
+              FROM invitation i INNER JOIN workspace w ON w.id = i.workspace_id
+              WHERE i.workspace_id = $1 ORDER BY i.created_at ASC
+            "#,
+            &[&organization_id],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(Value::Array(
+        rows.iter()
+            .map(invitation_json)
+            .collect::<Result<Vec<_>, _>>()?,
+    )))
+}
+
+async fn list_user_invitations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let email = current_user_email(&state, &auth).await?;
+    let rows = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT i.id AS invitation_id, i.workspace_id AS organization_id,
+                     i.email, i.role, i.status, i.inviter_id,
+                     to_char(i.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS expires_at,
+                     to_char(i.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     w.name AS organization_name
+              FROM invitation i INNER JOIN workspace w ON w.id = i.workspace_id
+              WHERE lower(i.email) = lower($1) AND i.status = 'pending'
+                AND i.expires_at > NOW()
+              ORDER BY i.created_at ASC
+            "#,
+            &[&email],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(Value::Array(
+        rows.iter()
+            .map(invitation_json)
+            .collect::<Result<Vec<_>, _>>()?,
+    )))
+}
+
+async fn get_organization_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let invitation_id = query
+        .get("id")
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Invitation id is required"))?;
+    let row = invitation_row(&state, invitation_id).await?;
+    require_workspace(&state, &auth, &row_string(&row, "organization_id")?).await?;
+    Ok(Json(invitation_json(&row)?))
+}
+
+async fn invite_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<InviteMemberInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace_permission(&state, &auth, &input.organization_id, "member", "create").await?;
+    let email = normalize_email(&input.email)?;
+    let role = input.role.unwrap_or_else(|| "member".to_string());
+    if role.trim().is_empty() || role.len() > 64 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid member role",
+        ));
+    }
+    let existing = state
+        .database
+        .client
+        .query_opt(
+            "SELECT id FROM invitation WHERE workspace_id = $1 AND lower(email) = lower($2) AND status = 'pending' LIMIT 1",
+            &[&input.organization_id, &email],
+        )
+        .await
+        .map_err(database_error)?;
+    let invitation_id = if let Some(row) = existing {
+        let id: String = row.try_get("id").map_err(database_error)?;
+        if !input.resend.unwrap_or(false) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "An invitation for this email already exists",
+            ));
+        }
+        state
+            .database
+            .client
+            .execute(
+                "UPDATE invitation SET role = $1, expires_at = NOW() + INTERVAL '7 days', inviter_id = $2 WHERE id = $3",
+                &[&role, &auth.user_id, &id],
+            )
+            .await
+            .map_err(database_error)?;
+        id
+    } else {
+        let id = Uuid::new_v4().to_string();
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  INSERT INTO invitation
+                    (id, workspace_id, email, role, status, expires_at, created_at, inviter_id)
+                  VALUES ($1, $2, $3, $4, 'pending', NOW() + INTERVAL '7 days', NOW(), $5)
+                "#,
+                &[&id, &input.organization_id, &email, &role, &auth.user_id],
+            )
+            .await
+            .map_err(database_error)?;
+        id
+    };
+    let row = invitation_row(&state, &invitation_id).await?;
+    Ok(Json(invitation_json(&row)?))
+}
+
+async fn remove_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<OrganizationMemberInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let organization_id = input
+        .organization_id
+        .as_deref()
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Organization id is required"))?;
+    require_workspace_permission(&state, &auth, organization_id, "member", "delete").await?;
+    let member_id_or_email = input
+        .member_id_or_email
+        .or(input.member_id)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Member id is required"))?;
+    let row = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT m.id, m.user_id, m.role
+              FROM workspace_member m INNER JOIN "user" u ON u.id = m.user_id
+              WHERE m.workspace_id = $1
+                AND (m.id = $2 OR m.user_id = $2 OR lower(u.email) = lower($2))
+              LIMIT 1
+            "#,
+            &[&organization_id, &member_id_or_email],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Workspace member not found"))?;
+    let member_role: String = row.try_get("role").map_err(database_error)?;
+    if member_role == "owner" {
+        let owner_count = state
+            .database
+            .client
+            .query_one(
+                "SELECT COUNT(*)::bigint AS count FROM workspace_member WHERE workspace_id = $1 AND role = 'owner'",
+                &[&organization_id],
+            )
+            .await
+            .map_err(database_error)?
+            .try_get::<_, i64>("count")
+            .map_err(database_error)?;
+        if owner_count <= 1 {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "The last workspace owner cannot be removed",
+            ));
+        }
+    }
+    let member_id: String = row.try_get("id").map_err(database_error)?;
+    state
+        .database
+        .client
+        .execute("DELETE FROM workspace_member WHERE id = $1", &[&member_id])
+        .await
+        .map_err(database_error)?;
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn update_member_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<OrganizationMemberInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let organization_id = input
+        .organization_id
+        .as_deref()
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Organization id is required"))?;
+    require_workspace_permission(&state, &auth, organization_id, "member", "update").await?;
+    let member_id = input
+        .member_id
+        .as_deref()
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Member id is required"))?;
+    let role = input
+        .role
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Member role is required"))?;
+    if role.len() > 64 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid member role",
+        ));
+    }
+    let updated = state
+        .database
+        .client
+        .execute(
+            "UPDATE workspace_member SET role = $1 WHERE id = $2 AND workspace_id = $3",
+            &[&role, &member_id, &organization_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if updated == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Workspace member not found",
+        ));
+    }
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn accept_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<InvitationActionInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let email = current_user_email(&state, &auth).await?;
+    let row = invitation_row(&state, &input.invitation_id).await?;
+    let organization_id = row_string(&row, "organization_id")?;
+    let invitation_email = row_string(&row, "email")?;
+    if !email.eq_ignore_ascii_case(&invitation_email) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Invitation email does not match the signed-in user",
+        ));
+    }
+    if row_string(&row, "status")? != "pending" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invitation is no longer pending",
+        ));
+    }
+    let role = row_optional_string(&row, "role")?.unwrap_or_else(|| "member".to_string());
+    let existing = state
+        .database
+        .client
+        .query_opt(
+            "SELECT id FROM workspace_member WHERE workspace_id = $1 AND user_id = $2 LIMIT 1",
+            &[&organization_id, &auth.user_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if existing.is_none() {
+        state
+            .database
+            .client
+            .execute(
+                "INSERT INTO workspace_member (id, workspace_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4, NOW())",
+                &[&Uuid::new_v4().to_string(), &organization_id, &auth.user_id, &role],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE invitation SET status = 'accepted' WHERE id = $1",
+            &[&input.invitation_id],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn reject_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<InvitationActionInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let email = current_user_email(&state, &auth).await?;
+    let row = invitation_row(&state, &input.invitation_id).await?;
+    if !email.eq_ignore_ascii_case(&row_string(&row, "email")?) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Invitation email does not match the signed-in user",
+        ));
+    }
+    let updated = state
+        .database
+        .client
+        .execute(
+            "UPDATE invitation SET status = 'rejected' WHERE id = $1 AND status = 'pending'",
+            &[&input.invitation_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if updated == 0 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invitation is no longer pending",
+        ));
+    }
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn cancel_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<InvitationActionInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let row = invitation_row(&state, &input.invitation_id).await?;
+    require_workspace_permission(
+        &state,
+        &auth,
+        &row_string(&row, "organization_id")?,
+        "invitation",
+        "cancel",
+    )
+    .await?;
+    let updated = state
+        .database
+        .client
+        .execute(
+            "UPDATE invitation SET status = 'canceled' WHERE id = $1 AND status = 'pending'",
+            &[&input.invitation_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if updated == 0 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Invitation is no longer pending",
+        ));
+    }
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn list_roles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<OrganizationQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let organization_id = resolve_organization_id(
+        &state,
+        &auth,
+        query.organization_id.as_deref(),
+        query.organization_slug.as_deref(),
+    )
+    .await?;
+    require_workspace(&state, &auth, &organization_id).await?;
+    let rows = state
+        .database
+        .client
+        .query(
+            r#"
+              SELECT id, workspace_id, role, permission,
+                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+              FROM workspace_role WHERE workspace_id = $1 ORDER BY role ASC
+            "#,
+            &[&organization_id],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(Value::Array(
+        rows.into_iter()
+            .map(|row| {
+                Ok(json!({
+                    "id": row_string(&row, "id")?,
+                    "organizationId": row_string(&row, "workspace_id")?,
+                    "role": row_string(&row, "role")?,
+                    "permission": row_string(&row, "permission")?,
+                    "createdAt": row_string(&row, "created_at")?,
+                    "updatedAt": row_string(&row, "updated_at")?,
+                }))
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?,
+    )))
+}
+
+async fn create_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<RoleCreateInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace_permission(&state, &auth, &input.organization_id, "ac", "create").await?;
+    let role = input.role.trim().to_string();
+    if role.is_empty() || role.len() > 64 || role == "owner" {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Invalid role name"));
+    }
+    let permission = serde_json::to_string(&input.permission).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid role permissions: {error}"),
+        )
+    })?;
+    let inserted = state
+        .database
+        .client
+        .execute(
+            "INSERT INTO workspace_role (id, workspace_id, role, permission, created_at, updated_at) SELECT $1, $2, $3, $4, NOW(), NOW() WHERE NOT EXISTS (SELECT 1 FROM workspace_role WHERE workspace_id = $2 AND role = $3)",
+            &[&Uuid::new_v4().to_string(), &input.organization_id, &role, &permission],
+        )
+        .await
+        .map_err(database_error)?;
+    if inserted == 0 {
+        return Err(ApiError::new(StatusCode::CONFLICT, "Role already exists"));
+    }
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn update_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<RoleUpdateInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace_permission(&state, &auth, &input.organization_id, "ac", "update").await?;
+    let permission = input
+        .data
+        .and_then(|data| data.permission)
+        .or(input.permission)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Role permissions are required"))?;
+    let permission = serde_json::to_string(&permission)
+        .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let updated = state
+        .database
+        .client
+        .execute(
+            "UPDATE workspace_role SET permission = $1, updated_at = NOW() WHERE workspace_id = $2 AND role = $3",
+            &[&permission, &input.organization_id, &input.role_name],
+        )
+        .await
+        .map_err(database_error)?;
+    if updated == 0 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "Role not found"));
+    }
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn delete_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<RoleDeleteInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace_permission(&state, &auth, &input.organization_id, "ac", "delete").await?;
+    if matches!(
+        input.role_name.as_str(),
+        "owner" | "admin" | "member" | "viewer"
+    ) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Default roles cannot be deleted",
+        ));
+    }
+    let assigned = state
+        .database
+        .client
+        .query_one(
+            "SELECT COUNT(*)::bigint AS count FROM workspace_member WHERE workspace_id = $1 AND role = $2",
+            &[&input.organization_id, &input.role_name],
+        )
+        .await
+        .map_err(database_error)?
+        .try_get::<_, i64>("count")
+        .map_err(database_error)?;
+    if assigned > 0 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Role is still assigned to workspace members",
+        ));
+    }
+    let deleted = state
+        .database
+        .client
+        .execute(
+            "DELETE FROM workspace_role WHERE workspace_id = $1 AND role = $2",
+            &[&input.organization_id, &input.role_name],
+        )
+        .await
+        .map_err(database_error)?;
+    if deleted == 0 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "Role not found"));
+    }
+    Ok(Json(json!({ "success": true })))
 }
 
 fn built_in_permissions(role: &str) -> HashMap<String, Vec<String>> {
@@ -8857,7 +13447,7 @@ async fn create_activity_comment(
     let task = task_by_id(&state.database, &input.task_id).await?;
     publish_task_event(
         &state,
-        "COMMENT_UPDATED",
+        "TASK_COMMENT_CREATED",
         task.project_id,
         input.task_id,
         &auth,
@@ -9052,7 +13642,7 @@ async fn create_comment(
     let task = task_by_id(&state.database, &task_id).await?;
     publish_task_event(
         &state,
-        "COMMENT_UPDATED",
+        "TASK_COMMENT_CREATED",
         task.project_id.clone(),
         task_id.clone(),
         &auth,
@@ -11066,6 +15656,94 @@ fn billing_is_enabled() -> bool {
     env_true("KANEO_CLOUD") && env_present("CREEM_API_KEY") && env_present("CREEM_WEBHOOK_SECRET")
 }
 
+fn billing_product_id(plan: &str, interval: &str) -> Option<String> {
+    let key = match (plan, interval) {
+        ("personal", "monthly") => "CREEM_PRODUCT_PERSONAL_MONTHLY",
+        ("personal", "annual") => "CREEM_PRODUCT_PERSONAL_ANNUAL",
+        ("team", "monthly") => "CREEM_PRODUCT_TEAM_MONTHLY",
+        ("team", "annual") => "CREEM_PRODUCT_TEAM_ANNUAL",
+        _ => return None,
+    };
+    env::var(key).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn billing_plan_for_product(product_id: &str) -> Option<(&'static str, &'static str)> {
+    [
+        ("personal", "monthly"),
+        ("personal", "annual"),
+        ("team", "monthly"),
+        ("team", "annual"),
+    ]
+    .into_iter()
+    .find(|(plan, interval)| billing_product_id(plan, interval).as_deref() == Some(product_id))
+}
+
+fn billing_api_base_url() -> String {
+    if let Some(value) = env::var("CREEM_API_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return value.trim_end_matches('/').to_string();
+    }
+    if env_true("CREEM_TEST_MODE") {
+        "https://test-api.creem.io".to_string()
+    } else {
+        "https://api.creem.io".to_string()
+    }
+}
+
+async fn creem_request(
+    state: &AppState,
+    method: reqwest::Method,
+    path: &str,
+    payload: Option<Value>,
+) -> Result<Value, ApiError> {
+    let api_key = env::var("CREEM_API_KEY").map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Billing is not configured with a Creem API key",
+        )
+    })?;
+    let url = format!("{}{}", billing_api_base_url(), path);
+    let mut request = state
+        .http
+        .request(method, url)
+        .header("x-api-key", api_key)
+        .header("Accept", "application/json")
+        .timeout(Duration::from_secs(20));
+    if let Some(payload) = payload {
+        request = request
+            .header("Content-Type", "application/json")
+            .json(&payload);
+    }
+    let response = request.send().await.map_err(|error| {
+        eprintln!("billing: Creem request failed: {error}");
+        ApiError::new(StatusCode::BAD_GATEWAY, "Billing provider request failed")
+    })?;
+    let status = StatusCode::from_u16(response.status().as_u16()).map_err(database_error)?;
+    let body = response.bytes().await.map_err(|error| {
+        eprintln!("billing: could not read Creem response: {error}");
+        ApiError::new(StatusCode::BAD_GATEWAY, "Billing provider request failed")
+    })?;
+    if !status.is_success() {
+        eprintln!("billing: Creem returned {status}");
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "Billing provider request failed",
+        ));
+    }
+    if body.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_slice(&body).map_err(|error| {
+        eprintln!("billing: Creem returned invalid JSON: {error}");
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "Billing provider returned invalid JSON",
+        )
+    })
+}
+
 fn billing_trial_days() -> i32 {
     env::var("BILLING_TRIAL_DAYS")
         .ok()
@@ -11074,13 +15752,7 @@ fn billing_trial_days() -> i32 {
         .unwrap_or(14)
 }
 
-async fn get_workspace_billing(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(workspace_id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let auth = authenticate(&state, &headers).await?;
-    require_workspace(&state, &auth, &workspace_id).await?;
+async fn ensure_workspace_billing(state: &AppState, workspace_id: &str) -> Result<(), ApiError> {
     let workspace_exists = state
         .database
         .client
@@ -11090,9 +15762,9 @@ async fn get_workspace_billing(
         )
         .await
         .map_err(database_error)?;
-    let Some(workspace) = workspace_exists else {
+    if workspace_exists.is_none() {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "Workspace not found"));
-    };
+    }
 
     let existing = state
         .database
@@ -11103,48 +15775,60 @@ async fn get_workspace_billing(
         )
         .await
         .map_err(database_error)?;
-    if existing.is_none() {
-        let founding_free = if let Some(cutoff) = env::var("BILLING_FOUNDING_CUTOFF")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-        {
-            state
-                .database
-                .client
-                .query_one(
-                    "SELECT created_at <= $1::timestamp AS founding_free FROM workspace WHERE id = $2",
-                    &[&cutoff, &workspace_id],
-                )
-                .await
-                .map_err(database_error)?
-                .try_get::<_, bool>("founding_free")
-                .map_err(database_error)?
-        } else {
-            let _ = workspace;
-            false
-        };
+    if existing.is_some() {
+        return Ok(());
+    }
+
+    let founding_free = if let Some(cutoff) = env::var("BILLING_FOUNDING_CUTOFF")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
         state
             .database
             .client
-            .execute(
-                r#"
-                  INSERT INTO workspace_billing (id, workspace_id, founding_free, trial_ends_at)
-                  VALUES ($1, $2, $3,
-                    CASE WHEN $3 THEN NULL
-                         ELSE NOW() + ($4::int * INTERVAL '1 day')
-                    END)
-                  ON CONFLICT (workspace_id) DO NOTHING
-                "#,
-                &[
-                    &Uuid::new_v4().to_string(),
-                    &workspace_id,
-                    &founding_free,
-                    &billing_trial_days(),
-                ],
+            .query_one(
+                "SELECT created_at <= $1::timestamp AS founding_free FROM workspace WHERE id = $2",
+                &[&cutoff, &workspace_id],
             )
             .await
-            .map_err(database_error)?;
-    }
+            .map_err(database_error)?
+            .try_get::<_, bool>("founding_free")
+            .map_err(database_error)?
+    } else {
+        false
+    };
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO workspace_billing (id, workspace_id, founding_free, trial_ends_at)
+              VALUES ($1, $2, $3,
+                CASE WHEN $3 THEN NULL
+                     ELSE NOW() + ($4::int * INTERVAL '1 day')
+                END)
+              ON CONFLICT (workspace_id) DO NOTHING
+            "#,
+            &[
+                &Uuid::new_v4().to_string(),
+                &workspace_id,
+                &founding_free,
+                &billing_trial_days(),
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(())
+}
+
+async fn get_workspace_billing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace(&state, &auth, &workspace_id).await?;
+    ensure_workspace_billing(&state, &workspace_id).await?;
 
     let billing = state
         .database
@@ -11200,6 +15884,493 @@ async fn get_workspace_billing(
         "canceledAt": row_optional_string(&billing, "canceled_at")?,
         "hasCustomer": row_optional_string(&billing, "creem_customer_id")?.is_some(),
     })))
+}
+
+async fn require_billing_manager(
+    state: &AppState,
+    headers: &HeaderMap,
+    workspace_id: &str,
+) -> Result<AuthContext, ApiError> {
+    let auth = authenticate(state, headers).await?;
+    require_workspace(state, &auth, workspace_id).await?;
+    if auth.is_admin() {
+        return Ok(auth);
+    }
+    let role = state
+        .database
+        .client
+        .query_opt(
+            "SELECT role FROM workspace_member WHERE workspace_id = $1 AND user_id = $2 LIMIT 1",
+            &[&workspace_id, &auth.user_id],
+        )
+        .await
+        .map_err(database_error)?
+        .and_then(|row| row.try_get::<_, String>("role").ok());
+    if !matches!(role.as_deref(), Some("owner" | "admin")) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Only workspace owners and admins can manage billing",
+        ));
+    }
+    Ok(auth)
+}
+
+async fn create_billing_checkout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+    Json(input): Json<BillingCheckoutInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = require_billing_manager(&state, &headers, &workspace_id).await?;
+    if !matches!(input.plan.as_str(), "personal" | "team")
+        || !matches!(input.interval.as_str(), "monthly" | "annual")
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Unknown plan or billing interval",
+        ));
+    }
+    if !billing_is_enabled() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Billing is not enabled",
+        ));
+    }
+    let product_id = billing_product_id(&input.plan, &input.interval)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Unknown plan"))?;
+    ensure_workspace_billing(&state, &workspace_id).await?;
+    let billing = state
+        .database
+        .client
+        .query_one(
+            "SELECT status FROM workspace_billing WHERE workspace_id = $1 LIMIT 1",
+            &[&workspace_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if billing
+        .try_get::<_, Option<String>>("status")
+        .map_err(database_error)?
+        .as_deref()
+        == Some("active")
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Workspace already has an active subscription",
+        ));
+    }
+    let units = if input.plan == "team" {
+        state
+            .database
+            .client
+            .query_one(
+                "SELECT GREATEST(1, COUNT(*)::int) AS units FROM workspace_member WHERE workspace_id = $1",
+                &[&workspace_id],
+            )
+            .await
+            .map_err(database_error)?
+            .try_get::<_, i32>("units")
+            .map_err(database_error)?
+    } else {
+        1
+    };
+    let email = current_user_email(&state, &auth).await?;
+    let success_url = format!(
+        "{}/dashboard/settings/workspace/billing?checkout=success",
+        state.client_url.trim_end_matches('/')
+    );
+    let checkout = creem_request(
+        &state,
+        reqwest::Method::POST,
+        "/v1/checkouts",
+        Some(json!({
+            "product_id": product_id,
+            "units": units,
+            "success_url": success_url,
+            "request_id": Uuid::new_v4().to_string(),
+            "customer": { "email": email },
+            "metadata": {
+                "workspaceId": workspace_id,
+                "plan": input.plan,
+                "interval": input.interval,
+            },
+        })),
+    )
+    .await?;
+    let checkout_url = checkout
+        .get("checkout_url")
+        .or_else(|| checkout.get("checkoutUrl"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "Billing provider returned no checkout URL",
+            )
+        })?;
+    Ok(Json(json!({ "checkoutUrl": checkout_url })))
+}
+
+async fn create_billing_portal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(workspace_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let _auth = require_billing_manager(&state, &headers, &workspace_id).await?;
+    let billing = state
+        .database
+        .client
+        .query_opt(
+            "SELECT creem_customer_id FROM workspace_billing WHERE workspace_id = $1 LIMIT 1",
+            &[&workspace_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let Some(customer_id) = billing
+        .as_ref()
+        .and_then(|row| row_optional_string(row, "creem_customer_id").ok().flatten())
+    else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "No billing customer exists for this workspace yet",
+        ));
+    };
+    if !billing_is_enabled() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Billing is not enabled",
+        ));
+    }
+    let links = creem_request(
+        &state,
+        reqwest::Method::POST,
+        "/v1/customers/billing",
+        Some(json!({ "customer_id": customer_id })),
+    )
+    .await?;
+    let portal_url = links
+        .get("customer_portal_link")
+        .or_else(|| links.get("customerPortalLink"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "Billing provider returned no portal URL",
+            )
+        })?;
+    Ok(Json(json!({ "portalUrl": portal_url })))
+}
+
+fn billing_id_value(object: &Value, key: &str) -> Option<String> {
+    match object.get(key) {
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+        Some(Value::Object(value)) => value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+fn billing_string_value(object: &Value, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn billing_metadata_value(object: &Value, key: &str) -> Option<String> {
+    object
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(key))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn billing_timestamp_value(object: &Value, key: &str) -> Option<String> {
+    let raw = billing_string_value(object, key)?;
+    chrono::DateTime::parse_from_rfc3339(&raw)
+        .ok()
+        .map(|value| value.naive_utc().to_string())
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+fn verify_creem_webhook(headers: &HeaderMap, secret: &str, payload: &[u8]) -> bool {
+    let standard_headers = headers
+        .get("webhook-id")
+        .and_then(|value| value.to_str().ok())
+        .zip(
+            headers
+                .get("webhook-timestamp")
+                .and_then(|value| value.to_str().ok()),
+        )
+        .zip(
+            headers
+                .get("webhook-signature")
+                .and_then(|value| value.to_str().ok()),
+        );
+    if let Some(((webhook_id, timestamp), signature)) = standard_headers {
+        let Ok(timestamp) = timestamp.parse::<i64>() else {
+            return false;
+        };
+        if (Utc::now().timestamp() - timestamp).abs() > 5 * 60 {
+            return false;
+        }
+        let secret_value = secret.strip_prefix("whsec_").unwrap_or(secret);
+        let Ok(secret_bytes) = base64::engine::general_purpose::STANDARD.decode(secret_value)
+        else {
+            return false;
+        };
+        let mut signed_payload = format!("{webhook_id}.{timestamp}.").into_bytes();
+        signed_payload.extend_from_slice(payload);
+        let expected = base64::engine::general_purpose::STANDARD
+            .encode(hmac_sha256_bytes(&secret_bytes, &signed_payload));
+        return signature.split_whitespace().any(|value| {
+            let Some(value) = value.strip_prefix("v1,") else {
+                return false;
+            };
+            constant_time_equal(value.as_bytes(), expected.as_bytes())
+        });
+    }
+
+    let Some(signature) = headers
+        .get("creem-signature")
+        .or_else(|| headers.get("x-creem-signature"))
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let provided = signature
+        .trim()
+        .strip_prefix("sha256=")
+        .unwrap_or(signature.trim())
+        .to_ascii_lowercase();
+    let expected = hex_digest(&hmac_sha256_bytes(secret.as_bytes(), payload));
+    constant_time_equal(provided.as_bytes(), expected.as_bytes())
+}
+
+async fn billing_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    if !billing_is_enabled() {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "Not found"));
+    }
+    let secret = env::var("CREEM_WEBHOOK_SECRET")
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "Not found"))?;
+    if !verify_creem_webhook(&headers, &secret, &body) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Invalid signature"));
+    }
+    let payload: Value = serde_json::from_slice(&body).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid webhook payload: {error}"),
+        )
+    })?;
+    let event_type = payload
+        .get("type")
+        .or_else(|| payload.get("eventType"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Invalid webhook payload"))?
+        .to_string();
+    let data = payload
+        .get("data")
+        .or_else(|| payload.get("object"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let event_id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    if let Some(event_id) = event_id.as_deref() {
+        let inserted = state
+            .database
+            .client
+            .execute(
+                "INSERT INTO billing_event (id, event_type) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+                &[&event_id, &event_type],
+            )
+            .await
+            .map_err(database_error)?;
+        if inserted == 0 {
+            return Ok(Json(json!({ "processed": false, "duplicate": true })));
+        }
+    }
+
+    if event_type == "checkout.completed" {
+        let subscription = data.get("subscription").unwrap_or(&Value::Null);
+        let workspace_id = billing_metadata_value(&data, "workspaceId")
+            .or_else(|| billing_metadata_value(subscription, "workspaceId"));
+        let Some(workspace_id) = workspace_id else {
+            eprintln!("billing: checkout.completed without workspaceId");
+            return Ok(Json(json!({ "processed": false, "duplicate": false })));
+        };
+        ensure_workspace_billing(&state, &workspace_id).await?;
+        let product_id = billing_id_value(&data, "product")
+            .or_else(|| billing_id_value(subscription, "product"));
+        let customer_id = billing_id_value(&data, "customer")
+            .or_else(|| billing_id_value(subscription, "customer"));
+        let subscription_id = billing_id_value(&data, "subscription");
+        let mapped = product_id.as_deref().and_then(billing_plan_for_product);
+        let plan = mapped.map(|(plan, _)| plan.to_string());
+        let interval = mapped.map(|(_, interval)| interval.to_string());
+        let status =
+            billing_string_value(subscription, "status").or_else(|| Some("active".to_string()));
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  UPDATE workspace_billing
+                  SET creem_customer_id = $1,
+                      creem_subscription_id = $2,
+                      creem_product_id = $3,
+                      plan = $4,
+                      billing_interval = $5,
+                      status = $6,
+                      updated_at = NOW()
+                  WHERE workspace_id = $7
+                "#,
+                &[
+                    &customer_id,
+                    &subscription_id,
+                    &product_id,
+                    &plan,
+                    &interval,
+                    &status,
+                    &workspace_id,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        return Ok(Json(json!({ "processed": true, "duplicate": false })));
+    }
+
+    if event_type.starts_with("subscription.") {
+        let Some(subscription_id) = billing_id_value(&data, "id") else {
+            return Ok(Json(json!({ "processed": false, "duplicate": false })));
+        };
+        let product_id = billing_id_value(&data, "product");
+        let mapped = product_id.as_deref().and_then(billing_plan_for_product);
+        let plan = mapped.map(|(plan, _)| plan.to_string());
+        let interval = mapped.map(|(_, interval)| interval.to_string());
+        let status = billing_string_value(&data, "status").or_else(|| {
+            Some(
+                match event_type.as_str() {
+                    "subscription.active" | "subscription.paid" => "active",
+                    "subscription.trialing" => "trialing",
+                    "subscription.scheduled_cancel" => "scheduled_cancel",
+                    "subscription.canceled" => "canceled",
+                    "subscription.past_due" => "past_due",
+                    "subscription.expired" => "expired",
+                    "subscription.paused" => "paused",
+                    _ => return None,
+                }
+                .to_string(),
+            )
+        });
+        let current_period_end = billing_timestamp_value(&data, "current_period_end_date")
+            .or_else(|| billing_timestamp_value(&data, "currentPeriodEndDate"));
+        let canceled_at = billing_timestamp_value(&data, "canceled_at")
+            .or_else(|| billing_timestamp_value(&data, "canceledAt"));
+        let seats = data
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("units"))
+            .and_then(Value::as_i64)
+            .and_then(|units| i32::try_from(units).ok())
+            .filter(|units| *units > 0);
+        let customer_id = billing_id_value(&data, "customer");
+        let updated = state
+            .database
+            .client
+            .execute(
+                r#"
+                  UPDATE workspace_billing
+                  SET status = COALESCE($1, status),
+                      current_period_end = $2::text::timestamp,
+                      canceled_at = $3::text::timestamp,
+                      creem_product_id = COALESCE($4, creem_product_id),
+                      plan = CASE WHEN $4 IS NULL THEN plan ELSE $5 END,
+                      billing_interval = CASE WHEN $4 IS NULL THEN billing_interval ELSE $6 END,
+                      seats = COALESCE($7, seats),
+                      creem_customer_id = COALESCE($8, creem_customer_id),
+                      updated_at = NOW()
+                  WHERE creem_subscription_id = $9
+                "#,
+                &[
+                    &status,
+                    &current_period_end,
+                    &canceled_at,
+                    &product_id,
+                    &plan,
+                    &interval,
+                    &seats,
+                    &customer_id,
+                    &subscription_id,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        if updated == 0 {
+            let workspace_id = billing_metadata_value(&data, "workspaceId");
+            if let Some(workspace_id) = workspace_id {
+                state
+                    .database
+                    .client
+                    .execute(
+                        r#"
+                          UPDATE workspace_billing
+                          SET creem_subscription_id = $9,
+                              status = COALESCE($1, status),
+                              current_period_end = $2::text::timestamp,
+                              canceled_at = $3::text::timestamp,
+                              creem_product_id = COALESCE($4, creem_product_id),
+                              plan = CASE WHEN $4 IS NULL THEN plan ELSE $5 END,
+                              billing_interval = CASE WHEN $4 IS NULL THEN billing_interval ELSE $6 END,
+                              seats = COALESCE($7, seats),
+                              creem_customer_id = COALESCE($8, creem_customer_id),
+                              updated_at = NOW()
+                          WHERE workspace_id = $10
+                        "#,
+                        &[
+                            &status,
+                            &current_period_end,
+                            &canceled_at,
+                            &product_id,
+                            &plan,
+                            &interval,
+                            &seats,
+                            &customer_id,
+                            &subscription_id,
+                            &workspace_id,
+                        ],
+                    )
+                    .await
+                    .map_err(database_error)?;
+            }
+        }
+    }
+
+    Ok(Json(json!({ "processed": true, "duplicate": false })))
 }
 
 fn build_agent_prompt(input: &StartAgentInput, workspace_id: &str) -> String {
@@ -11556,60 +16727,19 @@ async fn cors(request: Request<Body>, next: Next) -> Response {
     response
 }
 
-async fn proxy(
-    State(state): State<AppState>,
-    request: Request<Body>,
-) -> Result<Response, ApiError> {
-    let Some(legacy_url) = &state.legacy_api_url else {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "This Kaneo route has not moved to Rust yet.",
-        ));
-    };
-    let path_and_query = request
-        .uri()
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or("/");
-    let url = format!("{}{}", legacy_url.trim_end_matches('/'), path_and_query);
-    let method = reqwest::Method::from_bytes(request.method().as_str().as_bytes())
-        .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
-    let incoming_headers = request.headers().clone();
-    let body = to_bytes(request.into_body(), DEFAULT_MAX_BODY_BYTES)
-        .await
-        .map_err(|error| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
-    let mut upstream_request = state.http.request(method, url).body(body);
-    for (name, value) in &incoming_headers {
-        if *name == header::HOST || *name == header::CONTENT_LENGTH {
-            continue;
-        }
-        upstream_request = upstream_request.header(name.as_str(), value.as_bytes());
-    }
-    let upstream = upstream_request.send().await.map_err(|error| {
-        ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            format!("Legacy Kaneo API is unavailable: {error}"),
-        )
-    })?;
-    let status = StatusCode::from_u16(upstream.status().as_u16())
-        .map_err(|error| ApiError::new(StatusCode::BAD_GATEWAY, error.to_string()))?;
-    let upstream_headers = upstream.headers().clone();
-    let bytes = upstream.bytes().await.map_err(|error| {
-        ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            format!("Could not read legacy Kaneo response: {error}"),
-        )
-    })?;
-    let mut response = Response::builder().status(status);
-    for (name, value) in &upstream_headers {
-        if *name == header::CONTENT_LENGTH || *name == header::TRANSFER_ENCODING {
-            continue;
-        }
-        response = response.header(name.as_str(), value.as_bytes());
-    }
-    response
-        .body(Body::from(bytes))
-        .map_err(|error| ApiError::new(StatusCode::BAD_GATEWAY, error.to_string()))
+async fn native_auth_route(Path(path): Path<String>) -> Result<Response, ApiError> {
+    Err(ApiError::new(
+        StatusCode::BAD_REQUEST,
+        format!("Optional authentication route /api/auth/{path} is not configured"),
+    ))
+}
+
+async fn not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "message": "Kaneo route not found in the Rust runtime" })),
+    )
+        .into_response()
 }
 
 fn app(state: AppState) -> Router {
@@ -11618,10 +16748,26 @@ fn app(state: AppState) -> Router {
         .route("/api/config", get(config))
         .route("/api/instance/status", get(instance_status))
         .route("/api/rust/status", get(rust_status))
+        .route("/api/openapi", get(openapi))
         .route("/api/public-project/{id}", get(get_public_project))
+        .route("/api/asset/{id}", get(get_asset))
         .route("/api/search", get(global_search))
         .route("/api/auth/get-session", get(get_session))
         .route("/api/oauth/id-token", get(get_oauth_id_token))
+        .route("/api/auth/sign-up/email", post(sign_up_email))
+        .route("/api/auth/sign-in/email", post(sign_in_email))
+        .route("/api/auth/sign-in/anonymous", post(sign_in_anonymous))
+        .route("/api/auth/sign-out", post(sign_out))
+        .route("/api/auth/update-user", post(update_user))
+        .route("/api/auth/change-password", post(change_password))
+        .route("/api/auth/device", get(claim_device_code))
+        .route("/api/auth/device/code", post(create_device_code))
+        .route("/api/auth/device/approve", post(approve_device_code))
+        .route("/api/auth/device/deny", post(deny_device_code))
+        .route("/api/auth/device/token", post(device_token))
+        .route("/api/auth/api-key/create", post(create_api_key))
+        .route("/api/auth/api-key/list", get(list_api_keys))
+        .route("/api/auth/api-key/delete", post(delete_api_key))
         .route("/api/mcp", get(mcp_get_endpoint).post(mcp_endpoint))
         .route(
             "/api/.well-known/oauth-protected-resource/api/mcp",
@@ -11639,7 +16785,52 @@ fn app(state: AppState) -> Router {
         )
         .route("/api/mcp/token", post(mcp_token))
         .route("/api/auth/organization/list", get(list_organizations))
+        .route(
+            "/api/auth/organization/list-invitations",
+            get(list_invitations),
+        )
+        .route(
+            "/api/auth/organization/list-user-invitations",
+            get(list_user_invitations),
+        )
+        .route(
+            "/api/auth/organization/get-invitation",
+            get(get_organization_invitation),
+        )
+        .route("/api/auth/organization/invite-member", post(invite_member))
+        .route("/api/auth/organization/remove-member", post(remove_member))
+        .route(
+            "/api/auth/organization/update-member-role",
+            post(update_member_role),
+        )
+        .route(
+            "/api/auth/organization/accept-invitation",
+            post(accept_invitation),
+        )
+        .route(
+            "/api/auth/organization/reject-invitation",
+            post(reject_invitation),
+        )
+        .route(
+            "/api/auth/organization/cancel-invitation",
+            post(cancel_invitation),
+        )
+        .route("/api/auth/organization/list-roles", get(list_roles))
+        .route("/api/auth/organization/create-role", post(create_role))
+        .route("/api/auth/organization/update-role", post(update_role))
+        .route("/api/auth/organization/delete-role", post(delete_role))
+        .route("/api/auth/organization/create", post(create_organization))
+        .route(
+            "/api/auth/organization/set-active",
+            post(set_active_organization),
+        )
+        .route("/api/auth/organization/update", post(update_organization))
+        .route("/api/auth/organization/delete", post(delete_organization))
         .route("/api/auth/organization/list-members", get(list_members))
+        .route(
+            "/api/auth/organization/get-active-member",
+            get(get_active_member),
+        )
         .route(
             "/api/auth/organization/get-full-organization",
             get(get_full_organization),
@@ -11701,6 +16892,19 @@ fn app(state: AppState) -> Router {
         )
         .route("/api/github-integration/app-info", get(github_app_info))
         .route(
+            "/api/github-integration/repositories",
+            get(list_github_repositories),
+        )
+        .route(
+            "/api/github-integration/verify",
+            post(verify_github_installation),
+        )
+        .route(
+            "/api/github-integration/import-issues",
+            post(import_github_issues),
+        )
+        .route("/api/github-integration/webhook", post(github_webhook))
+        .route(
             "/api/github-integration/project/{project_id}",
             get(get_github_integration)
                 .post(create_github_integration)
@@ -11719,10 +16923,27 @@ fn app(state: AppState) -> Router {
                 .patch(update_gitea_integration)
                 .delete(delete_gitea_integration),
         )
+        .route(
+            "/api/gitea-integration/import-issues",
+            post(import_gitea_issues),
+        )
+        .route(
+            "/api/gitea-integration/webhook/{integration_id}",
+            post(gitea_webhook),
+        )
         .route("/api/invitation/pending", get(pending_invitations))
         .route(
             "/api/invitation/public/{id}",
             get(public_invitation_details),
+        )
+        .route("/api/billing/webhook", post(billing_webhook))
+        .route(
+            "/api/billing/{workspace_id}/checkout",
+            post(create_billing_checkout),
+        )
+        .route(
+            "/api/billing/{workspace_id}/portal",
+            post(create_billing_portal),
         )
         .route("/api/billing/{workspace_id}", get(get_workspace_billing))
         .route(
@@ -11811,12 +17032,25 @@ fn app(state: AppState) -> Router {
         .route("/api/task/due-date/{id}", put(update_task_due_date))
         .route("/api/task/assignee/{id}", put(update_task_assignee))
         .route("/api/task/description/{id}", put(update_task_description))
+        .route("/api/task/image-upload/{id}", put(create_task_image_upload))
+        .route(
+            "/api/task/image-upload/{id}/finalize",
+            post(finalize_task_image_upload),
+        )
         .route("/api/task/move/{id}", put(move_task))
         .route("/api/task/export/{project_id}", get(export_tasks))
         .route("/api/agent/runs", post(start_agent))
         .route("/api/agent/runs/{id}", get(get_agent))
         .route("/api/agent/runs/{id}/cancel", post(cancel_agent))
-        .fallback(any(proxy))
+        .route(
+            "/api/auth/{*path}",
+            get(native_auth_route)
+                .post(native_auth_route)
+                .put(native_auth_route)
+                .patch(native_auth_route)
+                .delete(native_auth_route),
+        )
+        .fallback(not_found)
         .with_state(state)
         .layer(middleware::from_fn(cors))
 }
@@ -11847,10 +17081,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = env::var("DATABASE_URL")?;
     let database = Database::connect(&database_url).await?;
     let bind = env::var("KANEO_RUST_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-    let legacy_api_url = env::var("KANEO_LEGACY_API_URL")
-        .ok()
-        .map(|value| value.trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty());
     let client_url = env::var("KANEO_CLIENT_URL")
         .unwrap_or_else(|_| "http://localhost:5173".to_string())
         .trim_end_matches('/')
@@ -11866,7 +17096,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_string(),
         client_url,
         mcp: Arc::new(Mutex::new(McpState::default())),
-        legacy_api_url,
         events,
     };
     let listener = TcpListener::bind(&bind).await?;

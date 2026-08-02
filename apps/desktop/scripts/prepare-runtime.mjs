@@ -7,17 +7,14 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { builtinModules } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { build } from "esbuild";
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(desktopRoot, "../..");
 const runtimeRoot = join(desktopRoot, "runtime");
 const webDist = join(repoRoot, "apps/web/dist");
 const drizzleDir = join(repoRoot, "apps/api/drizzle");
-const apiSource = join(repoRoot, "apps/api/src/index.ts");
 const rustApiSource = join(repoRoot, "rust/target/release/kaneo-api");
 const rustDesktopSource = join(repoRoot, "rust/target/release/kaneo-desktop");
 
@@ -31,10 +28,8 @@ async function mustExist(path, label) {
 
 await mustExist(webDist, "The web build");
 await mustExist(drizzleDir, "The API migrations");
-await mustExist(apiSource, "The API source");
 
 await rm(runtimeRoot, { recursive: true, force: true });
-await mkdir(join(runtimeRoot, "api"), { recursive: true });
 
 await cp(webDist, join(runtimeRoot, "web"), { recursive: true });
 await cp(drizzleDir, join(runtimeRoot, "drizzle"), { recursive: true });
@@ -59,34 +54,10 @@ try {
     );
   }
 } catch {
-  console.warn(
-    `Rust API binary not found at ${rustApiSource}; packaging the compatibility runtime only.`,
+  throw new Error(
+    `Rust API binary not found at ${rustApiSource}; build the Rust runtime before packaging.`,
   );
 }
-
-const nodeBuiltins = [
-  ...builtinModules,
-  ...builtinModules.map((name) => `node:${name}`),
-];
-
-await build({
-  entryPoints: [apiSource],
-  outfile: join(runtimeRoot, "api/index.cjs"),
-  bundle: true,
-  packages: "bundle",
-  platform: "node",
-  format: "cjs",
-  external: nodeBuiltins,
-  define: {
-    "import.meta.url": "__kaneoImportMetaUrl",
-  },
-  banner: {
-    js: 'const __kaneoImportMetaUrl = require("node:url").pathToFileURL(__filename).href;',
-  },
-  legalComments: "none",
-  sourcemap: false,
-  target: "node20",
-});
 
 const envSource = join(repoRoot, ".env");
 try {

@@ -9,7 +9,11 @@ description = "Rust HTTP runtime for Kaneo board, task, and autonomous-agent flo
 aes-gcm.workspace = true
 axum.workspace = true
 base64.workspace = true
+bcrypt.workspace = true
+chrono.workspace = true
 futures-util.workspace = true
+hmac.workspace = true
+jsonwebtoken.workspace = true
 kaneo-core = { path = "../kaneo-core" }
 reqwest.workspace = true
 serde.workspace = true

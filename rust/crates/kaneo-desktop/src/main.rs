@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -12,10 +12,16 @@ use url::Url;
 
 struct ApiChild(Mutex<Option<Child>>);
 
-fn configured_api_binary() -> String {
+fn configured_api_binary(resource_dir: Option<&Path>) -> String {
     if let Ok(path) = env::var("KANEO_RUST_API_BIN") {
         if !path.trim().is_empty() {
             return path;
+        }
+    }
+    if let Some(resource_dir) = resource_dir {
+        let bundled = resource_dir.join("kaneo-api");
+        if bundled.is_file() {
+            return bundled.display().to_string();
         }
     }
     let current = env::current_exe().expect("could not resolve the Kaneo desktop executable");
@@ -27,8 +33,8 @@ fn configured_api_binary() -> String {
         .to_string()
 }
 
-fn start_api() -> Result<Child, String> {
-    let binary = configured_api_binary();
+fn start_api(resource_dir: Option<&Path>) -> Result<Child, String> {
+    let binary = configured_api_binary(resource_dir);
     let mut command = Command::new(&binary);
     command
         .envs(env::vars())
@@ -50,11 +56,17 @@ fn web_url() -> Result<Url, String> {
     Url::parse(&value).map_err(|error| format!("Invalid KANEO_WEB_URL: {error}"))
 }
 
-fn web_root() -> Option<PathBuf> {
+fn web_root(app: &AppHandle) -> Option<PathBuf> {
     if let Ok(root) = env::var("KANEO_WEB_ROOT") {
         let path = PathBuf::from(root);
         if path.join("index.html").is_file() {
             return Some(path);
+        }
+    }
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let bundled_root = resource_dir.join("web");
+        if bundled_root.join("index.html").is_file() {
+            return Some(bundled_root);
         }
     }
     let current = env::current_exe().ok()?;
@@ -66,8 +78,8 @@ fn web_root() -> Option<PathBuf> {
         .then_some(bundled_root)
 }
 
-fn start_web_server() {
-    let Some(root) = web_root() else {
+fn start_web_server(app: &AppHandle) {
+    let Some(root) = web_root(app) else {
         eprintln!(
             "[kaneo-rust-desktop] no bundled web root; using an already-running KANEO_WEB_URL"
         );
@@ -116,9 +128,10 @@ fn create_window(app: &AppHandle) -> Result<(), String> {
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
-            let api = start_api().map_err(std::io::Error::other)?;
+            let resource_dir = app.path().resource_dir().ok();
+            let api = start_api(resource_dir.as_deref()).map_err(std::io::Error::other)?;
             app.manage(ApiChild(Mutex::new(Some(api))));
-            start_web_server();
+            start_web_server(app.handle());
             std::thread::sleep(Duration::from_millis(100));
             create_window(app.handle()).map_err(std::io::Error::other)?;
             Ok(())

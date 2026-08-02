@@ -48,7 +48,7 @@ Learn more about Kaneo's features and capabilities in our [documentation](https:
 
 ## Linux autonomous-agent implementation
 
-This Linux-focused implementation adds a self-hosted Electron desktop shell
+This Linux-focused implementation adds a self-hosted Rust/Tauri desktop shell
 and an on-demand Codex agent runner. Agents can inspect a Kaneo project,
 execute work in a selected local directory, update task status and comments,
 and stream redacted progress into a live monitor while the kanban board keeps
@@ -67,14 +67,12 @@ WebSockets, generic-webhook configuration CRUD, and the authenticated native
 MCP JSON-RPC bridge with PKCE OAuth for autonomous project/task agents, plus a
 native Slack, Discord, and Telegram integration-settings runtime and Tauri
 shell. GitHub and Gitea project-integration configuration is native too,
-including Gitea repository discovery and access verification; external webhook
-delivery, issue import, and the remaining authentication/billing/storage
-surface still run through the private compatibility API during the migration.
-Rust-launched agents enforce project/task permissions and receive the local
-Rust MCP endpoint directly in their Codex invocation.
-Packaged Linux desktop builds start the Rust API by default; the legacy
-TypeScript API remains on a private compatibility port for routes that have
-not moved yet, and can be selected explicitly with `KANEO_API_RUNTIME=node`.
+including repository discovery, access verification, issue import, and inbound
+webhooks. Billing checkout, customer portals, and webhook processing are native
+as well. Rust-launched agents enforce project/task permissions and receive the
+local Rust MCP endpoint directly in their Codex invocation. Packaged Linux
+desktop builds start only the Rust API; the desktop runtime no longer starts a
+Node API process.
 
 ## Sponsors
 
