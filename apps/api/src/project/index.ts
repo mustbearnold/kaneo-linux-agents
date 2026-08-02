@@ -74,15 +74,24 @@ const project = new Hono<{
         workspaceId: v.string(),
         icon: v.string(),
         slug: v.string(),
+        description: v.optional(v.string()),
+        localPath: v.optional(v.string()),
       }),
     ),
     workspaceAccess.fromBody(),
     requireWorkspacePermission({ project: ["create"] }),
     requireEntitlement,
     async (c) => {
-      const { name, icon, slug } = c.req.valid("json");
+      const { name, icon, slug, description, localPath } = c.req.valid("json");
       const workspaceId = c.get("workspaceId");
-      const newProject = await createProjectCtrl(workspaceId, name, icon, slug);
+      const newProject = await createProjectCtrl(
+        workspaceId,
+        name,
+        icon,
+        slug,
+        description,
+        localPath,
+      );
       return c.json(newProject);
     },
   )
@@ -134,13 +143,15 @@ const project = new Hono<{
         slug: v.string(),
         description: v.string(),
         isPublic: v.boolean(),
+        localPath: v.optional(v.string()),
       }),
     ),
     workspaceAccess.fromProject(),
     requireWorkspacePermission({ project: ["update"] }),
     async (c) => {
       const { id } = c.req.valid("param");
-      const { name, icon, slug, description, isPublic } = c.req.valid("json");
+      const { name, icon, slug, description, isPublic, localPath } =
+        c.req.valid("json");
       const workspaceId = c.get("workspaceId");
       const updatedProject = await updateProjectCtrl(
         id,
@@ -149,6 +160,7 @@ const project = new Hono<{
         slug,
         description,
         isPublic,
+        localPath,
         workspaceId,
       );
       return c.json(updatedProject);

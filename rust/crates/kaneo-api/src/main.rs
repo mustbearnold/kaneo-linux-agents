@@ -759,6 +759,10 @@ struct CreateProjectInput {
     workspace_id: String,
     icon: String,
     slug: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    local_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1035,6 +1039,7 @@ struct BoardProject {
     slug: String,
     icon: Option<String>,
     description: Option<String>,
+    local_path: Option<String>,
     is_public: bool,
     workspace_id: String,
     columns: Vec<Column>,
@@ -1711,6 +1716,35 @@ fn row_optional_i32(row: &Row, name: &str) -> Result<Option<i32>, ApiError> {
     row.try_get(name).map_err(database_error)
 }
 
+fn validate_project_local_path(value: Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(value) = value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if value.chars().count() > 1_000 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "localPath must be 1000 characters or fewer",
+        ));
+    }
+    let path = FsPath::new(&value);
+    if !path.is_absolute() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "localPath must be an absolute path",
+        ));
+    }
+    if !path.is_dir() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Local project folder is not a directory: {value}"),
+        ));
+    }
+    Ok(Some(value))
+}
+
 fn task_from_row(row: &Row) -> Result<ApiTask, ApiError> {
     Ok(ApiTask {
         id: row_string(row, "id")?,
@@ -1858,6 +1892,23 @@ async fn project_workspace(database: &Database, project_id: &str) -> Result<Stri
         .map(|row| row_string(&row, "workspace_id"))
         .transpose()?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Project not found"))
+}
+
+async fn project_local_path(
+    database: &Database,
+    project_id: &str,
+) -> Result<Option<String>, ApiError> {
+    database
+        .client
+        .query_opt(
+            "SELECT local_path FROM project WHERE id = $1 LIMIT 1",
+            &[&project_id],
+        )
+        .await
+        .map_err(database_error)?
+        .map(|row| row_optional_string(&row, "local_path"))
+        .transpose()
+        .map(|value| value.flatten())
 }
 
 async fn task_workspace(database: &Database, task_id: &str) -> Result<String, ApiError> {
@@ -2291,6 +2342,7 @@ async fn project_record(
         .query_opt(
             r#"
               SELECT p.id, p.workspace_id, p.slug, p.icon, p.name, p.description,
+                     p.local_path,
                      to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
                      COALESCE(p.is_public, FALSE) AS is_public,
                      to_char(p.archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at
@@ -2310,6 +2362,7 @@ async fn project_record(
         "icon": row_optional_string(&row, "icon")?,
         "name": row_string(&row, "name")?,
         "description": row_optional_string(&row, "description")?,
+        "localPath": row_optional_string(&row, "local_path")?,
         "createdAt": row_string(&row, "created_at")?,
         "isPublic": row.try_get::<_, bool>("is_public").map_err(database_error)?,
         "archivedAt": row_optional_string(&row, "archived_at")?,
@@ -2323,6 +2376,13 @@ async fn create_project(
 ) -> Result<Json<Value>, ApiError> {
     let auth = authenticate(&state, &headers).await?;
     require_workspace(&state, &auth, &input.workspace_id).await?;
+    let description = input
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let local_path = validate_project_local_path(input.local_path)?;
     let id = Uuid::new_v4().to_string();
     state
         .database
@@ -2330,8 +2390,8 @@ async fn create_project(
         .execute(
             r#"
               INSERT INTO project
-                (id, workspace_id, slug, icon, name, description, is_public, last_task_number)
-              VALUES ($1, $2, $3, $4, $5, NULL, FALSE, 0)
+                (id, workspace_id, slug, icon, name, description, local_path, is_public, last_task_number)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, 0)
             "#,
             &[
                 &id,
@@ -2339,6 +2399,8 @@ async fn create_project(
                 &input.slug,
                 &input.icon,
                 &input.name,
+                &description,
+                &local_path,
             ],
         )
         .await
@@ -6525,6 +6587,8 @@ fn mcp_tool_definitions() -> Value {
                 "workspaceId": string,
                 "icon": string,
                 "slug": string,
+                "description": optional_string,
+                "localPath": optional_string,
             }), &["name", "workspaceId", "icon", "slug"]),
         }),
         json!({
@@ -6919,6 +6983,8 @@ async fn mcp_call_tool(
                 "workspaceId": mcp_required_string(args, "workspaceId")?,
                 "icon": mcp_required_string(args, "icon")?,
                 "slug": mcp_required_string(args, "slug")?,
+                "description": mcp_optional_text(args, "description")?,
+                "localPath": mcp_optional_text(args, "localPath")?,
             });
             mcp_api_request(
                 state,
@@ -8006,6 +8072,7 @@ async fn list_projects(
             r#"
               SELECT
                 p.id, p.workspace_id, p.slug, p.icon, p.name, p.description,
+                p.local_path,
                 to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
                 COALESCE(p.is_public, FALSE) AS is_public,
                 COUNT(t.id)::int AS total_tasks,
@@ -8040,6 +8107,7 @@ async fn list_projects(
                 "icon": row_optional_string(&row, "icon")?,
                 "name": row_string(&row, "name")?,
                 "description": row_optional_string(&row, "description")?,
+                "localPath": row_optional_string(&row, "local_path")?,
                 "createdAt": row_string(&row, "created_at")?,
                 "isPublic": row.try_get::<_, bool>("is_public").map_err(database_error)?,
                 "statistics": {
@@ -8076,6 +8144,7 @@ async fn get_project(
         .query_opt(
             r#"
               SELECT p.id, p.workspace_id, p.slug, p.icon, p.name, p.description,
+                     p.local_path,
                      to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
                      COALESCE(p.is_public, FALSE) AS is_public
               FROM project p
@@ -8113,6 +8182,7 @@ async fn get_project(
         "icon": row_optional_string(&row, "icon")?,
         "name": row_string(&row, "name")?,
         "description": row_optional_string(&row, "description")?,
+        "localPath": row_optional_string(&row, "local_path")?,
         "createdAt": row_string(&row, "created_at")?,
         "isPublic": row.try_get::<_, bool>("is_public").map_err(database_error)?,
         "tasks": tasks,
@@ -8124,13 +8194,14 @@ async fn get_public_project(
     Path(id): Path<String>,
     Query(query): Query<BoardQuery>,
 ) -> Result<Json<BoardResponse>, ApiError> {
-    let board = load_board(&state, &id, &query).await?;
+    let mut board = load_board(&state, &id, &query).await?;
     if !board.data.is_public {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "Project is not public",
         ));
     }
+    board.data.local_path = None;
     Ok(Json(board))
 }
 
@@ -8988,7 +9059,7 @@ async fn load_board(
         .client
         .query_opt(
             r#"
-              SELECT p.id, p.name, p.slug, p.icon, p.description,
+              SELECT p.id, p.name, p.slug, p.icon, p.description, p.local_path,
                      COALESCE(p.is_public, FALSE) AS is_public, p.workspace_id
               FROM project p
               WHERE p.id = $1
@@ -9110,6 +9181,7 @@ async fn load_board(
             slug: row_string(&project_row, "slug")?,
             icon: row_optional_string(&project_row, "icon")?,
             description: row_optional_string(&project_row, "description")?,
+            local_path: row_optional_string(&project_row, "local_path")?,
             is_public: project_row.try_get("is_public").map_err(database_error)?,
             workspace_id: row_string(&project_row, "workspace_id")?,
             columns,
@@ -16868,8 +16940,16 @@ fn build_codex_command_args(
     command_args
 }
 
-fn resolve_orchestrator_cwd(cwd: Option<&str>, orchestrator_id: &str) -> Result<PathBuf, ApiError> {
-    let path = if let Some(cwd) = cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
+fn resolve_orchestrator_cwd(
+    cwd: Option<&str>,
+    project_cwd: Option<&str>,
+    orchestrator_id: &str,
+) -> Result<PathBuf, ApiError> {
+    let requested_cwd = cwd
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .or_else(|| project_cwd.map(str::trim).filter(|cwd| !cwd.is_empty()));
+    let path = if let Some(cwd) = requested_cwd {
         let path = PathBuf::from(cwd);
         if !path.is_absolute() {
             return Err(ApiError::new(
@@ -17242,13 +17322,18 @@ fn build_agent_prompt(input: &StartAgentInput, workspace_id: &str) -> String {
     .join("\n")
 }
 
-fn resolve_agent_cwd(input: &StartAgentInput, run_id: &str) -> Result<PathBuf, ApiError> {
-    let cwd = if let Some(cwd) = input
+fn resolve_agent_cwd(
+    input: &StartAgentInput,
+    project_cwd: Option<&str>,
+    run_id: &str,
+) -> Result<PathBuf, ApiError> {
+    let requested_cwd = input
         .cwd
         .as_deref()
         .map(str::trim)
         .filter(|cwd| !cwd.is_empty())
-    {
+        .or_else(|| project_cwd.map(str::trim).filter(|cwd| !cwd.is_empty()));
+    let cwd = if let Some(cwd) = requested_cwd {
         let path = PathBuf::from(cwd);
         if !path.is_absolute() {
             return Err(ApiError::new(
@@ -17339,12 +17424,14 @@ async fn start_agent(
     require_workspace_permission(&state, &auth, &workspace_id, "task", "create").await?;
     require_workspace_permission(&state, &auth, &workspace_id, "task", "update").await?;
     let id = Uuid::new_v4().to_string();
-    let cwd = resolve_agent_cwd(&input, &id)?;
+    let project_cwd = project_local_path(&state.database, &input.project_id).await?;
+    let cwd = resolve_agent_cwd(&input, project_cwd.as_deref(), &id)?;
     if !cwd.is_dir() {
         if input
             .cwd
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
+            || project_cwd.is_some()
         {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -18020,12 +18107,14 @@ async fn create_orchestrator(
     require_workspace_permission(&state, &auth, &workspace_id, "task", "create").await?;
     require_workspace_permission(&state, &auth, &workspace_id, "task", "update").await?;
     let id = Uuid::new_v4().to_string();
-    let cwd = resolve_orchestrator_cwd(input.cwd.as_deref(), &id)?;
+    let project_cwd = project_local_path(&state.database, &input.project_id).await?;
+    let cwd = resolve_orchestrator_cwd(input.cwd.as_deref(), project_cwd.as_deref(), &id)?;
     if !cwd.is_dir() {
         if input
             .cwd
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
+            || project_cwd.is_some()
         {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -18799,6 +18888,42 @@ mod tests {
                 "missing MCP tool {expected}"
             );
         }
+    }
+
+    #[test]
+    fn project_local_path_accepts_existing_absolute_directory() {
+        let current = std::env::current_dir()
+            .expect("current directory")
+            .display()
+            .to_string();
+        assert_eq!(
+            validate_project_local_path(Some(current.clone())).expect("valid path"),
+            Some(current)
+        );
+        assert_eq!(
+            validate_project_local_path(None).expect("missing path"),
+            None
+        );
+        assert!(validate_project_local_path(Some("relative/project".to_string())).is_err());
+    }
+
+    #[test]
+    fn project_local_path_is_the_default_agent_working_directory() {
+        let project_path = std::env::current_dir()
+            .expect("current directory")
+            .display()
+            .to_string();
+        let input = StartAgentInput {
+            project_id: "project-test".to_string(),
+            prompt: "test".to_string(),
+            cwd: None,
+            model: None,
+            network_access: None,
+            max_seconds: None,
+        };
+        let cwd = resolve_agent_cwd(&input, Some(&project_path), "run-test")
+            .expect("project path should be selected");
+        assert_eq!(cwd, FsPath::new(&project_path));
     }
 
     #[test]

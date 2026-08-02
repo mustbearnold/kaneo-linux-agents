@@ -240,6 +240,8 @@ export function registerMcpTools(
         workspaceId: nonEmptyString,
         icon: nonEmptyString,
         slug: nonEmptyString,
+        description: z.string().optional(),
+        localPath: z.string().optional(),
       }),
     },
     async (args) =>
@@ -251,6 +253,8 @@ export function registerMcpTools(
             workspaceId: args.workspaceId,
             icon: args.icon,
             slug: args.slug,
+            description: args.description,
+            localPath: args.localPath,
           }),
         }),
       ),
@@ -268,6 +272,7 @@ export function registerMcpTools(
         slug: optionalNonEmptyString,
         description: z.string().optional(),
         isPublic: z.boolean().optional(),
+        localPath: z.string().optional(),
       }),
     },
     async (args) => {

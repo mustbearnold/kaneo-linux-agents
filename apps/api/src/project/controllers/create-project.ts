@@ -13,6 +13,8 @@ async function createProject(
   name: string,
   icon: string,
   slug: string,
+  description?: string,
+  localPath?: string,
 ) {
   return db.transaction(async (tx) => {
     const [createdProject] = await tx
@@ -22,6 +24,8 @@ async function createProject(
         name,
         icon,
         slug,
+        description: description?.trim() || null,
+        localPath: localPath?.trim() || null,
       })
       .returning();
 

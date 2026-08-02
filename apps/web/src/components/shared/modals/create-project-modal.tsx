@@ -1,5 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
+import { FolderOpen } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -23,11 +24,13 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { Textarea } from "@/components/ui/textarea";
 import icons from "@/constants/project-icons";
 import useCreateProject from "@/hooks/mutations/project/use-create-project";
 import useActiveWorkspace from "@/hooks/queries/workspace/use-active-workspace";
 import { cn } from "@/lib/cn";
 import generateProjectSlug from "@/lib/generate-project-id";
+import { pickProjectFolder } from "@/lib/tauri";
 import { toast } from "@/lib/toast";
 
 type CreateProjectModalProps = {
@@ -38,10 +41,13 @@ type CreateProjectModalProps = {
 function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
   const { t } = useTranslation();
   const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [localPath, setLocalPath] = useState("");
   const [slug, setSlug] = useState("");
   const [selectedIcon, setSelectedIcon] = useState("Layout");
   const [iconPopoverOpen, setIconPopoverOpen] = useState(false);
   const [iconSearch, setIconSearch] = useState("");
+  const [isPickingFolder, setIsPickingFolder] = useState(false);
   const queryClient = useQueryClient();
   const { data: workspace } = useActiveWorkspace();
   const { mutateAsync } = useCreateProject({
@@ -49,6 +55,8 @@ function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
     slug,
     workspaceId: workspace?.id ?? "",
     icon: selectedIcon,
+    description,
+    localPath,
   });
   const SelectedIcon =
     icons[selectedIcon as keyof typeof icons] || icons.Layout;
@@ -59,16 +67,35 @@ function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
 
   const handleClose = () => {
     setName("");
+    setDescription("");
+    setLocalPath("");
     setSlug("");
     setSelectedIcon("Layout");
     setIconPopoverOpen(false);
     setIconSearch("");
+    setIsPickingFolder(false);
     onClose();
+  };
+
+  const handlePickFolder = async () => {
+    setIsPickingFolder(true);
+    try {
+      const selected = await pickProjectFolder();
+      if (selected) setLocalPath(selected);
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Couldn't open the local folder picker.",
+      );
+    } finally {
+      setIsPickingFolder(false);
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim()) return;
+    if (!name.trim() || !localPath.trim()) return;
 
     try {
       const { id } = await mutateAsync();
@@ -101,7 +128,7 @@ function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
 
   return (
     <Dialog open={open} onOpenChange={handleClose}>
-      <DialogContent className="max-w-md" showCloseButton={false}>
+      <DialogContent className="max-w-lg" showCloseButton={false}>
         <DialogHeader className="px-3 pt-4 pb-1 gap-1.5">
           <DialogTitle className="sr-only">
             {t("common:modals.createProject.title")}
@@ -193,6 +220,51 @@ function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
               className="w-full [&_[data-slot=input]]:h-auto [&_[data-slot=input]]:px-0 [&_[data-slot=input]]:py-2 [&_[data-slot=input]]:text-2xl [&_[data-slot=input]]:leading-tight [&_[data-slot=input]]:font-semibold [&_[data-slot=input]]:tracking-tight [&_[data-slot=input]]:text-foreground [&_[data-slot=input]]:placeholder:text-muted-foreground [&_[data-slot=input]]:outline-none"
               required
             />
+
+            <label htmlFor="project-local-path" className="block space-y-1.5">
+              <span className="flex items-center gap-1.5 text-sm font-medium">
+                <FolderOpen className="size-3.5" />
+                Local project folder
+              </span>
+              <div className="flex items-center gap-2">
+                <Input
+                  id="project-local-path"
+                  value={localPath}
+                  onChange={(event) => setLocalPath(event.target.value)}
+                  placeholder="/home/you/Projects/your-repository"
+                  required
+                  className="min-w-0 flex-1"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void handlePickFolder()}
+                  disabled={isPickingFolder}
+                >
+                  {isPickingFolder ? "Opening…" : "Browse"}
+                </Button>
+              </div>
+              <span className="block text-xs text-muted-foreground">
+                Agents will use this folder as the project working directory.
+              </span>
+            </label>
+
+            <label htmlFor="project-description" className="block space-y-1.5">
+              <span className="text-sm font-medium">
+                Description{" "}
+                <span className="font-normal text-muted-foreground">
+                  (optional)
+                </span>
+              </span>
+              <Textarea
+                id="project-description"
+                value={description}
+                onChange={(event) => setDescription(event.target.value)}
+                placeholder="What is this project about?"
+                className="min-h-20"
+              />
+            </label>
           </div>
 
           <div className="space-y-3 px-3">
@@ -231,7 +303,7 @@ function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
             </Button>
             <Button
               type="submit"
-              disabled={!name.trim() || !slug.trim()}
+              disabled={!name.trim() || !slug.trim() || !localPath.trim()}
               size="sm"
               className="bg-primary hover:bg-primary/90  disabled:opacity-50"
             >

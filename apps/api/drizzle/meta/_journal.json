@@ -253,6 +253,13 @@
 			"when": 1785258280966,
 			"tag": "0035_swift_captain_cross",
 			"breakpoints": true
+		},
+		{
+			"idx": 36,
+			"version": "7",
+			"when": 1785704644523,
+			"tag": "0036_tan_omega_flight",
+			"breakpoints": true
 		}
 	]
 }

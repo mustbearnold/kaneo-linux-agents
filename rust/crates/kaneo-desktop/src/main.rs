@@ -181,6 +181,45 @@ fn wait_for_web_server(port: &str) {
     eprintln!("[kaneo-rust-desktop] web server did not become ready on port {port}");
 }
 
+#[tauri::command]
+fn pick_project_folder() -> Result<Option<String>, String> {
+    let start = env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("/"))
+        .display()
+        .to_string();
+    for (program, args) in [
+        (
+            "kdialog",
+            vec![
+                "--getexistingdirectory".to_string(),
+                start.clone(),
+                "--title".to_string(),
+                "Select a Kaneo project folder".to_string(),
+            ],
+        ),
+        (
+            "zenity",
+            vec![
+                "--file-selection".to_string(),
+                "--directory".to_string(),
+                "--title=Select a Kaneo project folder".to_string(),
+            ],
+        ),
+    ] {
+        let output = match Command::new(program).args(&args).output() {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("Could not open the folder picker: {error}")),
+        };
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok((!selected.is_empty()).then_some(selected));
+    }
+    Err("No native folder picker is installed (tried kdialog and zenity).".to_string())
+}
+
 fn create_window(app: &AppHandle) -> Result<(), String> {
     WebviewWindowBuilder::new(app, "main", WebviewUrl::External(web_url()?))
         .title("Kaneo")
@@ -194,6 +233,7 @@ fn create_window(app: &AppHandle) -> Result<(), String> {
 fn main() {
     configure_linux_webview();
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![pick_project_folder])
         .setup(|app| {
             let resource_dir = app.path().resource_dir().ok();
             load_default_environment(resource_dir.as_deref());

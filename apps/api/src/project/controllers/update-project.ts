@@ -10,6 +10,7 @@ async function updateProject(
   slug: string,
   description: string,
   isPublic: boolean,
+  localPath: string | undefined,
   workspaceId: string,
 ) {
   const [existingProject] = await db
@@ -36,6 +37,9 @@ async function updateProject(
       slug,
       description,
       isPublic,
+      ...(localPath !== undefined
+        ? { localPath: localPath.trim() || null }
+        : {}),
     })
     .where(eq(projectTable.id, id))
     .returning();

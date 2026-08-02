@@ -47,6 +47,8 @@ describe("API integration: project creation", () => {
         name: "Roadmap",
         icon: "FolderKanban",
         slug: "roadmap",
+        description: "The local delivery roadmap",
+        localPath: process.cwd(),
       }),
     });
 
@@ -59,6 +61,8 @@ describe("API integration: project creation", () => {
       name: "Roadmap",
       icon: "FolderKanban",
       slug: "roadmap",
+      description: "The local delivery roadmap",
+      localPath: process.cwd(),
     });
 
     const persistedProject = await db.query.projectTable.findFirst({

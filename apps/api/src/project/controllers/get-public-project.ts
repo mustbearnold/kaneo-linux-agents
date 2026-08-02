@@ -16,5 +16,5 @@ export async function getPublicProject(id: string) {
     });
   }
 
-  return result.data;
+  return { ...result.data, localPath: null };
 }

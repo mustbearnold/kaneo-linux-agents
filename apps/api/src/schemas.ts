@@ -16,6 +16,7 @@ export const projectSchema = v.object({
   icon: v.nullable(v.string()),
   name: v.string(),
   description: v.nullable(v.string()),
+  localPath: v.nullable(v.string()),
   createdAt: v.date(),
   isPublic: v.nullable(v.boolean()),
   archivedAt: v.nullable(v.date()),
