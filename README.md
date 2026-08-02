@@ -54,9 +54,12 @@ execute work in a selected local directory, update task status and comments,
 and stream redacted progress into a live monitor while the kanban board keeps
 receiving WebSocket updates.
 
-The Rust migration starts in [`rust/`](rust/README.md) with the bounded,
-parallel agent execution core. The TypeScript API remains the compatibility
-runtime while the rest of Kaneo is ported behind the same domain boundary.
+The Rust migration in [`rust/`](rust/README.md) now owns the bounded parallel
+agent runner, authenticated PostgreSQL board API, task mutations, board labels,
+external links, and live project WebSockets, plus a native Tauri shell.
+Packaged Linux desktop builds start the Rust API by default; the legacy
+TypeScript API remains on a private compatibility port for routes that have
+not moved yet, and can be selected explicitly with `KANEO_API_RUNTIME=node`.
 
 ## Sponsors
 

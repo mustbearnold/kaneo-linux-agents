@@ -1,0 +1,19 @@
+[package]
+name = "kaneo-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust HTTP runtime for Kaneo board, task, and autonomous-agent flows"
+
+[dependencies]
+axum.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+kaneo-core = { path = "../kaneo-core" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+uuid.workspace = true

@@ -28,6 +28,7 @@ build
 dist
 .source
 /rust/target/
+/rust/crates/kaneo-desktop/gen/
 /apps/desktop/runtime/
 
 # Debug

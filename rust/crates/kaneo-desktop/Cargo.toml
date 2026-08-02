@@ -1,0 +1,17 @@
+[package]
+name = "kaneo-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Rust/Tauri desktop shell for Kaneo"
+build = "build.rs"
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+axum.workspace = true
+tauri.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+url.workspace = true

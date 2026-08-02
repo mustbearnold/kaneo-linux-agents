@@ -880,7 +880,11 @@ const isMainModule =
   import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (isMainModule) {
-  void startServer(injectWebSocket);
+  const configuredPort = Number.parseInt(process.env.KANEO_PORT || "1337", 10);
+  void startServer(
+    injectWebSocket,
+    Number.isInteger(configuredPort) && configuredPort > 0 ? configuredPort : 1337,
+  );
 }
 
 export type AppType =

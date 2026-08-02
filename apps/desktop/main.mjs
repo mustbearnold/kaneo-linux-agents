@@ -1,19 +1,23 @@
-import { app, BrowserWindow, dialog, shell } from "electron";
-import { createServer, request } from "node:http";
-import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { createReadStream, existsSync, statSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createServer, request } from "node:http";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { app, BrowserWindow, dialog, shell } from "electron";
 
 const desktopRoot = dirname(fileURLToPath(import.meta.url));
-const apiPort = 1337;
+const apiPort = Number.parseInt(process.env.KANEO_API_PORT || "1337", 10);
 const webPort = 5173;
 const apiOrigin = `http://127.0.0.1:${apiPort}`;
 const webOrigin = `http://127.0.0.1:${webPort}`;
+const apiRuntime = (
+  process.env.KANEO_API_RUNTIME || (app.isPackaged ? "rust" : "node")
+).toLowerCase();
 
 let apiProcess;
+let legacyApiProcess;
 let webServer;
 let mainWindow;
 
@@ -59,7 +63,9 @@ async function loadEnvironment() {
       if (app.isPackaged && candidate !== userDataEnv) {
         await mkdir(app.getPath("userData"), { recursive: true });
         try {
-          await writeFile(userDataEnv, await readFile(candidate), { flag: "wx" });
+          await writeFile(userDataEnv, await readFile(candidate), {
+            flag: "wx",
+          });
         } catch {
           // Another launch may have created it first.
         }
@@ -78,7 +84,9 @@ async function loadEnvironment() {
     KANEO_CLIENT_URL: webOrigin,
     CORS_ORIGINS: webOrigin,
     AUTH_SECRET:
-      values.AUTH_SECRET || process.env.AUTH_SECRET || randomBytes(32).toString("hex"),
+      values.AUTH_SECRET ||
+      process.env.AUTH_SECRET ||
+      randomBytes(32).toString("hex"),
   };
 }
 
@@ -134,10 +142,14 @@ function startWebServer(webRoot) {
       );
       const candidate = resolve(root, `.${pathname}`);
       const relativePath = relative(root, candidate);
-      const safe = relativePath && !relativePath.startsWith("..") && !relativePath.startsWith("/");
-      const target = safe && existsSync(candidate) && !statSync(candidate).isDirectory()
-        ? candidate
-        : fallback;
+      const safe =
+        relativePath &&
+        !relativePath.startsWith("..") &&
+        !relativePath.startsWith("/");
+      const target =
+        safe && existsSync(candidate) && !statSync(candidate).isDirectory()
+          ? candidate
+          : fallback;
       response.writeHead(200, { "Content-Type": mimeType(target) });
       createReadStream(target).pipe(response);
     } catch {
@@ -150,11 +162,15 @@ function startWebServer(webRoot) {
   return webServer;
 }
 
-function startApiServer(apiEntry, environment) {
+function startApiServer(apiEntry, environment, port = apiPort) {
   const command = app.isPackaged
     ? process.execPath
     : process.env.KANEO_NODE_PATH || "node";
-  const childEnvironment = { ...environment };
+  const childEnvironment = {
+    ...environment,
+    KANEO_PORT: String(port),
+    KANEO_API_URL: `http://127.0.0.1:${port}`,
+  };
   if (app.isPackaged) childEnvironment.ELECTRON_RUN_AS_NODE = "1";
 
   apiProcess = spawn(command, [apiEntry], {
@@ -163,10 +179,40 @@ function startApiServer(apiEntry, environment) {
     stdio: ["ignore", "pipe", "pipe"],
   });
   apiProcess.stdout.on("data", (chunk) => console.log(`[kaneo-api] ${chunk}`));
-  apiProcess.stderr.on("data", (chunk) => console.error(`[kaneo-api] ${chunk}`));
+  apiProcess.stderr.on("data", (chunk) =>
+    console.error(`[kaneo-api] ${chunk}`),
+  );
   apiProcess.on("exit", (code, signal) => {
     if (!app.isQuitting && code !== 0) {
-      console.error(`Kaneo API exited with code ${code ?? "?"} (${signal ?? "no signal"})`);
+      console.error(
+        `Kaneo API exited with code ${code ?? "?"} (${signal ?? "no signal"})`,
+      );
+    }
+  });
+  return apiProcess;
+}
+
+function startRustApiServer(apiEntry, environment) {
+  apiProcess = spawn(apiEntry, [], {
+    cwd: dirname(apiEntry),
+    env: {
+      ...environment,
+      KANEO_RUST_BIND: `127.0.0.1:${apiPort}`,
+      KANEO_API_URL: apiOrigin,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  apiProcess.stdout.on("data", (chunk) =>
+    console.log(`[kaneo-rust-api] ${chunk}`),
+  );
+  apiProcess.stderr.on("data", (chunk) =>
+    console.error(`[kaneo-rust-api] ${chunk}`),
+  );
+  apiProcess.on("exit", (code, signal) => {
+    if (!app.isQuitting && code !== 0) {
+      console.error(
+        `Kaneo Rust API exited with code ${code ?? "?"} (${signal ?? "no signal"})`,
+      );
     }
   });
   return apiProcess;
@@ -175,21 +221,59 @@ function startApiServer(apiEntry, environment) {
 async function ensureServices(environment) {
   const root = runtimeRoot();
   const apiEntry = join(root, "api/index.cjs");
+  const rustApiEntry = join(root, "rust/kaneo-api");
   const webRoot = join(root, "web");
 
-  if (!(await waitFor(`${apiOrigin}/api/health`, 1000))) {
+  if (apiRuntime === "rust") {
+    if (!(await waitFor(`${apiOrigin}/api/health`, 1000))) {
+      if (!existsSync(apiEntry)) {
+        throw new Error(
+          `The bundled compatibility API is missing at ${apiEntry}. Run the desktop runtime build first.`,
+        );
+      }
+      const legacyApiPort = apiPort + 1;
+      if (
+        !(await waitFor(`http://127.0.0.1:${legacyApiPort}/api/health`, 1000))
+      ) {
+        legacyApiProcess = startApiServer(apiEntry, environment, legacyApiPort);
+        if (!(await waitFor(`http://127.0.0.1:${legacyApiPort}/api/health`))) {
+          throw new Error(
+            "Kaneo's compatibility API did not become healthy. Check the PostgreSQL connection.",
+          );
+        }
+      }
+      if (!existsSync(rustApiEntry)) {
+        throw new Error(
+          `The bundled Rust API is missing at ${rustApiEntry}. Build the Rust desktop runtime first.`,
+        );
+      }
+      startRustApiServer(rustApiEntry, {
+        ...environment,
+        KANEO_LEGACY_API_URL: `http://127.0.0.1:${legacyApiPort}`,
+      });
+      if (!(await waitFor(`${apiOrigin}/api/health`))) {
+        throw new Error("Kaneo's Rust API did not become healthy.");
+      }
+    }
+  } else if (!(await waitFor(`${apiOrigin}/api/health`, 1000))) {
     if (!existsSync(apiEntry)) {
-      throw new Error(`The bundled API is missing at ${apiEntry}. Run the desktop runtime build first.`);
+      throw new Error(
+        `The bundled API is missing at ${apiEntry}. Run the desktop runtime build first.`,
+      );
     }
     startApiServer(apiEntry, environment);
     if (!(await waitFor(`${apiOrigin}/api/health`))) {
-      throw new Error("Kaneo's API did not become healthy. Check the PostgreSQL connection.");
+      throw new Error(
+        "Kaneo's API did not become healthy. Check the PostgreSQL connection.",
+      );
     }
   }
 
   if (!(await waitFor(webOrigin, 1000))) {
     if (!existsSync(join(webRoot, "index.html"))) {
-      throw new Error(`The bundled web app is missing at ${webRoot}. Run the desktop runtime build first.`);
+      throw new Error(
+        `The bundled web app is missing at ${webRoot}. Run the desktop runtime build first.`,
+      );
     }
     startWebServer(webRoot);
     if (!(await waitFor(webOrigin))) {
@@ -236,6 +320,8 @@ app.whenReady().then(async () => {
 app.on("before-quit", () => {
   app.isQuitting = true;
   if (apiProcess && !apiProcess.killed) apiProcess.kill("SIGTERM");
+  if (legacyApiProcess && !legacyApiProcess.killed)
+    legacyApiProcess.kill("SIGTERM");
   if (webServer) webServer.close();
 });
 

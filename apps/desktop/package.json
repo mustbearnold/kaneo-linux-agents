@@ -8,11 +8,12 @@
   "author": "Kaneo contributors",
   "desktopName": "kaneo",
   "scripts": {
+    "build:rust": "cargo build --manifest-path ../../rust/Cargo.toml --release -p kaneo-api -p kaneo-desktop",
     "prepare:runtime": "VITE_API_URL=http://127.0.0.1:1337 VITE_CLIENT_URL=http://127.0.0.1:5173 VITE_TURNSTILE_SITE_KEY= pnpm --filter @kaneo/web build && node scripts/prepare-runtime.mjs",
     "start": "pnpm prepare:runtime && electron .",
-    "package": "pnpm prepare:runtime && electron-builder --linux",
-    "package:dir": "pnpm prepare:runtime && electron-builder --linux dir",
-    "package:appimage": "pnpm prepare:runtime && electron-builder --linux AppImage"
+    "package": "pnpm build:rust && pnpm prepare:runtime && electron-builder --linux",
+    "package:dir": "pnpm build:rust && pnpm prepare:runtime && electron-builder --linux dir",
+    "package:appimage": "pnpm build:rust && pnpm prepare:runtime && electron-builder --linux AppImage"
   },
   "devDependencies": {
     "electron": "43.2.0",

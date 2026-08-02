@@ -1,8 +1,16 @@
-import { build } from "esbuild";
-import { cp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  cp,
+  mkdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { builtinModules } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { build } from "esbuild";
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(desktopRoot, "../..");
@@ -10,6 +18,8 @@ const runtimeRoot = join(desktopRoot, "runtime");
 const webDist = join(repoRoot, "apps/web/dist");
 const drizzleDir = join(repoRoot, "apps/api/drizzle");
 const apiSource = join(repoRoot, "apps/api/src/index.ts");
+const rustApiSource = join(repoRoot, "rust/target/release/kaneo-api");
+const rustDesktopSource = join(repoRoot, "rust/target/release/kaneo-desktop");
 
 async function mustExist(path, label) {
   try {
@@ -28,6 +38,31 @@ await mkdir(join(runtimeRoot, "api"), { recursive: true });
 
 await cp(webDist, join(runtimeRoot, "web"), { recursive: true });
 await cp(drizzleDir, join(runtimeRoot, "drizzle"), { recursive: true });
+
+try {
+  await stat(rustApiSource);
+  const rustRuntimeDir = join(runtimeRoot, "rust");
+  await mkdir(rustRuntimeDir, { recursive: true });
+  const rustApiTarget = join(rustRuntimeDir, "kaneo-api");
+  await cp(rustApiSource, rustApiTarget);
+  await chmod(rustApiTarget, 0o755);
+  console.log(`Rust API runtime copied to ${rustApiTarget}`);
+  try {
+    await stat(rustDesktopSource);
+    const rustDesktopTarget = join(rustRuntimeDir, "kaneo-desktop");
+    await cp(rustDesktopSource, rustDesktopTarget);
+    await chmod(rustDesktopTarget, 0o755);
+    console.log(`Rust desktop runtime copied to ${rustDesktopTarget}`);
+  } catch {
+    console.warn(
+      `Rust desktop binary not found at ${rustDesktopSource}; the Rust API runtime is still available.`,
+    );
+  }
+} catch {
+  console.warn(
+    `Rust API binary not found at ${rustApiSource}; packaging the compatibility runtime only.`,
+  );
+}
 
 const nodeBuiltins = [
   ...builtinModules,
