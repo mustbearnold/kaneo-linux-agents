@@ -293,6 +293,76 @@ struct UpdateTimeEntryInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct CreateProjectInput {
+    name: String,
+    workspace_id: String,
+    icon: String,
+    slug: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateProjectInput {
+    name: String,
+    icon: String,
+    slug: String,
+    description: String,
+    is_public: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateColumnInput {
+    name: String,
+    icon: Option<String>,
+    color: Option<String>,
+    is_final: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ColumnPositionInput {
+    id: String,
+    position: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReorderColumnsInput {
+    columns: Vec<ColumnPositionInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateColumnInput {
+    name: Option<String>,
+    icon: Option<Option<String>>,
+    color: Option<Option<String>>,
+    is_final: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateLabelInput {
+    name: String,
+    color: String,
+    workspace_id: String,
+    task_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateLabelInput {
+    name: String,
+    color: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttachLabelInput {
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StartAgentInput {
     project_id: String,
     prompt: String,
@@ -1046,6 +1116,787 @@ async fn rust_status(State(state): State<AppState>) -> Json<Value> {
         "agentRunner": "kaneo-core",
         "websocket": true,
     }))
+}
+
+async fn project_record(
+    state: &AppState,
+    project_id: &str,
+    workspace_id: &str,
+) -> Result<Value, ApiError> {
+    let row = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT p.id, p.workspace_id, p.slug, p.icon, p.name, p.description,
+                     to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+                     COALESCE(p.is_public, FALSE) AS is_public,
+                     to_char(p.archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS archived_at
+              FROM project p
+              WHERE p.id = $1 AND p.workspace_id = $2
+              LIMIT 1
+            "#,
+            &[&project_id, &workspace_id],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Project not found"))?;
+    Ok(json!({
+        "id": row_string(&row, "id")?,
+        "workspaceId": row_string(&row, "workspace_id")?,
+        "slug": row_string(&row, "slug")?,
+        "icon": row_optional_string(&row, "icon")?,
+        "name": row_string(&row, "name")?,
+        "description": row_optional_string(&row, "description")?,
+        "createdAt": row_string(&row, "created_at")?,
+        "isPublic": row.try_get::<_, bool>("is_public").map_err(database_error)?,
+        "archivedAt": row_optional_string(&row, "archived_at")?,
+    }))
+}
+
+async fn create_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateProjectInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace(&state, &auth, &input.workspace_id).await?;
+    let id = Uuid::new_v4().to_string();
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO project
+                (id, workspace_id, slug, icon, name, description, is_public, last_task_number)
+              VALUES ($1, $2, $3, $4, $5, NULL, FALSE, 0)
+            "#,
+            &[
+                &id,
+                &input.workspace_id,
+                &input.slug,
+                &input.icon,
+                &input.name,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    for (name, slug, position, is_final) in [
+        ("To Do", "to-do", 0_i32, false),
+        ("In Progress", "in-progress", 1_i32, false),
+        ("In Review", "in-review", 2_i32, false),
+        ("Done", "done", 3_i32, true),
+    ] {
+        let column_id = Uuid::new_v4().to_string();
+        state
+            .database
+            .client
+            .execute(
+                r#"
+                  INSERT INTO "column"
+                    (id, project_id, name, slug, position, icon, color, is_final, created_at, updated_at)
+                  VALUES ($1, $2, $3, $4, $5, NULL, NULL, $6, NOW(), NOW())
+                "#,
+                &[&column_id, &id, &name, &slug, &position, &is_final],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+    Ok(Json(
+        project_record(&state, &id, &input.workspace_id).await?,
+    ))
+}
+
+async fn update_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateProjectInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, workspace_id) = auth_for_project(&state, &headers, &id).await?;
+    let updated = state
+        .database
+        .client
+        .execute(
+            r#"
+              UPDATE project
+              SET name = $1, icon = $2, slug = $3, description = $4,
+                  is_public = $5
+              WHERE id = $6 AND workspace_id = $7
+            "#,
+            &[
+                &input.name,
+                &input.icon,
+                &input.slug,
+                &input.description,
+                &input.is_public,
+                &id,
+                &workspace_id,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    if updated == 0 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "Project not found"));
+    }
+    Ok(Json(project_record(&state, &id, &workspace_id).await?))
+}
+
+async fn archive_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, workspace_id) = auth_for_project(&state, &headers, &id).await?;
+    let updated = state
+        .database
+        .client
+        .execute(
+            "UPDATE project SET archived_at = NOW() WHERE id = $1 AND workspace_id = $2",
+            &[&id, &workspace_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if updated == 0 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "Project not found"));
+    }
+    Ok(Json(project_record(&state, &id, &workspace_id).await?))
+}
+
+async fn unarchive_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, workspace_id) = auth_for_project(&state, &headers, &id).await?;
+    let updated = state
+        .database
+        .client
+        .execute(
+            "UPDATE project SET archived_at = NULL WHERE id = $1 AND workspace_id = $2",
+            &[&id, &workspace_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if updated == 0 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "Project not found"));
+    }
+    Ok(Json(project_record(&state, &id, &workspace_id).await?))
+}
+
+async fn delete_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, workspace_id) = auth_for_project(&state, &headers, &id).await?;
+    let existing = project_record(&state, &id, &workspace_id).await?;
+    let deleted = state
+        .database
+        .client
+        .execute(
+            "DELETE FROM project WHERE id = $1 AND workspace_id = $2",
+            &[&id, &workspace_id],
+        )
+        .await
+        .map_err(database_error)?;
+    if deleted == 0 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "Project not found"));
+    }
+    Ok(Json(existing))
+}
+
+fn column_slug(name: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for character in name.trim().chars() {
+        for lower in character.to_lowercase() {
+            if lower.is_alphanumeric() {
+                slug.push(lower);
+                previous_dash = false;
+            } else if !slug.is_empty() && !previous_dash {
+                slug.push('-');
+                previous_dash = true;
+            }
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
+}
+
+fn column_from_row(row: &Row) -> Result<Value, ApiError> {
+    Ok(json!({
+        "id": row_string(row, "id")?,
+        "projectId": row_string(row, "project_id")?,
+        "name": row_string(row, "name")?,
+        "slug": row_string(row, "slug")?,
+        "position": row.try_get::<_, i32>("position").map_err(database_error)?,
+        "icon": row_optional_string(row, "icon")?,
+        "color": row_optional_string(row, "color")?,
+        "isFinal": row.try_get::<_, bool>("is_final").map_err(database_error)?,
+        "createdAt": row_string(row, "created_at")?,
+        "updatedAt": row_string(row, "updated_at")?,
+    }))
+}
+
+const COLUMN_SELECT_SQL: &str = r#"
+    SELECT id, project_id, name, slug, position, icon, color, is_final,
+           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+           to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+    FROM "column"
+"#;
+
+async fn column_by_id(state: &AppState, column_id: &str) -> Result<Value, ApiError> {
+    let row = state
+        .database
+        .client
+        .query_opt(
+            &format!("{COLUMN_SELECT_SQL} WHERE id = $1 LIMIT 1"),
+            &[&column_id],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Column not found"))?;
+    column_from_row(&row)
+}
+
+async fn column_context(state: &AppState, column_id: &str) -> Result<String, ApiError> {
+    state
+        .database
+        .client
+        .query_opt(
+            "SELECT project_id FROM \"column\" WHERE id = $1 LIMIT 1",
+            &[&column_id],
+        )
+        .await
+        .map_err(database_error)?
+        .map(|row| row_string(&row, "project_id"))
+        .transpose()?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Column not found"))
+}
+
+async fn create_column(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<CreateColumnInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (auth, _) = auth_for_project(&state, &headers, &project_id).await?;
+    let slug = column_slug(&input.name);
+    if slug.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Column name must contain at least one alphanumeric character",
+        ));
+    }
+    if matches!(slug.as_str(), "planned" | "archived") {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!("Column slug \"{slug}\" is reserved for virtual task statuses"),
+        ));
+    }
+    let duplicate = state
+        .database
+        .client
+        .query_opt(
+            "SELECT id FROM \"column\" WHERE project_id = $1 AND slug = $2 LIMIT 1",
+            &[&project_id, &slug],
+        )
+        .await
+        .map_err(database_error)?;
+    if duplicate.is_some() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!("Column with slug \"{slug}\" already exists in this project"),
+        ));
+    }
+    let position: i32 = state
+        .database
+        .client
+        .query_one(
+            "SELECT COALESCE(MAX(position), -1) + 1 AS position FROM \"column\" WHERE project_id = $1",
+            &[&project_id],
+        )
+        .await
+        .map_err(database_error)?
+        .try_get("position")
+        .map_err(database_error)?;
+    let id = Uuid::new_v4().to_string();
+    let icon = input.icon.unwrap_or_default();
+    let color = input.color.unwrap_or_default();
+    let is_final = input.is_final.unwrap_or(false);
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO "column"
+                (id, project_id, name, slug, position, icon, color, is_final, created_at, updated_at)
+              VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($7, ''), $8, NOW(), NOW())
+            "#,
+            &[
+                &id,
+                &project_id,
+                &input.name,
+                &slug,
+                &position,
+                &icon,
+                &color,
+                &is_final,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    publish_task_event(
+        &state,
+        "TASK_UPDATED",
+        project_id.clone(),
+        id.clone(),
+        &auth,
+        &headers,
+    );
+    Ok(Json(column_by_id(&state, &id).await?))
+}
+
+async fn reorder_columns(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<ReorderColumnsInput>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    let _ = auth_for_project(&state, &headers, &project_id).await?;
+    for column in input.columns {
+        let updated = state
+            .database
+            .client
+            .execute(
+                "UPDATE \"column\" SET position = $1, updated_at = NOW() WHERE id = $2 AND project_id = $3",
+                &[&column.position, &column.id, &project_id],
+            )
+            .await
+            .map_err(database_error)?;
+        if updated == 0 {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("Column {} does not belong to this project", column.id),
+            ));
+        }
+    }
+    let rows = state
+        .database
+        .client
+        .query(
+            &format!("{COLUMN_SELECT_SQL} WHERE project_id = $1 ORDER BY position ASC"),
+            &[&project_id],
+        )
+        .await
+        .map_err(database_error)?;
+    let columns = rows
+        .iter()
+        .map(column_from_row)
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(Json(columns))
+}
+
+async fn update_column(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateColumnInput>,
+) -> Result<Json<Value>, ApiError> {
+    let project_id = column_context(&state, &id).await?;
+    let (auth, _) = auth_for_project(&state, &headers, &project_id).await?;
+    let existing = state
+        .database
+        .client
+        .query_one(
+            "SELECT name, icon, color, is_final FROM \"column\" WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .map_err(database_error)?;
+    let name = input.name.unwrap_or(row_string(&existing, "name")?);
+    let icon = input
+        .icon
+        .unwrap_or(row_optional_string(&existing, "icon")?);
+    let color = input
+        .color
+        .unwrap_or(row_optional_string(&existing, "color")?);
+    let is_final = input
+        .is_final
+        .unwrap_or(existing.try_get("is_final").map_err(database_error)?);
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE \"column\" SET name = $1, icon = $2, color = $3, is_final = $4, updated_at = NOW() WHERE id = $5",
+            &[&name, &icon, &color, &is_final, &id],
+        )
+        .await
+        .map_err(database_error)?;
+    publish_task_event(
+        &state,
+        "TASK_UPDATED",
+        project_id,
+        id.clone(),
+        &auth,
+        &headers,
+    );
+    Ok(Json(column_by_id(&state, &id).await?))
+}
+
+async fn delete_column(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let project_id = column_context(&state, &id).await?;
+    let (auth, _) = auth_for_project(&state, &headers, &project_id).await?;
+    let existing = column_by_id(&state, &id).await?;
+    let task_count: i64 = state
+        .database
+        .client
+        .query_one(
+            "SELECT COUNT(*)::bigint AS count FROM task WHERE column_id = $1",
+            &[&id],
+        )
+        .await
+        .map_err(database_error)?
+        .try_get("count")
+        .map_err(database_error)?;
+    if task_count > 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "Cannot delete column that contains tasks. Move or delete tasks first.",
+        ));
+    }
+    state
+        .database
+        .client
+        .execute("DELETE FROM \"column\" WHERE id = $1", &[&id])
+        .await
+        .map_err(database_error)?;
+    publish_task_event(&state, "TASK_UPDATED", project_id, id, &auth, &headers);
+    Ok(Json(existing))
+}
+
+fn label_from_row(row: &Row) -> Result<Value, ApiError> {
+    Ok(json!({
+        "id": row_string(row, "id")?,
+        "name": row_string(row, "name")?,
+        "color": row_string(row, "color")?,
+        "createdAt": row_string(row, "created_at")?,
+        "updatedAt": row_string(row, "updated_at")?,
+        "taskId": row_optional_string(row, "task_id")?,
+        "workspaceId": row_optional_string(row, "workspace_id")?,
+    }))
+}
+
+const LABEL_SELECT_SQL: &str = r#"
+    SELECT id, name, color,
+           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+           to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+           task_id, workspace_id
+    FROM label
+"#;
+
+async fn label_by_id(state: &AppState, label_id: &str) -> Result<Value, ApiError> {
+    let row = state
+        .database
+        .client
+        .query_opt(
+            &format!("{LABEL_SELECT_SQL} WHERE id = $1 LIMIT 1"),
+            &[&label_id],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Label not found"))?;
+    label_from_row(&row)
+}
+
+async fn label_context(
+    state: &AppState,
+    label_id: &str,
+) -> Result<(String, Option<String>, String), ApiError> {
+    let row = state
+        .database
+        .client
+        .query_opt(
+            r#"
+              SELECT l.task_id, COALESCE(l.workspace_id, p.workspace_id) AS workspace_id
+              FROM label l
+              LEFT JOIN task t ON t.id = l.task_id
+              LEFT JOIN project p ON p.id = t.project_id
+              WHERE l.id = $1
+              LIMIT 1
+            "#,
+            &[&label_id],
+        )
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Label not found"))?;
+    Ok((
+        row_string(&row, "workspace_id")?,
+        row_optional_string(&row, "task_id")?,
+        label_id.to_string(),
+    ))
+}
+
+async fn create_label(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateLabelInput>,
+) -> Result<Json<Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace(&state, &auth, &input.workspace_id).await?;
+    let workspace_id = if let Some(task_id) = input.task_id.as_deref() {
+        let task_workspace_id = task_workspace(&state.database, task_id).await?;
+        if task_workspace_id != input.workspace_id {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "Task not found"));
+        }
+        task_workspace_id
+    } else {
+        input.workspace_id.clone()
+    };
+    let existing = if let Some(task_id) = input.task_id.as_deref() {
+        state
+            .database
+            .client
+            .query_opt(
+                "SELECT id FROM label WHERE task_id = $1 AND name = $2 LIMIT 1",
+                &[&task_id, &input.name],
+            )
+            .await
+            .map_err(database_error)?
+    } else {
+        state
+            .database
+            .client
+            .query_opt(
+                "SELECT id FROM label WHERE workspace_id = $1 AND name = $2 AND task_id IS NULL LIMIT 1",
+                &[&workspace_id, &input.name],
+            )
+            .await
+            .map_err(database_error)?
+    };
+    if let Some(existing) = existing {
+        return Ok(Json(
+            label_by_id(&state, &row_string(&existing, "id")?).await?,
+        ));
+    }
+    let id = Uuid::new_v4().to_string();
+    state
+        .database
+        .client
+        .execute(
+            r#"
+              INSERT INTO label
+                (id, name, color, created_at, updated_at, task_id, workspace_id)
+              VALUES ($1, $2, $3, NOW(), NOW(), $4, $5)
+            "#,
+            &[
+                &id,
+                &input.name,
+                &input.color,
+                &input.task_id,
+                &workspace_id,
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    if let Some(task_id) = input.task_id {
+        let task = task_by_id(&state.database, &task_id).await?;
+        publish_task_event(
+            &state,
+            "TASK_LABEL_UPDATED",
+            task.project_id,
+            task_id,
+            &auth,
+            &headers,
+        );
+    }
+    Ok(Json(label_by_id(&state, &id).await?))
+}
+
+async fn get_label(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (workspace_id, _, _) = label_context(&state, &id).await?;
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace(&state, &auth, &workspace_id).await?;
+    Ok(Json(label_by_id(&state, &id).await?))
+}
+
+async fn update_label(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateLabelInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (workspace_id, task_id, _) = label_context(&state, &id).await?;
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace(&state, &auth, &workspace_id).await?;
+    let existing = state
+        .database
+        .client
+        .query_one("SELECT name FROM label WHERE id = $1", &[&id])
+        .await
+        .map_err(database_error)?;
+    let previous_name = row_string(&existing, "name")?;
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE label SET name = $1, color = $2, updated_at = NOW() WHERE id = $3",
+            &[&input.name, &input.color, &id],
+        )
+        .await
+        .map_err(database_error)?;
+    if task_id.is_none() {
+        state
+            .database
+            .client
+            .execute(
+                "UPDATE label SET name = $1, color = $2, updated_at = NOW() WHERE workspace_id = $3 AND name = $4 AND task_id IS NOT NULL",
+                &[&input.name, &input.color, &workspace_id, &previous_name],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+    if let Some(task_id) = task_id {
+        let task = task_by_id(&state.database, &task_id).await?;
+        publish_task_event(
+            &state,
+            "TASK_LABEL_UPDATED",
+            task.project_id,
+            task_id,
+            &auth,
+            &headers,
+        );
+    }
+    Ok(Json(label_by_id(&state, &id).await?))
+}
+
+async fn assign_label_to_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<AttachLabelInput>,
+) -> Result<Json<Value>, ApiError> {
+    let (workspace_id, _, _) = label_context(&state, &id).await?;
+    let (auth, _) = auth_for_task(&state, &headers, &input.task_id).await?;
+    let target_workspace = task_workspace(&state.database, &input.task_id).await?;
+    if target_workspace != workspace_id {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Label and task must belong to the same workspace",
+        ));
+    }
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE label SET task_id = $1, updated_at = NOW() WHERE id = $2",
+            &[&input.task_id, &id],
+        )
+        .await
+        .map_err(database_error)?;
+    let task = task_by_id(&state.database, &input.task_id).await?;
+    publish_task_event(
+        &state,
+        "TASK_LABEL_UPDATED",
+        task.project_id,
+        input.task_id,
+        &auth,
+        &headers,
+    );
+    Ok(Json(label_by_id(&state, &id).await?))
+}
+
+async fn unassign_label_from_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (workspace_id, task_id, _) = label_context(&state, &id).await?;
+    let Some(task_id) = task_id else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Label is not assigned to a task",
+        ));
+    };
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace(&state, &auth, &workspace_id).await?;
+    state
+        .database
+        .client
+        .execute(
+            "UPDATE label SET task_id = NULL, updated_at = NOW() WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .map_err(database_error)?;
+    let task = task_by_id(&state.database, &task_id).await?;
+    publish_task_event(
+        &state,
+        "TASK_LABEL_UPDATED",
+        task.project_id,
+        task_id,
+        &auth,
+        &headers,
+    );
+    Ok(Json(label_by_id(&state, &id).await?))
+}
+
+async fn delete_label(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let (workspace_id, task_id, _) = label_context(&state, &id).await?;
+    let auth = authenticate(&state, &headers).await?;
+    require_workspace(&state, &auth, &workspace_id).await?;
+    let existing = label_by_id(&state, &id).await?;
+    if let Some(task_id) = task_id {
+        state
+            .database
+            .client
+            .execute("DELETE FROM label WHERE id = $1", &[&id])
+            .await
+            .map_err(database_error)?;
+        let task = task_by_id(&state.database, &task_id).await?;
+        publish_task_event(
+            &state,
+            "TASK_LABEL_UPDATED",
+            task.project_id,
+            task_id,
+            &auth,
+            &headers,
+        );
+    } else {
+        let name: String = state
+            .database
+            .client
+            .query_one("SELECT name FROM label WHERE id = $1", &[&id])
+            .await
+            .map_err(database_error)?
+            .try_get("name")
+            .map_err(database_error)?;
+        state
+            .database
+            .client
+            .execute(
+                "DELETE FROM label WHERE workspace_id = $1 AND name = $2",
+                &[&workspace_id, &name],
+            )
+            .await
+            .map_err(database_error)?;
+    }
+    Ok(Json(existing))
 }
 
 async fn list_projects(
@@ -4102,6 +4953,15 @@ fn app(state: AppState) -> Router {
             get(list_workspace_labels),
         )
         .route(
+            "/api/label/{id}",
+            get(get_label).put(update_label).delete(delete_label),
+        )
+        .route(
+            "/api/label/{id}/task",
+            put(assign_label_to_task).delete(unassign_label_from_task),
+        )
+        .route("/api/label", post(create_label))
+        .route(
             "/api/external-link/task/{task_id}",
             get(list_external_links),
         )
@@ -4132,9 +4992,21 @@ fn app(state: AppState) -> Router {
             "/api/time-entry/{id}",
             get(get_time_entry).put(update_time_entry),
         )
-        .route("/api/project", get(list_projects))
-        .route("/api/project/{id}", get(get_project))
-        .route("/api/column/{project_id}", get(list_columns))
+        .route("/api/project", get(list_projects).post(create_project))
+        .route(
+            "/api/project/{id}",
+            get(get_project).put(update_project).delete(delete_project),
+        )
+        .route("/api/project/{id}/archive", put(archive_project))
+        .route("/api/project/{id}/unarchive", put(unarchive_project))
+        .route(
+            "/api/column/{id}",
+            get(list_columns)
+                .post(create_column)
+                .put(update_column)
+                .delete(delete_column),
+        )
+        .route("/api/column/reorder/{project_id}", put(reorder_columns))
         .route("/api/task/tasks/{project_id}", get(list_tasks))
         .route(
             "/api/task/{id}",

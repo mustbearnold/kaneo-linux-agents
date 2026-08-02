@@ -5,13 +5,13 @@ project. It now includes the performance-sensitive agent process boundary,
 an authenticated PostgreSQL HTTP runtime for the board and task flows, and a
 Tauri desktop shell that starts the Rust API and can serve the built web app.
 
-The Rust API also owns the board's live project WebSocket, task label reads,
-external-link reads, activity and comment CRUD, task-relation CRUD, time-entry
-CRUD, organization membership and permission reads, notification inbox
-operations, pending invitations, and workspace billing state. Task, comment,
-relation, and time-entry mutations publish filtered events to connected project
-boards, so an agent changing a task is visible without waiting for a polling
-cycle.
+The Rust API also owns the board's live project WebSocket, project and column
+CRUD, label CRUD and assignment, task label reads, external-link reads,
+activity and comment CRUD, task-relation CRUD, time-entry CRUD, organization
+membership and permission reads, notification inbox operations, pending
+invitations, and workspace billing state. Task, comment, relation, label, and
+time-entry mutations publish filtered events to connected project boards, so an
+agent changing a task is visible without waiting for a polling cycle.
 
 The current TypeScript API remains a compatibility runtime while feature parity
 is built in Rust. In packaged Electron builds it runs privately on port 1338;
