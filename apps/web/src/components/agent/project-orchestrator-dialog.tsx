@@ -34,6 +34,7 @@ import {
 import { toast } from "@/lib/toast";
 import type {
   Orchestrator,
+  OrchestratorChild,
   OrchestratorStatus,
 } from "@/types/orchestrator";
 
@@ -73,6 +74,49 @@ function statusIcon(status?: OrchestratorStatus) {
     return <CheckCircle2 className="size-4 text-emerald-500" />;
   }
   return <CircleAlert className="size-4 text-amber-500" />;
+}
+
+function nestedAgentCount(orchestrator: Orchestrator): number {
+  return orchestrator.children.reduce(
+    (total, child) =>
+      total + 1 + (child.orchestrator ? nestedAgentCount(child.orchestrator) : 0),
+    0,
+  );
+}
+
+function OrchestratorChildren({
+  children,
+}: {
+  children: OrchestratorChild[];
+}) {
+  return (
+    <div className="space-y-1.5">
+      {children.map((child) => {
+        const nested = child.orchestrator;
+        return (
+          <div key={child.id} className="space-y-1.5">
+            <div className="flex items-center justify-between gap-2 rounded-md bg-muted/55 px-2 py-1.5">
+              <span className="flex min-w-0 items-center gap-1.5 truncate">
+                <Bot className="size-3 shrink-0 text-primary" />
+                <span className="truncate">
+                  {child.taskId ?? child.id.slice(0, 8)}
+                </span>
+              </span>
+              <span className="shrink-0 text-muted-foreground">
+                {nested ? statusLabel(nested.status) : child.status}
+                {child.attempt > 1 ? " · try " + child.attempt : ""}
+              </span>
+            </div>
+            {nested && nested.children.length > 0 && (
+              <div className="ml-4 border-l border-border pl-2">
+                <OrchestratorChildren children={nested.children} />
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 export default function ProjectOrchestratorDialog({
@@ -208,8 +252,8 @@ export default function ProjectOrchestratorDialog({
               Start project orchestrator
             </DialogTitle>
             <DialogDescription>
-              One parent Codex agent will split the goal across independent
-              child agents and keep their Kanban tasks coordinated.
+              A parent Codex agent will split the goal into a live nested agent
+              tree and keep the Kanban tasks coordinated.
             </DialogDescription>
           </DialogHeader>
 
@@ -336,30 +380,14 @@ export default function ProjectOrchestratorDialog({
               <div className="flex items-center justify-between text-xs text-muted-foreground">
                 <span className="flex items-center gap-1.5">
                   <Users className="size-3.5" />
-                  {orchestrator.children.length} / {orchestrator.maxChildren}{" "}
-                  child agents
+                  {nestedAgentCount(orchestrator)} agents in tree
                 </span>
                 <span>{statusLabel(orchestrator.status)}</span>
               </div>
 
               {orchestrator.children.length > 0 && (
                 <div className="max-h-32 space-y-1 overflow-y-auto rounded-md border border-border p-2 text-xs">
-                  {orchestrator.children.map((child) => (
-                    <div
-                      key={child.id}
-                      className="flex items-center justify-between gap-2"
-                    >
-                      <span className="min-w-0 truncate">
-                        {child.taskId ?? child.id.slice(0, 8)}
-                      </span>
-                      <span className="shrink-0 text-muted-foreground">
-                        {child.status}
-                        {child.attempt > 1
-                          ? " · try " + child.attempt
-                          : ""}
-                      </span>
-                    </div>
-                  ))}
+                  <OrchestratorChildren children={orchestrator.children} />
                 </div>
               )}
 

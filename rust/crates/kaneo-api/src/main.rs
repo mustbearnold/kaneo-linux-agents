@@ -41,6 +41,8 @@ use uuid::Uuid;
 
 const DEFAULT_BIND: &str = "127.0.0.1:1337";
 const DEFAULT_MAX_BODY_BYTES: usize = 20 * 1024 * 1024;
+const MAX_ORCHESTRATOR_DEPTH: usize = 8;
+const MAX_ORCHESTRATOR_RESPONSE_DEPTH: usize = 8;
 
 #[derive(Debug, Clone)]
 struct ApiError {
@@ -896,6 +898,7 @@ struct OrchestratorMessage {
 #[derive(Debug, Clone)]
 struct OrchestratorChild {
     id: String,
+    orchestrator_id: Option<String>,
     task_id: Option<String>,
     prompt: String,
     cwd: PathBuf,
@@ -914,6 +917,9 @@ struct OrchestratorChild {
 #[derive(Debug, Clone)]
 struct OrchestratorRecord {
     id: String,
+    parent_orchestrator_id: Option<String>,
+    parent_child_id: Option<String>,
+    depth: usize,
     workspace_id: String,
     project_id: String,
     credential: String,
@@ -1102,6 +1108,7 @@ struct OrchestratorMessageInput {
 #[serde(rename_all = "camelCase")]
 struct OrchestratorChildResponse {
     id: String,
+    orchestrator_id: Option<String>,
     task_id: Option<String>,
     prompt: String,
     cwd: String,
@@ -1116,12 +1123,16 @@ struct OrchestratorChildResponse {
     created_at: String,
     updated_at: String,
     run: Option<AgentRunResponse>,
+    orchestrator: Option<Box<OrchestratorResponse>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct OrchestratorResponse {
     id: String,
+    parent_orchestrator_id: Option<String>,
+    parent_child_id: Option<String>,
+    depth: usize,
     workspace_id: String,
     project_id: String,
     goal: String,
@@ -16577,7 +16588,11 @@ fn append_orchestrator_message(record: &mut OrchestratorRecord, role: &str, text
     }
 }
 
-fn refresh_orchestrator_status(record: &mut OrchestratorRecord, runner: &RunManager) {
+fn refresh_orchestrator_status(
+    record: &mut OrchestratorRecord,
+    runner: &RunManager,
+    nested_statuses: &HashMap<String, OrchestratorStatus>,
+) {
     if record.cancel_requested {
         record.status = OrchestratorStatus::Cancelled;
         return;
@@ -16603,6 +16618,21 @@ fn refresh_orchestrator_status(record: &mut OrchestratorRecord, runner: &RunMana
         } else if child.status.is_active() {
             child_active = true;
         }
+        if let Some(status) = child
+            .orchestrator_id
+            .as_ref()
+            .and_then(|id| nested_statuses.get(id))
+        {
+            match status {
+                OrchestratorStatus::Queued | OrchestratorStatus::Running => {
+                    child_active = true;
+                }
+                OrchestratorStatus::Failed | OrchestratorStatus::Cancelled => {
+                    child_failed = true;
+                }
+                OrchestratorStatus::Waiting => {}
+            }
+        }
     }
 
     if parent_active || child_active {
@@ -16614,52 +16644,119 @@ fn refresh_orchestrator_status(record: &mut OrchestratorRecord, runner: &RunMana
     }
 }
 
-fn orchestrator_response(record: &OrchestratorRecord, runner: &RunManager) -> OrchestratorResponse {
-    OrchestratorResponse {
-        id: record.id.clone(),
-        workspace_id: record.workspace_id.clone(),
-        project_id: record.project_id.clone(),
-        goal: record.goal.clone(),
-        cwd: record.cwd.display().to_string(),
-        model: record.model.clone(),
-        network_access: record.network_access,
-        max_children: record.max_children,
-        max_retries: record.max_retries,
-        max_seconds: record.max_seconds,
-        status: record.status,
-        created_at: record.created_at.clone(),
-        updated_at: record.updated_at.clone(),
-        active_turn_id: record.active_turn_id.clone(),
-        error: record.error.clone(),
-        messages: record.messages.clone(),
-        children: record
-            .children
-            .iter()
-            .map(|child| {
-                let run = runner.get(&child.run_id);
-                OrchestratorChildResponse {
-                    id: child.id.clone(),
-                    task_id: child.task_id.clone(),
-                    prompt: child.prompt.clone(),
-                    cwd: child.cwd.display().to_string(),
-                    model: child.model.clone(),
-                    network_access: child.network_access,
-                    max_seconds: child.max_seconds,
-                    attempt: child.attempt,
-                    max_retries: child.max_retries,
-                    run_id: child.run_id.clone(),
-                    status: run.as_ref().map_or(child.status, |run| run.status),
-                    error: run
-                        .as_ref()
-                        .and_then(|run| run.error.clone())
-                        .or_else(|| child.error.clone()),
-                    created_at: child.created_at.clone(),
-                    updated_at: child.updated_at.clone(),
-                    run: run.map(agent_response),
-                }
+fn refresh_orchestrator_tree(
+    records: &mut HashMap<String, OrchestratorRecord>,
+    orchestrator_id: &str,
+    runner: &RunManager,
+) {
+    fn visit(
+        records: &mut HashMap<String, OrchestratorRecord>,
+        orchestrator_id: &str,
+        runner: &RunManager,
+        visiting: &mut HashSet<String>,
+    ) {
+        if !visiting.insert(orchestrator_id.to_string()) {
+            return;
+        }
+        let nested_ids = records
+            .get(orchestrator_id)
+            .map(|record| {
+                record
+                    .children
+                    .iter()
+                    .filter_map(|child| child.orchestrator_id.clone())
+                    .collect::<Vec<_>>()
             })
-            .collect(),
+            .unwrap_or_default();
+        for nested_id in &nested_ids {
+            visit(records, nested_id, runner, visiting);
+        }
+        let nested_statuses = nested_ids
+            .iter()
+            .filter_map(|id| records.get(id).map(|record| (id.clone(), record.status)))
+            .collect::<HashMap<_, _>>();
+        if let Some(record) = records.get_mut(orchestrator_id) {
+            refresh_orchestrator_status(record, runner, &nested_statuses);
+        }
+        visiting.remove(orchestrator_id);
     }
+
+    visit(records, orchestrator_id, runner, &mut HashSet::new());
+}
+
+fn orchestrator_response(
+    record: &OrchestratorRecord,
+    runner: &RunManager,
+    records: &HashMap<String, OrchestratorRecord>,
+) -> OrchestratorResponse {
+    fn at_depth(
+        record: &OrchestratorRecord,
+        runner: &RunManager,
+        records: &HashMap<String, OrchestratorRecord>,
+        depth: usize,
+    ) -> OrchestratorResponse {
+        OrchestratorResponse {
+            id: record.id.clone(),
+            parent_orchestrator_id: record.parent_orchestrator_id.clone(),
+            parent_child_id: record.parent_child_id.clone(),
+            depth: record.depth,
+            workspace_id: record.workspace_id.clone(),
+            project_id: record.project_id.clone(),
+            goal: record.goal.clone(),
+            cwd: record.cwd.display().to_string(),
+            model: record.model.clone(),
+            network_access: record.network_access,
+            max_children: record.max_children,
+            max_retries: record.max_retries,
+            max_seconds: record.max_seconds,
+            status: record.status,
+            created_at: record.created_at.clone(),
+            updated_at: record.updated_at.clone(),
+            active_turn_id: record.active_turn_id.clone(),
+            error: record.error.clone(),
+            messages: record.messages.clone(),
+            children: record
+                .children
+                .iter()
+                .map(|child| {
+                    let run = runner.get(&child.run_id);
+                    let orchestrator = if depth < MAX_ORCHESTRATOR_RESPONSE_DEPTH {
+                        child
+                            .orchestrator_id
+                            .as_ref()
+                            .and_then(|id| records.get(id))
+                            .map(|nested| Box::new(at_depth(nested, runner, records, depth + 1)))
+                    } else {
+                        None
+                    };
+                    OrchestratorChildResponse {
+                        id: child.id.clone(),
+                        orchestrator_id: child.orchestrator_id.clone(),
+                        task_id: child.task_id.clone(),
+                        prompt: child.prompt.clone(),
+                        cwd: child.cwd.display().to_string(),
+                        model: child.model.clone(),
+                        network_access: child.network_access,
+                        max_seconds: child.max_seconds,
+                        attempt: child.attempt,
+                        max_retries: child.max_retries,
+                        run_id: child.run_id.clone(),
+                        status: run.as_ref().map_or(child.status, |run| run.status),
+                        error: run
+                            .as_ref()
+                            .and_then(|run| run.error.clone())
+                            .or_else(|| child.error.clone()),
+                        created_at: child.created_at.clone(),
+                        updated_at: child.updated_at.clone(),
+                        run: run.map(agent_response),
+                        orchestrator,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    at_depth(record, runner, records, 0)
 }
 
 async fn orchestrator_snapshot(
@@ -16667,13 +16764,31 @@ async fn orchestrator_snapshot(
     orchestrator_id: &str,
 ) -> Result<OrchestratorResponse, ApiError> {
     let mut orchestrators = state.orchestrators.lock().await;
-    let record = orchestrators
+    if !orchestrators.records.contains_key(orchestrator_id) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Orchestrator not found",
+        ));
+    }
+    refresh_orchestrator_tree(
+        &mut orchestrators.records,
+        orchestrator_id,
+        &state.orchestrator_runner,
+    );
+    if let Some(record) = orchestrators.records.get_mut(orchestrator_id) {
+        record.updated_at = now_rfc3339();
+    }
+    let snapshot = orchestrators
         .records
-        .get_mut(orchestrator_id)
+        .get(orchestrator_id)
+        .cloned()
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Orchestrator not found"))?;
-    refresh_orchestrator_status(record, &state.orchestrator_runner);
-    record.updated_at = now_rfc3339();
-    Ok(orchestrator_response(record, &state.orchestrator_runner))
+    let records = orchestrators.records.clone();
+    Ok(orchestrator_response(
+        &snapshot,
+        &state.orchestrator_runner,
+        &records,
+    ))
 }
 
 fn publish_orchestrator_event(
@@ -16835,6 +16950,7 @@ fn build_orchestrator_prompt(record: &OrchestratorRecord) -> String {
 
 fn build_orchestrator_child_prompt(
     record: &OrchestratorRecord,
+    child_orchestrator_id: &str,
     task_id: Option<&str>,
     prompt: &str,
 ) -> String {
@@ -16846,11 +16962,13 @@ fn build_orchestrator_child_prompt(
         });
     [
         "You are a child delivery agent coordinated by a Kaneo orchestrator.",
-        &format!("Orchestrator ID: {}", record.id),
+        &format!("Parent orchestrator ID: {}", record.id),
+        &format!("Your child orchestrator ID: {child_orchestrator_id}"),
         &format!("Kaneo workspace ID: {}", record.workspace_id),
         &format!("Kaneo project ID: {}", record.project_id),
         &task_context,
         "Use the configured Kaneo MCP server and the supplied working directory.",
+        "You are an orchestrator for your own context. If you need parallel work, call orchestrator_delegate with your child orchestrator ID above; those agents will appear beneath you in the execution tree.",
         "Inspect the task and repository before acting. Keep the task status and comments accurate as you work.",
         "Do not delete projects, tasks, comments, labels, or relations. Run focused checks and report evidence, blockers, and changed files in your final response.",
         "",
@@ -16868,6 +16986,8 @@ fn build_orchestrator_spec(
     model: Option<String>,
     network_access: bool,
     max_seconds: u64,
+    execution_orchestrator_id: &str,
+    parent_orchestrator_id: Option<&str>,
     child_id: Option<&str>,
     task_id: Option<&str>,
 ) -> AgentSpec {
@@ -16884,7 +17004,26 @@ fn build_orchestrator_spec(
         record.workspace_id.clone(),
     );
     environment.insert("KANEO_PROJECT_ID".to_string(), record.project_id.clone());
-    environment.insert("KANEO_ORCHESTRATOR_ID".to_string(), record.id.clone());
+    environment.insert(
+        "KANEO_ORCHESTRATOR_ID".to_string(),
+        execution_orchestrator_id.to_string(),
+    );
+    let execution_depth = record.depth
+        + if parent_orchestrator_id.is_some() {
+            1
+        } else {
+            0
+        };
+    environment.insert(
+        "KANEO_ORCHESTRATOR_DEPTH".to_string(),
+        execution_depth.to_string(),
+    );
+    if let Some(parent_orchestrator_id) = parent_orchestrator_id {
+        environment.insert(
+            "KANEO_PARENT_ORCHESTRATOR_ID".to_string(),
+            parent_orchestrator_id.to_string(),
+        );
+    }
     if let Some(child_id) = child_id {
         environment.insert("KANEO_CHILD_ID".to_string(), child_id.to_string());
     }
@@ -16913,11 +17052,21 @@ async fn start_orchestrator_turn(
 ) -> Result<AgentRun, ApiError> {
     let record = {
         let mut orchestrators = state.orchestrators.lock().await;
+        if !orchestrators.records.contains_key(orchestrator_id) {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "Orchestrator not found",
+            ));
+        }
+        refresh_orchestrator_tree(
+            &mut orchestrators.records,
+            orchestrator_id,
+            &state.orchestrator_runner,
+        );
         let record = orchestrators
             .records
             .get_mut(orchestrator_id)
-            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Orchestrator not found"))?;
-        refresh_orchestrator_status(record, &state.orchestrator_runner);
+            .expect("orchestrator existence checked above");
         if record.cancel_requested {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
@@ -16961,6 +17110,8 @@ async fn start_orchestrator_turn(
         record.model.clone(),
         record.network_access,
         record.max_seconds,
+        &record.id,
+        None,
         None,
         None,
     );
@@ -17032,8 +17183,7 @@ fn spawn_orchestrator_parent_watcher(state: AppState, orchestrator_id: String, r
                 continue;
             }
             let final_text = agent_final_text(&run);
-            let mut event_record = None;
-            {
+            let event_record = {
                 let mut orchestrators = state.orchestrators.lock().await;
                 if let Some(record) = orchestrators.records.get_mut(&orchestrator_id) {
                     if record.active_turn_id.as_deref() == Some(run_id.as_str()) {
@@ -17050,10 +17200,14 @@ fn spawn_orchestrator_parent_watcher(state: AppState, orchestrator_id: String, r
                         record.error = Some("Orchestrator turn was cancelled.".to_string());
                     }
                     record.updated_at = now_rfc3339();
-                    refresh_orchestrator_status(record, &state.orchestrator_runner);
-                    event_record = Some(record.clone());
                 }
-            }
+                refresh_orchestrator_tree(
+                    &mut orchestrators.records,
+                    &orchestrator_id,
+                    &state.orchestrator_runner,
+                );
+                orchestrators.records.get(&orchestrator_id).cloned()
+            };
             if let Some(record) = event_record {
                 publish_orchestrator_event(
                     &state,
@@ -17308,7 +17462,12 @@ async fn delegate_orchestrator_child(
         .transpose()?;
 
     let record = {
-        let orchestrators = state.orchestrators.lock().await;
+        let mut orchestrators = state.orchestrators.lock().await;
+        refresh_orchestrator_tree(
+            &mut orchestrators.records,
+            &orchestrator_id,
+            &state.orchestrator_runner,
+        );
         orchestrators
             .records
             .get(&orchestrator_id)
@@ -17326,6 +17485,11 @@ async fn delegate_orchestrator_child(
         .map_err(|error| error.message.clone())?;
     if record.cancel_requested {
         return Err("Orchestrator has been cancelled".to_string());
+    }
+    if record.depth >= MAX_ORCHESTRATOR_DEPTH {
+        return Err(format!(
+            "Orchestrator nesting is limited to {MAX_ORCHESTRATOR_DEPTH} levels"
+        ));
     }
     if record.children.len() >= record.max_children {
         return Err(format!(
@@ -17348,6 +17512,7 @@ async fn delegate_orchestrator_child(
     }
 
     let child_id = Uuid::new_v4().to_string();
+    let child_orchestrator_id = Uuid::new_v4().to_string();
     let run_id = Uuid::new_v4().to_string();
     let child_cwd = if let Some(cwd) = cwd.as_deref() {
         let child_cwd = PathBuf::from(cwd);
@@ -17373,7 +17538,12 @@ async fn delegate_orchestrator_child(
             ));
         }
     }
-    let child_prompt = build_orchestrator_child_prompt(&record, task_id.as_deref(), &prompt);
+    let child_prompt = build_orchestrator_child_prompt(
+        &record,
+        &child_orchestrator_id,
+        task_id.as_deref(),
+        &prompt,
+    );
     let child_model = model.or_else(|| record.model.clone());
     let child_max_seconds = max_seconds.unwrap_or(record.max_seconds);
     if child_max_seconds < 60 {
@@ -17387,6 +17557,8 @@ async fn delegate_orchestrator_child(
         child_model.clone(),
         network_access || record.network_access,
         child_max_seconds,
+        &child_orchestrator_id,
+        Some(&record.id),
         Some(&child_id),
         task_id.as_deref(),
     );
@@ -17396,6 +17568,7 @@ async fn delegate_orchestrator_child(
         .map_err(|error| error.to_string())?;
     let child = OrchestratorChild {
         id: child_id.clone(),
+        orchestrator_id: Some(child_orchestrator_id.clone()),
         task_id: task_id.clone(),
         prompt,
         cwd: child_cwd,
@@ -17410,20 +17583,62 @@ async fn delegate_orchestrator_child(
         created_at: now_rfc3339(),
         updated_at: now_rfc3339(),
     };
+    let child_record = OrchestratorRecord {
+        id: child_orchestrator_id.clone(),
+        parent_orchestrator_id: Some(record.id.clone()),
+        parent_child_id: Some(child_id.clone()),
+        depth: record.depth + 1,
+        workspace_id: record.workspace_id.clone(),
+        project_id: record.project_id.clone(),
+        credential: auth.credential.clone(),
+        goal: child.prompt.clone(),
+        cwd: child.cwd.clone(),
+        model: child.model.clone(),
+        network_access: child.network_access,
+        max_children: record.max_children,
+        max_retries: record.max_retries,
+        max_seconds: child.max_seconds,
+        status: OrchestratorStatus::Running,
+        created_at: child.created_at.clone(),
+        updated_at: child.updated_at.clone(),
+        active_turn_id: Some(run.id.clone()),
+        error: None,
+        cancel_requested: false,
+        messages: vec![OrchestratorMessage {
+            id: Uuid::new_v4().to_string(),
+            role: "user".to_string(),
+            text: child.prompt.clone(),
+            at: now_rfc3339(),
+        }],
+        children: Vec::new(),
+    };
     let event_record = {
         let mut orchestrators = state.orchestrators.lock().await;
-        let record = orchestrators
+        let accepted = orchestrators
             .records
-            .get_mut(&orchestrator_id)
-            .ok_or_else(|| "Orchestrator not found".to_string())?;
-        if record.cancel_requested || record.children.len() >= record.max_children {
-            let _ = state.orchestrator_runner.cancel(&run.id);
-            return Err("Orchestrator was cancelled or reached its child limit".to_string());
+            .get(&orchestrator_id)
+            .is_some_and(|record| {
+                !record.cancel_requested && record.children.len() < record.max_children
+            });
+        if !accepted {
+            None
+        } else {
+            orchestrators
+                .records
+                .insert(child_orchestrator_id.clone(), child_record);
+            let record = orchestrators
+                .records
+                .get_mut(&orchestrator_id)
+                .expect("parent orchestrator existence checked above");
+            record.children.push(child);
+            record.status = OrchestratorStatus::Running;
+            record.updated_at = now_rfc3339();
+            Some(record.clone())
         }
-        record.children.push(child);
-        record.status = OrchestratorStatus::Running;
-        record.updated_at = now_rfc3339();
-        record.clone()
+    };
+    let Some(event_record) = event_record else {
+        let _ = state.orchestrator_runner.cancel(&run.id);
+        return Err("Orchestrator was cancelled or reached its child limit".to_string());
     };
     publish_orchestrator_event(
         state,
@@ -17440,6 +17655,7 @@ async fn delegate_orchestrator_child(
     );
     Ok(json!({
         "orchestratorId": event_record.id,
+        "childOrchestratorId": child_orchestrator_id,
         "childId": child_id,
         "runId": run.id,
         "taskId": task_id,
@@ -17471,6 +17687,73 @@ async fn orchestrator_children_value(
     .map_err(|error| format!("Could not serialize orchestrator state: {error}"))
 }
 
+fn finish_nested_orchestrator_run(
+    records: &mut HashMap<String, OrchestratorRecord>,
+    child_orchestrator_id: Option<&str>,
+    run: &AgentRun,
+    final_text: Option<&str>,
+) {
+    let Some(child_orchestrator_id) = child_orchestrator_id else {
+        return;
+    };
+    let Some(record) = records.get_mut(child_orchestrator_id) else {
+        return;
+    };
+    if record.active_turn_id.as_deref() == Some(run.id.as_str()) {
+        record.active_turn_id = None;
+    }
+    if !record.cancel_requested && run.status == RunStatus::Completed {
+        if let Some(text) = final_text {
+            append_orchestrator_message(record, "assistant", text);
+        }
+    }
+    if run.status == RunStatus::Failed {
+        record.error = run.error.clone().or_else(|| final_text.map(str::to_string));
+    } else if run.status == RunStatus::Cancelled && !record.cancel_requested {
+        record.error = Some("Child orchestrator turn was cancelled.".to_string());
+    }
+    record.updated_at = now_rfc3339();
+}
+
+fn cancel_orchestrator_tree(
+    records: &mut HashMap<String, OrchestratorRecord>,
+    orchestrator_id: &str,
+    run_ids: &mut HashSet<String>,
+    visiting: &mut HashSet<String>,
+) {
+    if !visiting.insert(orchestrator_id.to_string()) {
+        return;
+    }
+    let (active_turn_id, children) = records
+        .get(orchestrator_id)
+        .map(|record| {
+            (
+                record.active_turn_id.clone(),
+                record
+                    .children
+                    .iter()
+                    .map(|child| (child.run_id.clone(), child.orchestrator_id.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .unwrap_or_default();
+    if let Some(record) = records.get_mut(orchestrator_id) {
+        record.cancel_requested = true;
+        record.status = OrchestratorStatus::Cancelled;
+        record.updated_at = now_rfc3339();
+    }
+    if let Some(run_id) = active_turn_id {
+        run_ids.insert(run_id);
+    }
+    for (run_id, child_orchestrator_id) in children {
+        run_ids.insert(run_id);
+        if let Some(child_orchestrator_id) = child_orchestrator_id {
+            cancel_orchestrator_tree(records, &child_orchestrator_id, run_ids, visiting);
+        }
+    }
+    visiting.remove(orchestrator_id);
+}
+
 fn spawn_orchestrator_child_watcher(
     state: AppState,
     orchestrator_id: String,
@@ -17487,10 +17770,27 @@ fn spawn_orchestrator_child_watcher(
                 continue;
             }
 
+            let final_text = agent_final_text(&run);
             let mut retry_context: Option<(OrchestratorRecord, OrchestratorChild)> = None;
-            let mut event_record = None;
-            {
+            let event_record = {
                 let mut orchestrators = state.orchestrators.lock().await;
+                let child_orchestrator_id =
+                    orchestrators
+                        .records
+                        .get(&orchestrator_id)
+                        .and_then(|record| {
+                            record
+                                .children
+                                .iter()
+                                .find(|child| child.id == child_id && child.run_id == run_id)
+                                .and_then(|child| child.orchestrator_id.clone())
+                        });
+                finish_nested_orchestrator_run(
+                    &mut orchestrators.records,
+                    child_orchestrator_id.as_deref(),
+                    &run,
+                    final_text.as_deref(),
+                );
                 if let Some(record) = orchestrators.records.get_mut(&orchestrator_id) {
                     let retry_record = record.clone();
                     if let Some(child) = record
@@ -17514,20 +17814,29 @@ fn spawn_orchestrator_child_watcher(
                                 .or_else(|| Some(format!("Child agent {child_id} failed.")));
                         }
                         record.updated_at = now_rfc3339();
-                        refresh_orchestrator_status(record, &state.orchestrator_runner);
-                        event_record = Some(record.clone());
                     }
                 }
-            }
+                refresh_orchestrator_tree(
+                    &mut orchestrators.records,
+                    &orchestrator_id,
+                    &state.orchestrator_runner,
+                );
+                orchestrators.records.get(&orchestrator_id).cloned()
+            };
 
             if let Some((record, child)) = retry_context {
                 let next_attempt = child.attempt + 1;
                 let next_run_id = Uuid::new_v4().to_string();
+                let child_orchestrator_id = child
+                    .orchestrator_id
+                    .clone()
+                    .unwrap_or_else(|| record.id.clone());
                 let spec = build_orchestrator_spec(
                     &record,
                     next_run_id,
                     build_orchestrator_child_prompt(
                         &record,
+                        &child_orchestrator_id,
                         child.task_id.as_deref(),
                         &child.prompt,
                     ),
@@ -17535,6 +17844,8 @@ fn spawn_orchestrator_child_watcher(
                     child.model.clone(),
                     child.network_access,
                     child.max_seconds,
+                    &child_orchestrator_id,
+                    Some(&record.id),
                     Some(&child.id),
                     child.task_id.as_deref(),
                 );
@@ -17544,11 +17855,14 @@ fn spawn_orchestrator_child_watcher(
                         let mut retry_record = None;
                         {
                             let mut orchestrators = state.orchestrators.lock().await;
+                            let mut accepted_child_orchestrator_id = None;
                             if let Some(record) = orchestrators.records.get_mut(&orchestrator_id) {
                                 if let Some(current) = record.children.iter_mut().find(|current| {
                                     current.id == child_id && current.run_id == run_id
                                 }) {
                                     if !record.cancel_requested {
+                                        accepted_child_orchestrator_id =
+                                            current.orchestrator_id.clone();
                                         current.attempt = next_attempt;
                                         current.run_id = next_run.id.clone();
                                         current.status = next_run.status;
@@ -17561,6 +17875,24 @@ fn spawn_orchestrator_child_watcher(
                                         accepted = true;
                                     }
                                 }
+                            }
+                            if let Some(child_orchestrator_id) = accepted_child_orchestrator_id {
+                                if let Some(child_record) =
+                                    orchestrators.records.get_mut(&child_orchestrator_id)
+                                {
+                                    child_record.active_turn_id = Some(next_run.id.clone());
+                                    child_record.status = OrchestratorStatus::Running;
+                                    child_record.error = None;
+                                    child_record.updated_at = now_rfc3339();
+                                }
+                            }
+                            refresh_orchestrator_tree(
+                                &mut orchestrators.records,
+                                &orchestrator_id,
+                                &state.orchestrator_runner,
+                            );
+                            if accepted {
+                                retry_record = orchestrators.records.get(&orchestrator_id).cloned();
                             }
                         }
                         if accepted {
@@ -17587,24 +17919,27 @@ fn spawn_orchestrator_child_watcher(
                         let _ = state.orchestrator_runner.cancel(&next_run.id);
                     }
                     Err(error) => {
-                        let mut failure_record = None;
                         let error = error.to_string();
-                        let mut orchestrators = state.orchestrators.lock().await;
-                        if let Some(record) = orchestrators.records.get_mut(&orchestrator_id) {
-                            if let Some(current) = record
-                                .children
-                                .iter_mut()
-                                .find(|current| current.id == child_id && current.run_id == run_id)
-                            {
-                                current.error = Some(error.clone());
-                                current.status = RunStatus::Failed;
-                                current.updated_at = now_rfc3339();
-                                record.error = Some(error);
-                                record.updated_at = now_rfc3339();
-                                refresh_orchestrator_status(record, &state.orchestrator_runner);
-                                failure_record = Some(record.clone());
+                        let failure_record = {
+                            let mut orchestrators = state.orchestrators.lock().await;
+                            if let Some(record) = orchestrators.records.get_mut(&orchestrator_id) {
+                                if let Some(current) = record.children.iter_mut().find(|current| {
+                                    current.id == child_id && current.run_id == run_id
+                                }) {
+                                    current.error = Some(error.clone());
+                                    current.status = RunStatus::Failed;
+                                    current.updated_at = now_rfc3339();
+                                    record.error = Some(error);
+                                    record.updated_at = now_rfc3339();
+                                }
                             }
-                        }
+                            refresh_orchestrator_tree(
+                                &mut orchestrators.records,
+                                &orchestrator_id,
+                                &state.orchestrator_runner,
+                            );
+                            orchestrators.records.get(&orchestrator_id).cloned()
+                        };
                         if let Some(record) = failure_record {
                             publish_orchestrator_event(
                                 &state,
@@ -17625,7 +17960,7 @@ fn spawn_orchestrator_child_watcher(
                     "ORCHESTRATOR_CHILD_FINISHED",
                     &record,
                     Some(run_id),
-                    agent_final_text(&run),
+                    final_text,
                 );
             }
             return;
@@ -17710,6 +18045,9 @@ async fn create_orchestrator(
     let now = now_rfc3339();
     let record = OrchestratorRecord {
         id: id.clone(),
+        parent_orchestrator_id: None,
+        parent_child_id: None,
+        depth: 0,
         workspace_id,
         project_id: input.project_id,
         credential: auth.credential.clone(),
@@ -17795,11 +18133,11 @@ async fn message_orchestrator(
     require_workspace(&state, &auth, &record.workspace_id).await?;
     {
         let mut orchestrators = state.orchestrators.lock().await;
+        refresh_orchestrator_tree(&mut orchestrators.records, &id, &state.orchestrator_runner);
         let record = orchestrators
             .records
             .get_mut(&id)
             .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Orchestrator not found"))?;
-        refresh_orchestrator_status(record, &state.orchestrator_runner);
         if record.cancel_requested {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
@@ -17840,16 +18178,14 @@ async fn cancel_orchestrator(
     require_workspace(&state, &auth, &record.workspace_id).await?;
     let run_ids = {
         let mut orchestrators = state.orchestrators.lock().await;
-        let record = orchestrators
-            .records
-            .get_mut(&id)
-            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Orchestrator not found"))?;
-        record.cancel_requested = true;
-        record.status = OrchestratorStatus::Cancelled;
-        record.updated_at = now_rfc3339();
-        let mut run_ids = record.active_turn_id.iter().cloned().collect::<Vec<_>>();
-        run_ids.extend(record.children.iter().map(|child| child.run_id.clone()));
-        run_ids
+        let mut run_ids = HashSet::new();
+        cancel_orchestrator_tree(
+            &mut orchestrators.records,
+            &id,
+            &mut run_ids,
+            &mut HashSet::new(),
+        );
+        run_ids.into_iter().collect::<Vec<_>>()
     };
     for run_id in run_ids {
         let _ = state.orchestrator_runner.cancel(&run_id);
@@ -18408,6 +18744,9 @@ mod tests {
     fn test_orchestrator() -> OrchestratorRecord {
         OrchestratorRecord {
             id: "orchestrator-test".to_string(),
+            parent_orchestrator_id: None,
+            parent_child_id: None,
+            depth: 0,
             workspace_id: "workspace-test".to_string(),
             project_id: "project-test".to_string(),
             credential: "secret".to_string(),
@@ -18466,7 +18805,100 @@ mod tests {
     fn refresh_without_active_runs_waits_for_input() {
         let mut record = test_orchestrator();
         let runner = RunManager::new(RunnerConfig::default());
-        refresh_orchestrator_status(&mut record, &runner);
+        refresh_orchestrator_status(&mut record, &runner, &HashMap::new());
         assert_eq!(record.status, OrchestratorStatus::Waiting);
+    }
+
+    #[test]
+    fn nested_orchestrator_response_contains_the_execution_tree() {
+        let mut root = test_orchestrator();
+        root.children.push(OrchestratorChild {
+            id: "child-link".to_string(),
+            orchestrator_id: Some("child-orchestrator".to_string()),
+            task_id: Some("task-child".to_string()),
+            prompt: "Deliver the child task".to_string(),
+            cwd: root.cwd.clone(),
+            model: root.model.clone(),
+            network_access: false,
+            max_seconds: 60,
+            attempt: 1,
+            max_retries: 1,
+            run_id: "child-run".to_string(),
+            status: RunStatus::Completed,
+            error: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        });
+        let nested = OrchestratorRecord {
+            id: "child-orchestrator".to_string(),
+            parent_orchestrator_id: Some(root.id.clone()),
+            parent_child_id: Some("child-link".to_string()),
+            depth: 1,
+            workspace_id: root.workspace_id.clone(),
+            project_id: root.project_id.clone(),
+            credential: root.credential.clone(),
+            goal: "Deliver the child task".to_string(),
+            cwd: root.cwd.clone(),
+            model: root.model.clone(),
+            network_access: false,
+            max_children: 3,
+            max_retries: 1,
+            max_seconds: 60,
+            status: OrchestratorStatus::Running,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+            active_turn_id: Some("child-run".to_string()),
+            error: None,
+            cancel_requested: false,
+            messages: Vec::new(),
+            children: Vec::new(),
+        };
+        let mut records = HashMap::from([(root.id.clone(), root), (nested.id.clone(), nested)]);
+        let runner = RunManager::new(RunnerConfig::default());
+        refresh_orchestrator_tree(&mut records, "orchestrator-test", &runner);
+        let response = orchestrator_response(
+            records.get("orchestrator-test").expect("root record"),
+            &runner,
+            &records,
+        );
+        let child = response.children.first().expect("child response");
+        let nested_response = child
+            .orchestrator
+            .as_ref()
+            .expect("nested orchestrator response");
+        assert_eq!(child.orchestrator_id.as_deref(), Some("child-orchestrator"));
+        assert_eq!(nested_response.id, "child-orchestrator");
+        assert_eq!(
+            nested_response.parent_orchestrator_id.as_deref(),
+            Some("orchestrator-test")
+        );
+        assert_eq!(nested_response.depth, 1);
+        assert_eq!(nested_response.status, OrchestratorStatus::Waiting);
+    }
+
+    #[test]
+    fn nested_spec_uses_child_context_id() {
+        let record = test_orchestrator();
+        let spec = build_orchestrator_spec(
+            &record,
+            "run-child".to_string(),
+            "child prompt".to_string(),
+            record.cwd.clone(),
+            record.model.clone(),
+            false,
+            60,
+            "child-orchestrator",
+            Some(&record.id),
+            Some("child-link"),
+            Some("task-child"),
+        );
+        assert_eq!(
+            spec.environment.get("KANEO_ORCHESTRATOR_ID"),
+            Some(&"child-orchestrator".to_string())
+        );
+        assert_eq!(
+            spec.environment.get("KANEO_PARENT_ORCHESTRATOR_ID"),
+            Some(&"orchestrator-test".to_string())
+        );
     }
 }

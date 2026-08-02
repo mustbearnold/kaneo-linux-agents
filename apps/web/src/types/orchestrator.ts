@@ -16,6 +16,7 @@ export type OrchestratorMessage = {
 
 export type OrchestratorChild = {
   id: string;
+  orchestratorId: string | null;
   taskId: string | null;
   prompt: string;
   cwd: string;
@@ -30,10 +31,14 @@ export type OrchestratorChild = {
   createdAt: string;
   updatedAt: string;
   run: AgentRun | null;
+  orchestrator: Orchestrator | null;
 };
 
 export type Orchestrator = {
   id: string;
+  parentOrchestratorId: string | null;
+  parentChildId: string | null;
+  depth: number;
   workspaceId: string;
   projectId: string;
   goal: string;
