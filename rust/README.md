@@ -31,7 +31,8 @@ same restart semantics as the legacy implementation.
 
 Native agent runs enforce the project/task permission boundary, validate prompt
 and runtime limits, keep terminal history bounded in memory and PostgreSQL,
-canonicalize working directories, and inject the local
+canonicalize working directories, isolate each Unix run in its own process
+group, and inject the local
 Rust MCP URL into each Codex invocation. An agent launched by the Rust API can
 therefore use the board bridge without relying on a pre-existing Codex MCP
 configuration. Set `KANEO_AGENT_ALLOWED_ROOT` when the API should confine

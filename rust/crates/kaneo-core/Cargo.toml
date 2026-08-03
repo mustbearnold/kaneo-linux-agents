@@ -6,6 +6,7 @@ license.workspace = true
 description = "Rust domain and bounded parallel execution core for Kaneo"
 
 [dependencies]
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

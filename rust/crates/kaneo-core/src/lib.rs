@@ -10,6 +10,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
 use std::io::{BufRead, BufReader, Read};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
@@ -276,6 +278,8 @@ fn execute_run(id: String, spec: AgentSpec, state: Arc<Mutex<RunnerState>>, conf
         .envs(&spec.environment)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
 
     let child = match command.spawn() {
         Ok(child) => child,
@@ -552,6 +556,16 @@ fn redact_json(value: &mut Value) {
 fn kill_child(child: &Arc<Mutex<Option<Child>>>) {
     if let Ok(mut child) = child.lock() {
         if let Some(child) = child.as_mut() {
+            #[cfg(unix)]
+            {
+                let process_group = -(child.id() as i32);
+                // The process group contains the Codex process and commands it
+                // spawned. Kill it before the parent so cancellation cannot
+                // leave a repository-mutating grandchild behind.
+                unsafe {
+                    libc::kill(process_group, libc::SIGKILL);
+                }
+            }
             let _ = child.kill();
         }
     }
