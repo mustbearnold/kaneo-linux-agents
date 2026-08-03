@@ -1,5 +1,5 @@
 import { and, eq } from "drizzle-orm";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { describeRoute, resolver, validator } from "hono-openapi";
 import * as v from "valibot";
@@ -38,14 +38,30 @@ const agentRunSchema = v.object({
   ),
 });
 
-const agent = new Hono<{
-  Variables: {
-    userId: string;
-    session: { token?: string } | null;
-    workspaceId: string;
-    apiKey?: { id: string };
-  };
-}>()
+type AgentVariables = {
+  userId: string;
+  session: { token?: string } | null;
+  workspaceId: string;
+  apiKey?: { id: string };
+};
+
+type AgentContext = Context<{ Variables: AgentVariables }>;
+
+async function authorizeAgentRun(
+  c: AgentContext,
+  run: { workspaceId: string },
+  permissions: Record<string, string[]>,
+) {
+  await validateWorkspaceAccess(
+    c.get("userId"),
+    run.workspaceId,
+    c.get("apiKey")?.id,
+  );
+  c.set("workspaceId", run.workspaceId);
+  await requireWorkspacePermission(permissions)(c, async () => undefined);
+}
+
+const agent = new Hono<{ Variables: AgentVariables }>()
   .post(
     "/runs",
     describeRoute({
@@ -172,11 +188,7 @@ const agent = new Hono<{
       const run = getAgentRun(c.req.valid("param").id);
       if (!run)
         throw new HTTPException(404, { message: "Agent run not found" });
-      await validateWorkspaceAccess(
-        c.get("userId"),
-        run.workspaceId,
-        c.get("apiKey")?.id,
-      );
+      await authorizeAgentRun(c, run, { project: ["read"] });
       return c.json(run);
     },
   )
@@ -198,11 +210,10 @@ const agent = new Hono<{
       const run = getAgentRun(c.req.valid("param").id);
       if (!run)
         throw new HTTPException(404, { message: "Agent run not found" });
-      await validateWorkspaceAccess(
-        c.get("userId"),
-        run.workspaceId,
-        c.get("apiKey")?.id,
-      );
+      await authorizeAgentRun(c, run, {
+        project: ["read"],
+        task: ["update"],
+      });
       const cancelled = cancelAgentRun(run.id);
       return c.json(cancelled ?? run);
     },
