@@ -30,10 +30,12 @@ consent, and PKCE authorization-code exchange; its in-memory OAuth state has the
 same restart semantics as the legacy implementation.
 
 Native agent runs enforce the project/task permission boundary, validate prompt
-and runtime limits, and inject the local
+and runtime limits, keep terminal history bounded, canonicalize working
+directories, and inject the local
 Rust MCP URL into each Codex invocation. An agent launched by the Rust API can
 therefore use the board bridge without relying on a pre-existing Codex MCP
-configuration.
+configuration. Set `KANEO_AGENT_ALLOWED_ROOT` when the API should confine
+project and agent working directories to one filesystem root.
 
 The Rust runtime also exposes `/api/agent/orchestrators`: a parent Codex turn
 can chat through `/messages`, delegate bounded child runs with the

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub const DEFAULT_MAX_ACTIVE_RUNS: usize = 2;
+pub const DEFAULT_MAX_STORED_RUNS: usize = 512;
 pub const DEFAULT_MAX_EVENTS: usize = 1_000;
 pub const DEFAULT_MAX_EVENT_TEXT: usize = 12_000;
 pub const DEFAULT_MAX_SECONDS: u64 = 60 * 60;
@@ -81,6 +82,7 @@ pub struct AgentSpec {
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
     pub max_active_runs: usize,
+    pub max_stored_runs: usize,
     pub max_events: usize,
     pub max_event_text: usize,
     pub default_max_seconds: u64,
@@ -90,6 +92,7 @@ impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
             max_active_runs: DEFAULT_MAX_ACTIVE_RUNS,
+            max_stored_runs: DEFAULT_MAX_STORED_RUNS,
             max_events: DEFAULT_MAX_EVENTS,
             max_event_text: DEFAULT_MAX_EVENT_TEXT,
             default_max_seconds: DEFAULT_MAX_SECONDS,
@@ -101,6 +104,7 @@ impl Default for RunnerConfig {
 pub enum StartError {
     AtCapacity { max_active_runs: usize },
     InvalidWorkingDirectory(String),
+    WorkerSpawn(String),
 }
 
 impl Display for StartError {
@@ -116,6 +120,7 @@ impl Display for StartError {
                     "Agent working directory is not a directory: {path}"
                 )
             }
+            Self::WorkerSpawn(error) => write!(formatter, "Could not start agent worker: {error}"),
         }
     }
 }
@@ -152,6 +157,7 @@ impl RunManager {
         }
 
         let mut state = self.state.lock().expect("runner state lock poisoned");
+        prune_terminal_runs(&mut state.runs, self.config.max_stored_runs);
         let active_runs = state
             .runs
             .values()
@@ -189,10 +195,21 @@ impl RunManager {
 
         let state = Arc::clone(&self.state);
         let config = self.config.clone();
-        thread::Builder::new()
+        let worker_id = id.clone();
+        let worker_config = config.clone();
+        let worker = thread::Builder::new()
             .name(format!("kaneo-agent-{id}"))
-            .spawn(move || execute_run(id, spec, state, config))
-            .expect("failed to spawn Kaneo agent worker");
+            .spawn(move || execute_run(worker_id, spec, state, worker_config));
+        if let Err(error) = worker {
+            let error = error.to_string();
+            finish_failed(
+                &self.state,
+                &id,
+                format!("Could not start agent worker: {error}"),
+                &config,
+            );
+            return Err(StartError::WorkerSpawn(error));
+        }
 
         Ok(run)
     }
@@ -377,6 +394,20 @@ fn execute_run(id: String, spec: AgentSpec, state: Arc<Mutex<RunnerState>>, conf
                 &config,
             );
         }
+    }
+    prune_terminal_runs(&mut state.runs, config.max_stored_runs);
+}
+
+fn prune_terminal_runs(runs: &mut HashMap<String, AgentRun>, max_stored_runs: usize) {
+    let mut terminal = runs
+        .iter()
+        .filter(|(_, run)| !run.status.is_active())
+        .map(|(id, run)| (id.clone(), run.created_at.clone()))
+        .collect::<Vec<_>>();
+    terminal.sort_by(|left, right| left.1.cmp(&right.1));
+    let remove_count = terminal.len().saturating_sub(max_stored_runs.max(1));
+    for (id, _) in terminal.into_iter().take(remove_count) {
+        runs.remove(&id);
     }
 }
 
@@ -617,5 +648,27 @@ mod tests {
         assert_eq!(first.status, RunStatus::Completed);
         assert_eq!(second.status, RunStatus::Completed);
         assert!(started.elapsed() < Duration::from_millis(380));
+    }
+
+    #[test]
+    fn bounds_terminal_run_history() {
+        let manager = RunManager::new(RunnerConfig {
+            max_stored_runs: 2,
+            ..RunnerConfig::default()
+        });
+        for id in ["first", "second", "third"] {
+            manager.start(shell_spec(id, "true")).expect("run starts");
+            assert_eq!(wait_for_terminal(&manager, id).status, RunStatus::Completed);
+        }
+
+        assert!(manager.get("first").is_none());
+        assert_eq!(
+            manager.get("second").expect("second is retained").status,
+            RunStatus::Completed
+        );
+        assert_eq!(
+            manager.get("third").expect("third is retained").status,
+            RunStatus::Completed
+        );
     }
 }

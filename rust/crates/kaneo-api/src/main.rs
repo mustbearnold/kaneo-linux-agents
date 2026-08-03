@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::IpAddr;
-use std::path::{Path as FsPath, PathBuf};
+use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, lookup_host};
@@ -16975,16 +16975,38 @@ fn resolve_orchestrator_cwd(
             .join("kaneo-orchestrators")
             .join(orchestrator_id)
     };
-    if let Some(root) = env::var_os("KANEO_AGENT_ALLOWED_ROOT") {
-        let root = FsPath::new(&root);
-        if !path.starts_with(root) {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                format!("Agent working directory must be inside {}.", root.display()),
+    secure_agent_path(path).map_err(|message| ApiError::new(StatusCode::BAD_REQUEST, message))
+}
+
+fn normalize_agent_path(path: PathBuf, allowed_root: Option<&FsPath>) -> Result<PathBuf, String> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err("Agent working directory must not contain '..'.".to_string());
+    }
+    let path = if path.is_dir() {
+        std::fs::canonicalize(&path)
+            .map_err(|error| format!("Could not resolve agent working directory: {error}"))?
+    } else {
+        path
+    };
+    if let Some(root) = allowed_root {
+        let root = std::fs::canonicalize(root)
+            .map_err(|error| format!("Could not resolve the configured agent root: {error}"))?;
+        if !path.starts_with(&root) {
+            return Err(format!(
+                "Agent working directory must be inside {}.",
+                root.display()
             ));
         }
     }
     Ok(path)
+}
+
+fn secure_agent_path(path: PathBuf) -> Result<PathBuf, String> {
+    let allowed_root = env::var_os("KANEO_AGENT_ALLOWED_ROOT").map(PathBuf::from);
+    normalize_agent_path(path, allowed_root.as_deref())
 }
 
 fn build_orchestrator_prompt(record: &OrchestratorRecord) -> String {
@@ -17359,16 +17381,7 @@ fn resolve_agent_cwd(
             .join("kaneo-agent-runs")
             .join(run_id)
     };
-    if let Some(root) = env::var_os("KANEO_AGENT_ALLOWED_ROOT") {
-        let root = FsPath::new(&root);
-        if !cwd.starts_with(root) {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                format!("Agent working directory must be inside {}.", root.display()),
-            ));
-        }
-    }
-    Ok(cwd)
+    secure_agent_path(cwd).map_err(|message| ApiError::new(StatusCode::BAD_REQUEST, message))
 }
 
 fn agent_response(run: AgentRun) -> AgentRunResponse {
@@ -17628,15 +17641,7 @@ async fn delegate_orchestrator_child(
             child_cwd.display()
         ));
     }
-    if let Some(root) = env::var_os("KANEO_AGENT_ALLOWED_ROOT") {
-        let root = FsPath::new(&root);
-        if !child_cwd.starts_with(root) {
-            return Err(format!(
-                "Child working directory must be inside {}",
-                root.display()
-            ));
-        }
-    }
+    let child_cwd = secure_agent_path(child_cwd)?;
     let child_prompt = build_orchestrator_child_prompt(
         &record,
         &child_orchestrator_id,
@@ -18936,6 +18941,18 @@ mod tests {
         let cwd = resolve_agent_cwd(&input, Some(&project_path), "run-test")
             .expect("project path should be selected");
         assert_eq!(cwd, FsPath::new(&project_path));
+    }
+
+    #[test]
+    fn agent_allowed_root_rejects_parent_directory_escape() {
+        let root = std::env::current_dir().expect("current directory");
+        assert!(normalize_agent_path(root.join(".."), Some(&root)).is_err());
+
+        let retained = normalize_agent_path(root.clone(), Some(&root)).expect("root is allowed");
+        assert_eq!(
+            retained,
+            std::fs::canonicalize(root).expect("canonical root")
+        );
     }
 
     #[test]
