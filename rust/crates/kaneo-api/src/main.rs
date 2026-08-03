@@ -101,9 +101,158 @@ impl Database {
             }
         });
 
+        client
+            .batch_execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS kaneo_agent_run (
+                    id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    model TEXT,
+                    network_access BOOLEAN NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    exit_code INTEGER,
+                    error TEXT,
+                    events TEXT NOT NULL DEFAULT '[]',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS kaneo_agent_run_project_created_idx
+                    ON kaneo_agent_run (workspace_id, project_id, created_at DESC);
+                UPDATE kaneo_agent_run
+                SET status = 'failed',
+                    error = COALESCE(error, 'Rust API restarted before the agent run finished.'),
+                    finished_at = COALESCE(
+                        finished_at,
+                        (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT::TEXT
+                    ),
+                    updated_at = NOW()
+                WHERE status IN ('queued', 'running');
+                "#,
+            )
+            .await
+            .map_err(database_error)?;
+
         Ok(Self {
             client: Arc::new(client),
         })
+    }
+
+    async fn upsert_agent_run(&self, run: &AgentRun) -> Result<(), ApiError> {
+        let status = run_status_name(run.status);
+        let events = serde_json::to_string(&run.events).map_err(database_error)?;
+        self.client
+            .execute(
+                r#"
+                INSERT INTO kaneo_agent_run (
+                    id, workspace_id, project_id, prompt, cwd, model,
+                    network_access, status, created_at, started_at, finished_at,
+                    exit_code, error, events, updated_at
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6,
+                    $7, $8, $9, $10, $11,
+                    $12, $13, $14, NOW()
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                    workspace_id = EXCLUDED.workspace_id,
+                    project_id = EXCLUDED.project_id,
+                    prompt = EXCLUDED.prompt,
+                    cwd = EXCLUDED.cwd,
+                    model = EXCLUDED.model,
+                    network_access = EXCLUDED.network_access,
+                    status = EXCLUDED.status,
+                    created_at = EXCLUDED.created_at,
+                    started_at = EXCLUDED.started_at,
+                    finished_at = EXCLUDED.finished_at,
+                    exit_code = EXCLUDED.exit_code,
+                    error = EXCLUDED.error,
+                    events = EXCLUDED.events,
+                    updated_at = NOW()
+                "#,
+                &[
+                    &run.id,
+                    &run.workspace_id,
+                    &run.project_id,
+                    &run.prompt,
+                    &run.cwd,
+                    &run.model,
+                    &run.network_access,
+                    &status,
+                    &run.created_at,
+                    &run.started_at,
+                    &run.finished_at,
+                    &run.exit_code,
+                    &run.error,
+                    &events,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        self.client
+            .execute(
+                r#"
+                DELETE FROM kaneo_agent_run
+                WHERE id IN (
+                    SELECT id
+                    FROM kaneo_agent_run
+                    WHERE status NOT IN ('queued', 'running')
+                    ORDER BY created_at DESC
+                    OFFSET 512
+                )
+                "#,
+                &[],
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn get_agent_run(&self, id: &str) -> Result<Option<AgentRun>, ApiError> {
+        let Some(row) = self
+            .client
+            .query_opt(
+                r#"
+                SELECT id, workspace_id, project_id, prompt, cwd, model,
+                       network_access, status, created_at, started_at, finished_at,
+                       exit_code, error, events
+                FROM kaneo_agent_run
+                WHERE id = $1
+                "#,
+                &[&id],
+            )
+            .await
+            .map_err(database_error)?
+        else {
+            return Ok(None);
+        };
+        let status_name: String = row.try_get("status").map_err(database_error)?;
+        let status = run_status_from_name(&status_name).ok_or_else(|| {
+            database_error(format!("Unknown persisted agent run status: {status_name}"))
+        })?;
+        let events_text: String = row.try_get("events").map_err(database_error)?;
+        let events = serde_json::from_str(&events_text).map_err(|error| {
+            database_error(format!("Could not decode persisted agent events: {error}"))
+        })?;
+        Ok(Some(AgentRun {
+            id: row.try_get("id").map_err(database_error)?,
+            workspace_id: row.try_get("workspace_id").map_err(database_error)?,
+            project_id: row.try_get("project_id").map_err(database_error)?,
+            prompt: row.try_get("prompt").map_err(database_error)?,
+            cwd: row.try_get("cwd").map_err(database_error)?,
+            model: row.try_get("model").map_err(database_error)?,
+            network_access: row.try_get("network_access").map_err(database_error)?,
+            status,
+            created_at: row.try_get("created_at").map_err(database_error)?,
+            started_at: row.try_get("started_at").map_err(database_error)?,
+            finished_at: row.try_get("finished_at").map_err(database_error)?,
+            exit_code: row.try_get("exit_code").map_err(database_error)?,
+            error: row.try_get("error").map_err(database_error)?,
+            events,
+        }))
     }
 }
 
@@ -16647,6 +16796,27 @@ fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
 }
 
+fn run_status_name(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Queued => "queued",
+        RunStatus::Running => "running",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "cancelled",
+    }
+}
+
+fn run_status_from_name(status: &str) -> Option<RunStatus> {
+    match status {
+        "queued" => Some(RunStatus::Queued),
+        "running" => Some(RunStatus::Running),
+        "completed" => Some(RunStatus::Completed),
+        "failed" => Some(RunStatus::Failed),
+        "cancelled" => Some(RunStatus::Cancelled),
+        _ => None,
+    }
+}
+
 fn append_orchestrator_message(record: &mut OrchestratorRecord, role: &str, text: &str) {
     let text = text.trim();
     if text.is_empty() {
@@ -17411,6 +17581,24 @@ fn agent_response(run: AgentRun) -> AgentRunResponse {
     }
 }
 
+fn spawn_agent_persistence_watcher(state: AppState, run_id: String) {
+    tokio::spawn(async move {
+        loop {
+            let Some(run) = state.runner.get(&run_id) else {
+                return;
+            };
+            if run.status.is_active() {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            if let Err(error) = state.database.upsert_agent_run(&run).await {
+                eprintln!("[kaneo-rust-api] could not persist agent run {run_id}: {error}");
+            }
+            return;
+        }
+    });
+}
+
 async fn start_agent(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -17540,6 +17728,11 @@ async fn start_agent(
         .runner
         .start(spec)
         .map_err(|error| ApiError::new(StatusCode::CONFLICT, error.to_string()))?;
+    if let Err(error) = state.database.upsert_agent_run(&run).await {
+        let _ = state.runner.cancel(&run.id);
+        return Err(error);
+    }
+    spawn_agent_persistence_watcher(state.clone(), run.id.clone());
     Ok((StatusCode::ACCEPTED, Json(agent_response(run))))
 }
 
@@ -18304,10 +18497,14 @@ async fn get_agent(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<AgentRunResponse>, ApiError> {
-    let run = state
-        .runner
-        .get(&id)
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Agent run not found"))?;
+    let run = match state.runner.get(&id) {
+        Some(run) => run,
+        None => state
+            .database
+            .get_agent_run(&id)
+            .await?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Agent run not found"))?,
+    };
     let auth = authenticate(&state, &headers).await?;
     require_workspace(&state, &auth, &run.workspace_id).await?;
     Ok(Json(agent_response(run)))
@@ -18318,16 +18515,26 @@ async fn cancel_agent(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<AgentRunResponse>, ApiError> {
-    let run = state
-        .runner
-        .get(&id)
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Agent run not found"))?;
+    let live = state.runner.get(&id);
+    let run = match live.clone() {
+        Some(run) => run,
+        None => state
+            .database
+            .get_agent_run(&id)
+            .await?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Agent run not found"))?,
+    };
     let auth = authenticate(&state, &headers).await?;
     require_workspace(&state, &auth, &run.workspace_id).await?;
-    let cancelled = state
-        .runner
-        .cancel(&id)
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Agent run not found"))?;
+    let cancelled = if live.is_some() {
+        state
+            .runner
+            .cancel(&id)
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Agent run not found"))?
+    } else {
+        run
+    };
+    state.database.upsert_agent_run(&cancelled).await?;
     Ok(Json(agent_response(cancelled)))
 }
 
