@@ -96,7 +96,12 @@ export default function ProjectAgentDialog({
           .then((restored) => {
             if (cancelled) return;
             setRun(restored);
-            if (isActive(restored.status)) setIsMonitorOpen(true);
+            if (
+              isActive(restored.status) ||
+              restored.error?.includes("API restarted")
+            ) {
+              setIsMonitorOpen(true);
+            }
           })
           .catch((error: unknown) => {
             if (cancelled) return;
