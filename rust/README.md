@@ -38,8 +38,12 @@ Rust MCP URL into each Codex invocation. An agent launched by the Rust API can
 therefore use the board bridge without relying on a pre-existing Codex MCP
 configuration. Set `KANEO_AGENT_ALLOWED_ROOT` when the API should confine
 project and agent working directories to one filesystem root. Direct-agent
-summaries are restored after an API restart; any run that was still active at
-restart is reported as failed with an interruption error.
+summaries are available through `GET /api/agent/runs?projectId=...`, with live
+in-memory state overlaid ahead of durable rows, and are restored after an API
+restart; any run that was still active at restart is reported as failed with
+an interruption error. Orchestrator-sourced runs are kept out of that direct
+history so a fresh project view cannot mistake a child turn for a standalone
+agent run.
 
 The Rust runtime also exposes `/api/agent/orchestrators`: a parent Codex turn
 can chat through `/messages`, delegate bounded child runs with the

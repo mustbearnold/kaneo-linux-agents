@@ -89,6 +89,21 @@ struct Database {
     client: Arc<Client>,
 }
 
+#[derive(Clone, Copy)]
+enum AgentRunSource {
+    Direct,
+    Orchestrator,
+}
+
+impl AgentRunSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Orchestrator => "orchestrator",
+        }
+    }
+}
+
 impl Database {
     async fn connect(url: &str) -> Result<Self, ApiError> {
         let (client, connection) = tokio_postgres::connect(url, NoTls)
@@ -119,8 +134,11 @@ impl Database {
                     exit_code INTEGER,
                     error TEXT,
                     events TEXT NOT NULL DEFAULT '[]',
+                    source TEXT NOT NULL DEFAULT 'direct',
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+                ALTER TABLE kaneo_agent_run
+                    ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'direct';
                 CREATE INDEX IF NOT EXISTS kaneo_agent_run_project_created_idx
                     ON kaneo_agent_run (workspace_id, project_id, created_at DESC);
                 CREATE TABLE IF NOT EXISTS kaneo_orchestrator (
@@ -152,7 +170,11 @@ impl Database {
         })
     }
 
-    async fn upsert_agent_run(&self, run: &AgentRun) -> Result<(), ApiError> {
+    async fn upsert_agent_run(
+        &self,
+        run: &AgentRun,
+        source: AgentRunSource,
+    ) -> Result<(), ApiError> {
         let status = run_status_name(run.status);
         let events = serde_json::to_string(&run.events).map_err(database_error)?;
         self.client
@@ -161,11 +183,11 @@ impl Database {
                 INSERT INTO kaneo_agent_run (
                     id, workspace_id, project_id, prompt, cwd, model,
                     network_access, status, created_at, started_at, finished_at,
-                    exit_code, error, events, updated_at
+                    exit_code, error, events, source, updated_at
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6,
                     $7, $8, $9, $10, $11,
-                    $12, $13, $14, NOW()
+                    $12, $13, $14, $15, NOW()
                 )
                 ON CONFLICT (id) DO UPDATE SET
                     workspace_id = EXCLUDED.workspace_id,
@@ -181,6 +203,7 @@ impl Database {
                     exit_code = EXCLUDED.exit_code,
                     error = EXCLUDED.error,
                     events = EXCLUDED.events,
+                    source = kaneo_agent_run.source,
                     updated_at = NOW()
                 "#,
                 &[
@@ -198,6 +221,7 @@ impl Database {
                     &run.exit_code,
                     &run.error,
                     &events,
+                    &source.as_str(),
                 ],
             )
             .await
@@ -239,30 +263,35 @@ impl Database {
         else {
             return Ok(None);
         };
-        let status_name: String = row.try_get("status").map_err(database_error)?;
-        let status = run_status_from_name(&status_name).ok_or_else(|| {
-            database_error(format!("Unknown persisted agent run status: {status_name}"))
-        })?;
-        let events_text: String = row.try_get("events").map_err(database_error)?;
-        let events = serde_json::from_str(&events_text).map_err(|error| {
-            database_error(format!("Could not decode persisted agent events: {error}"))
-        })?;
-        Ok(Some(AgentRun {
-            id: row.try_get("id").map_err(database_error)?,
-            workspace_id: row.try_get("workspace_id").map_err(database_error)?,
-            project_id: row.try_get("project_id").map_err(database_error)?,
-            prompt: row.try_get("prompt").map_err(database_error)?,
-            cwd: row.try_get("cwd").map_err(database_error)?,
-            model: row.try_get("model").map_err(database_error)?,
-            network_access: row.try_get("network_access").map_err(database_error)?,
-            status,
-            created_at: row.try_get("created_at").map_err(database_error)?,
-            started_at: row.try_get("started_at").map_err(database_error)?,
-            finished_at: row.try_get("finished_at").map_err(database_error)?,
-            exit_code: row.try_get("exit_code").map_err(database_error)?,
-            error: row.try_get("error").map_err(database_error)?,
-            events,
-        }))
+        Ok(Some(agent_run_from_row(&row)?))
+    }
+
+    async fn list_agent_runs(
+        &self,
+        workspace_id: &str,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<AgentRun>, ApiError> {
+        let limit = i64::try_from(limit).map_err(database_error)?;
+        let rows = self
+            .client
+            .query(
+                r#"
+                SELECT id, workspace_id, project_id, prompt, cwd, model,
+                       network_access, status, created_at, started_at, finished_at,
+                       exit_code, error, events
+                FROM kaneo_agent_run
+                WHERE workspace_id = $1
+                  AND project_id = $2
+                  AND source = 'direct'
+                ORDER BY created_at DESC
+                LIMIT $3
+                "#,
+                &[&workspace_id, &project_id, &limit],
+            )
+            .await
+            .map_err(database_error)?;
+        rows.iter().map(agent_run_from_row).collect()
     }
 
     async fn upsert_orchestrator(&self, record: &OrchestratorRecord) -> Result<(), ApiError> {
@@ -1115,6 +1144,13 @@ struct StartAgentInput {
     model: Option<String>,
     network_access: Option<bool>,
     max_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AgentRunListQuery {
+    project_id: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
@@ -2499,7 +2535,7 @@ async fn openapi(State(state): State<AppState>) -> Json<Value> {
         ("/api/task/{id}", vec!["get", "post", "put", "delete"]),
         ("/api/task/tasks/{project_id}", vec!["get"]),
         ("/api/task/bulk", vec!["patch"]),
-        ("/api/agent/runs", vec!["post"]),
+        ("/api/agent/runs", vec!["get", "post"]),
         ("/api/agent/runs/{id}", vec!["get"]),
         ("/api/agent/runs/{id}/cancel", vec!["post"]),
         ("/api/agent/orchestrators", vec!["get", "post"]),
@@ -16911,6 +16947,33 @@ fn run_status_from_name(status: &str) -> Option<RunStatus> {
     }
 }
 
+fn agent_run_from_row(row: &Row) -> Result<AgentRun, ApiError> {
+    let status_name: String = row.try_get("status").map_err(database_error)?;
+    let status = run_status_from_name(&status_name).ok_or_else(|| {
+        database_error(format!("Unknown persisted agent run status: {status_name}"))
+    })?;
+    let events_text: String = row.try_get("events").map_err(database_error)?;
+    let events = serde_json::from_str(&events_text).map_err(|error| {
+        database_error(format!("Could not decode persisted agent events: {error}"))
+    })?;
+    Ok(AgentRun {
+        id: row.try_get("id").map_err(database_error)?,
+        workspace_id: row.try_get("workspace_id").map_err(database_error)?,
+        project_id: row.try_get("project_id").map_err(database_error)?,
+        prompt: row.try_get("prompt").map_err(database_error)?,
+        cwd: row.try_get("cwd").map_err(database_error)?,
+        model: row.try_get("model").map_err(database_error)?,
+        network_access: row.try_get("network_access").map_err(database_error)?,
+        status,
+        created_at: row.try_get("created_at").map_err(database_error)?,
+        started_at: row.try_get("started_at").map_err(database_error)?,
+        finished_at: row.try_get("finished_at").map_err(database_error)?,
+        exit_code: row.try_get("exit_code").map_err(database_error)?,
+        error: row.try_get("error").map_err(database_error)?,
+        events,
+    })
+}
+
 fn orchestrator_status_name(status: OrchestratorStatus) -> &'static str {
     match status {
         OrchestratorStatus::Queued => "queued",
@@ -17578,7 +17641,11 @@ async fn start_orchestrator_turn(
             return Err(ApiError::new(StatusCode::CONFLICT, error.to_string()));
         }
     };
-    if let Err(error) = state.database.upsert_agent_run(&run).await {
+    if let Err(error) = state
+        .database
+        .upsert_agent_run(&run, AgentRunSource::Orchestrator)
+        .await
+    {
         let _ = state.orchestrator_runner.cancel(&run.id);
         let mut orchestrators = state.orchestrators.lock().await;
         if let Some(record) = orchestrators.records.get_mut(orchestrator_id) {
@@ -17592,6 +17659,7 @@ async fn start_orchestrator_turn(
         state.clone(),
         state.orchestrator_runner.clone(),
         run.id.clone(),
+        AgentRunSource::Orchestrator,
     );
     let accepted = {
         let mut orchestrators = state.orchestrators.lock().await;
@@ -17763,7 +17831,12 @@ fn agent_response(run: AgentRun) -> AgentRunResponse {
     }
 }
 
-fn spawn_agent_persistence_watcher(state: AppState, runner: RunManager, run_id: String) {
+fn spawn_agent_persistence_watcher(
+    state: AppState,
+    runner: RunManager,
+    run_id: String,
+    source: AgentRunSource,
+) {
     tokio::spawn(async move {
         loop {
             let Some(run) = runner.get(&run_id) else {
@@ -17773,7 +17846,7 @@ fn spawn_agent_persistence_watcher(state: AppState, runner: RunManager, run_id: 
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 continue;
             }
-            if let Err(error) = state.database.upsert_agent_run(&run).await {
+            if let Err(error) = state.database.upsert_agent_run(&run, source).await {
                 eprintln!("[kaneo-rust-api] could not persist agent run {run_id}: {error}");
             }
             return;
@@ -17930,11 +18003,20 @@ async fn start_agent(
         .runner
         .start(spec)
         .map_err(|error| ApiError::new(StatusCode::CONFLICT, error.to_string()))?;
-    if let Err(error) = state.database.upsert_agent_run(&run).await {
+    if let Err(error) = state
+        .database
+        .upsert_agent_run(&run, AgentRunSource::Direct)
+        .await
+    {
         let _ = state.runner.cancel(&run.id);
         return Err(error);
     }
-    spawn_agent_persistence_watcher(state.clone(), state.runner.clone(), run.id.clone());
+    spawn_agent_persistence_watcher(
+        state.clone(),
+        state.runner.clone(),
+        run.id.clone(),
+        AgentRunSource::Direct,
+    );
     Ok((StatusCode::ACCEPTED, Json(agent_response(run))))
 }
 
@@ -18069,7 +18151,11 @@ async fn delegate_orchestrator_child(
         .orchestrator_runner
         .start(spec)
         .map_err(|error| error.to_string())?;
-    if let Err(error) = state.database.upsert_agent_run(&run).await {
+    if let Err(error) = state
+        .database
+        .upsert_agent_run(&run, AgentRunSource::Orchestrator)
+        .await
+    {
         let _ = state.orchestrator_runner.cancel(&run.id);
         return Err(error.message);
     }
@@ -18077,6 +18163,7 @@ async fn delegate_orchestrator_child(
         state.clone(),
         state.orchestrator_runner.clone(),
         run.id.clone(),
+        AgentRunSource::Orchestrator,
     );
     let child = OrchestratorChild {
         id: child_id.clone(),
@@ -18363,7 +18450,11 @@ fn spawn_orchestrator_child_watcher(
                 );
                 match state.orchestrator_runner.start(spec) {
                     Ok(next_run) => {
-                        if let Err(error) = state.database.upsert_agent_run(&next_run).await {
+                        if let Err(error) = state
+                            .database
+                            .upsert_agent_run(&next_run, AgentRunSource::Orchestrator)
+                            .await
+                        {
                             eprintln!(
                                 "[kaneo-rust-api] could not persist orchestrator retry {}: {}",
                                 next_run.id, error.message
@@ -18373,6 +18464,7 @@ fn spawn_orchestrator_child_watcher(
                             state.clone(),
                             state.orchestrator_runner.clone(),
                             next_run.id.clone(),
+                            AgentRunSource::Orchestrator,
                         );
                         let mut accepted = false;
                         let mut retry_record = None;
@@ -18520,6 +18612,42 @@ async fn list_orchestrators(
         responses.push(orchestrator_snapshot(&state, &id).await?);
     }
     Ok(Json(responses))
+}
+
+async fn list_agent_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AgentRunListQuery>,
+) -> Result<Json<Vec<AgentRunResponse>>, ApiError> {
+    let project_id = query
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|project_id| !project_id.is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "projectId is required"))?;
+    let (auth, workspace_id) = auth_for_project(&state, &headers, project_id).await?;
+    require_workspace(&state, &auth, &workspace_id).await?;
+    let limit = query.limit.unwrap_or(20).clamp(1, 50);
+    let persisted = state
+        .database
+        .list_agent_runs(&workspace_id, project_id, limit)
+        .await?;
+    let mut runs = persisted
+        .into_iter()
+        .map(|run| (run.id.clone(), run))
+        .collect::<HashMap<_, _>>();
+    for run in state
+        .runner
+        .list()
+        .into_iter()
+        .filter(|run| run.workspace_id == workspace_id && run.project_id == project_id)
+    {
+        runs.insert(run.id.clone(), run);
+    }
+    let mut runs = runs.into_values().collect::<Vec<_>>();
+    runs.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    runs.truncate(limit);
+    Ok(Json(runs.into_iter().map(agent_response).collect()))
 }
 
 async fn create_orchestrator(
@@ -18791,7 +18919,10 @@ async fn cancel_agent(
     } else {
         run
     };
-    state.database.upsert_agent_run(&cancelled).await?;
+    state
+        .database
+        .upsert_agent_run(&cancelled, AgentRunSource::Direct)
+        .await?;
     Ok(Json(agent_response(cancelled)))
 }
 
@@ -19220,7 +19351,7 @@ fn app(state: AppState) -> Router {
         )
         .route("/api/task/move/{id}", put(move_task))
         .route("/api/task/export/{project_id}", get(export_tasks))
-        .route("/api/agent/runs", post(start_agent))
+        .route("/api/agent/runs", get(list_agent_runs).post(start_agent))
         .route("/api/agent/runs/{id}", get(get_agent))
         .route("/api/agent/runs/{id}/cancel", post(cancel_agent))
         .route(
@@ -19311,13 +19442,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app(state.clone()))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    for run in state
-        .runner
-        .cancel_all()
-        .into_iter()
-        .chain(state.orchestrator_runner.cancel_all())
-    {
-        if let Err(error) = state.database.upsert_agent_run(&run).await {
+    for run in state.runner.cancel_all() {
+        if let Err(error) = state
+            .database
+            .upsert_agent_run(&run, AgentRunSource::Direct)
+            .await
+        {
+            eprintln!(
+                "[kaneo-rust-api] could not persist shutdown cancellation for {}: {}",
+                run.id, error.message
+            );
+        }
+    }
+    for run in state.orchestrator_runner.cancel_all() {
+        if let Err(error) = state
+            .database
+            .upsert_agent_run(&run, AgentRunSource::Orchestrator)
+            .await
+        {
             eprintln!(
                 "[kaneo-rust-api] could not persist shutdown cancellation for {}: {}",
                 run.id, error.message

@@ -26,6 +26,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { isAgentNotFound } from "@/fetchers/agent/agent-request-error";
 import cancelAgentRun from "@/fetchers/agent/cancel-agent-run";
 import getAgentRun from "@/fetchers/agent/get-agent-run";
+import listAgentRuns from "@/fetchers/agent/list-agent-runs";
 import startAgentRun from "@/fetchers/agent/start-agent-run";
 import { pickProjectFolder } from "@/lib/tauri";
 import { toast } from "@/lib/toast";
@@ -88,13 +89,27 @@ export default function ProjectAgentDialog({
       const storedRunId = window.localStorage.getItem(
         agentRunStorageKey(projectId),
       );
-      if (!storedRunId) return;
-
+      const restoreLatest = () =>
+        listAgentRuns(projectId).then((items) => items[0] ?? null);
       let retryCount = 0;
       const restore = () => {
-        void getAgentRun(storedRunId)
+        const request = storedRunId
+          ? getAgentRun(storedRunId).catch((error: unknown) => {
+              if (isAgentNotFound(error)) {
+                try {
+                  window.localStorage.removeItem(agentRunStorageKey(projectId));
+                } catch {
+                  // Ignore storage failures; the server remains the source of truth.
+                }
+                return restoreLatest();
+              }
+              throw error;
+            })
+          : restoreLatest();
+        void request
           .then((restored) => {
             if (cancelled) return;
+            if (!restored) return;
             setRun(restored);
             if (
               isActive(restored.status) ||

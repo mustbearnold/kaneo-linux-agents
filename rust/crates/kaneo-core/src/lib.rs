@@ -225,6 +225,16 @@ impl RunManager {
             .cloned()
     }
 
+    pub fn list(&self) -> Vec<AgentRun> {
+        self.state
+            .lock()
+            .expect("runner state lock poisoned")
+            .runs
+            .values()
+            .cloned()
+            .collect()
+    }
+
     pub fn cancel(&self, id: &str) -> Option<AgentRun> {
         let child = {
             let mut state = self.state.lock().expect("runner state lock poisoned");
