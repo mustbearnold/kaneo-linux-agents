@@ -26,6 +26,7 @@ import { Textarea } from "@/components/ui/textarea";
 import cancelAgentRun from "@/fetchers/agent/cancel-agent-run";
 import getAgentRun from "@/fetchers/agent/get-agent-run";
 import startAgentRun from "@/fetchers/agent/start-agent-run";
+import { pickProjectFolder } from "@/lib/tauri";
 import { toast } from "@/lib/toast";
 import type { AgentRun } from "@/types/agent";
 
@@ -35,6 +36,9 @@ type ProjectAgentDialogProps = {
 
 const DEFAULT_PROMPT =
   "Work through the highest-priority actionable tasks in this project. Implement the next useful slice, verify it, and keep the task statuses and comments up to date.";
+
+const agentRunStorageKey = (projectId: string) =>
+  `kaneo:agent-run:${projectId}`;
 
 function isActive(status?: AgentRun["status"]) {
   return status === "queued" || status === "running";
@@ -68,8 +72,51 @@ export default function ProjectAgentDialog({
   const [isMonitorOpen, setIsMonitorOpen] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
+  const [isPickingFolder, setIsPickingFolder] = useState(false);
   const activeRunId = run?.id;
   const activeRunStatus = run?.status;
+
+  useEffect(() => {
+    setRun(null);
+    setIsMonitorOpen(false);
+
+    let cancelled = false;
+    let storedRunId: string | null = null;
+    try {
+      storedRunId = window.localStorage.getItem(agentRunStorageKey(projectId));
+    } catch {
+      return;
+    }
+    if (!storedRunId) return;
+
+    void getAgentRun(storedRunId)
+      .then((restored) => {
+        if (cancelled) return;
+        setRun(restored);
+        if (isActive(restored.status)) setIsMonitorOpen(true);
+      })
+      .catch(() => {
+        try {
+          window.localStorage.removeItem(agentRunStorageKey(projectId));
+        } catch {
+          // Ignore storage failures; the server remains the source of truth.
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  useEffect(() => {
+    const runId = run?.id;
+    if (!runId) return;
+    try {
+      window.localStorage.setItem(agentRunStorageKey(projectId), runId);
+    } catch {
+      // Ignore storage failures; the current monitor still works in memory.
+    }
+  }, [projectId, run?.id]);
 
   useEffect(() => {
     if (!activeRunId || !isActive(activeRunStatus)) return;
@@ -91,6 +138,24 @@ export default function ProjectAgentDialog({
 
   const visibleEvents = useMemo(() => run?.events.slice(-32) ?? [], [run]);
   const active = isActive(run?.status);
+
+  const handlePickFolder = async () => {
+    if (active || isStarting) return;
+
+    setIsPickingFolder(true);
+    try {
+      const selected = await pickProjectFolder();
+      if (selected) setCwd(selected);
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Couldn't open the local folder picker.",
+      );
+    } finally {
+      setIsPickingFolder(false);
+    }
+  };
 
   const handleStart = async () => {
     if (!prompt.trim()) return;
@@ -196,16 +261,30 @@ export default function ProjectAgentDialog({
                   (optional)
                 </span>
               </span>
-              <Input
-                id="agent-cwd"
-                value={cwd}
-                onChange={(event) => setCwd(event.target.value)}
-                disabled={active || isStarting}
-                placeholder="/home/you/Projects/your-repository"
-              />
+              <div className="flex items-center gap-2">
+                <Input
+                  id="agent-cwd"
+                  value={cwd}
+                  onChange={(event) => setCwd(event.target.value)}
+                  disabled={active || isStarting || isPickingFolder}
+                  placeholder="/home/you/Projects/your-repository"
+                  className="min-w-0 flex-1"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0 gap-1.5"
+                  onClick={() => void handlePickFolder()}
+                  disabled={active || isStarting || isPickingFolder}
+                >
+                  <FolderOpen className="size-3.5" />
+                  {isPickingFolder ? "Opening…" : "Browse"}
+                </Button>
+              </div>
               <span className="block text-xs text-muted-foreground">
-                Leave blank for an isolated temporary directory when the work is
-                only in Kaneo.
+                Leave blank to use this project’s configured folder. If none is
+                configured, Kaneo uses an isolated temporary directory.
               </span>
             </label>
 

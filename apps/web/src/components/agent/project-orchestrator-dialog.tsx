@@ -31,6 +31,7 @@ import {
   getOrchestrator,
   sendOrchestratorMessage,
 } from "@/fetchers/agent/orchestrator";
+import { pickProjectFolder } from "@/lib/tauri";
 import { toast } from "@/lib/toast";
 import type {
   Orchestrator,
@@ -44,6 +45,9 @@ type ProjectOrchestratorDialogProps = {
 
 const DEFAULT_GOAL =
   "Coordinate the highest-priority actionable tasks in this project. Split independent work across child agents, have them implement and verify it, and keep the Kanban board accurate.";
+
+const orchestratorStorageKey = (projectId: string) =>
+  `kaneo:orchestrator:${projectId}`;
 
 function isActive(status?: OrchestratorStatus) {
   return status === "queued" || status === "running";
@@ -79,19 +83,17 @@ function statusIcon(status?: OrchestratorStatus) {
 function nestedAgentCount(orchestrator: Orchestrator): number {
   return orchestrator.children.reduce(
     (total, child) =>
-      total + 1 + (child.orchestrator ? nestedAgentCount(child.orchestrator) : 0),
+      total +
+      1 +
+      (child.orchestrator ? nestedAgentCount(child.orchestrator) : 0),
     0,
   );
 }
 
-function OrchestratorChildren({
-  children,
-}: {
-  children: OrchestratorChild[];
-}) {
+function OrchestratorChildren({ items }: { items: OrchestratorChild[] }) {
   return (
     <div className="space-y-1.5">
-      {children.map((child) => {
+      {items.map((child) => {
         const nested = child.orchestrator;
         return (
           <div key={child.id} className="space-y-1.5">
@@ -104,12 +106,12 @@ function OrchestratorChildren({
               </span>
               <span className="shrink-0 text-muted-foreground">
                 {nested ? statusLabel(nested.status) : child.status}
-                {child.attempt > 1 ? " · try " + child.attempt : ""}
+                {child.attempt > 1 ? ` · try ${child.attempt}` : ""}
               </span>
             </div>
             {nested && nested.children.length > 0 && (
               <div className="ml-4 border-l border-border pl-2">
-                <OrchestratorChildren children={nested.children} />
+                <OrchestratorChildren items={nested.children} />
               </div>
             )}
           </div>
@@ -133,8 +135,56 @@ export default function ProjectOrchestratorDialog({
   const [isStarting, setIsStarting] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
+  const [isPickingFolder, setIsPickingFolder] = useState(false);
 
   const active = isActive(orchestrator?.status);
+
+  useEffect(() => {
+    setOrchestrator(null);
+    setIsMonitorOpen(false);
+
+    let cancelled = false;
+    let storedOrchestratorId: string | null = null;
+    try {
+      storedOrchestratorId = window.localStorage.getItem(
+        orchestratorStorageKey(projectId),
+      );
+    } catch {
+      return;
+    }
+    if (!storedOrchestratorId) return;
+
+    void getOrchestrator(storedOrchestratorId)
+      .then((restored) => {
+        if (cancelled) return;
+        setOrchestrator(restored);
+        if (isActive(restored.status)) setIsMonitorOpen(true);
+      })
+      .catch(() => {
+        try {
+          window.localStorage.removeItem(orchestratorStorageKey(projectId));
+        } catch {
+          // Ignore storage failures; the server remains the source of truth.
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  useEffect(() => {
+    const orchestratorId = orchestrator?.id;
+    if (!orchestratorId) return;
+    try {
+      window.localStorage.setItem(
+        orchestratorStorageKey(projectId),
+        orchestratorId,
+      );
+    } catch {
+      // Ignore storage failures; the current monitor still works in memory.
+    }
+  }, [projectId, orchestrator?.id]);
 
   useEffect(() => {
     if (!orchestrator?.id || !isActive(orchestrator.status)) return;
@@ -156,6 +206,24 @@ export default function ProjectOrchestratorDialog({
     () => orchestrator?.messages.slice(-24) ?? [],
     [orchestrator],
   );
+
+  const handlePickFolder = async () => {
+    if (active || isStarting) return;
+
+    setIsPickingFolder(true);
+    try {
+      const selected = await pickProjectFolder();
+      if (selected) setCwd(selected);
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Couldn't open the local folder picker.",
+      );
+    } finally {
+      setIsPickingFolder(false);
+    }
+  };
 
   const handleStart = async () => {
     if (!goal.trim()) return;
@@ -278,16 +346,37 @@ export default function ProjectOrchestratorDialog({
                   (optional)
                 </span>
               </span>
-              <Input
-                id="orchestrator-cwd"
-                value={cwd}
-                onChange={(event) => setCwd(event.target.value)}
-                disabled={isStarting}
-                placeholder="/home/you/Projects/your-repository"
-              />
+              <div className="flex items-center gap-2">
+                <Input
+                  id="orchestrator-cwd"
+                  value={cwd}
+                  onChange={(event) => setCwd(event.target.value)}
+                  disabled={active || isStarting || isPickingFolder}
+                  placeholder="/home/you/Projects/your-repository"
+                  className="min-w-0 flex-1"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0 gap-1.5"
+                  onClick={() => void handlePickFolder()}
+                  disabled={active || isStarting || isPickingFolder}
+                >
+                  <FolderOpen className="size-3.5" />
+                  {isPickingFolder ? "Opening…" : "Browse"}
+                </Button>
+              </div>
+              <span className="block text-xs text-muted-foreground">
+                Leave blank to use this project’s configured folder. If none is
+                configured, Kaneo uses an isolated temporary directory.
+              </span>
             </label>
 
-            <label htmlFor="orchestrator-children" className="block space-y-1.5">
+            <label
+              htmlFor="orchestrator-children"
+              className="block space-y-1.5"
+            >
               <span className="text-sm font-medium">Maximum child agents</span>
               <Input
                 id="orchestrator-children"
@@ -339,7 +428,8 @@ export default function ProjectOrchestratorDialog({
                 {statusIcon(orchestrator.status)}
                 <div className="min-w-0">
                   <p className="text-sm font-medium">
-                    Orchestrator {statusLabel(orchestrator.status).toLowerCase()}
+                    Orchestrator{" "}
+                    {statusLabel(orchestrator.status).toLowerCase()}
                   </p>
                   <p className="text-xs text-muted-foreground">
                     The Kanban board stays live while child agents work.
@@ -387,7 +477,7 @@ export default function ProjectOrchestratorDialog({
 
               {orchestrator.children.length > 0 && (
                 <div className="max-h-32 space-y-1 overflow-y-auto rounded-md border border-border p-2 text-xs">
-                  <OrchestratorChildren children={orchestrator.children} />
+                  <OrchestratorChildren items={orchestrator.children} />
                 </div>
               )}
 
@@ -397,9 +487,13 @@ export default function ProjectOrchestratorDialog({
 
               {orchestrator.status === "waiting" && (
                 <div className="flex items-end gap-2">
-                  <label className="min-w-0 flex-1 space-y-1">
+                  <label
+                    htmlFor="orchestrator-message"
+                    className="min-w-0 flex-1 space-y-1"
+                  >
                     <span className="sr-only">Message orchestrator</span>
                     <Textarea
+                      id="orchestrator-message"
                       value={message}
                       onChange={(event) => setMessage(event.target.value)}
                       onKeyDown={(event) => {
