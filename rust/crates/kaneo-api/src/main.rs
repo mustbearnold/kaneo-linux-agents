@@ -16947,6 +16947,16 @@ fn run_status_from_name(status: &str) -> Option<RunStatus> {
     }
 }
 
+fn normalize_model(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(model) = value.map(str::trim).filter(|model| !model.is_empty()) else {
+        return Ok(None);
+    };
+    if model.chars().count() > 120 {
+        return Err("model must be 120 characters or fewer".to_string());
+    }
+    Ok(Some(model.to_string()))
+}
+
 fn agent_run_from_row(row: &Row) -> Result<AgentRun, ApiError> {
     let status_name: String = row.try_get("status").map_err(database_error)?;
     let status = run_status_from_name(&status_name).ok_or_else(|| {
@@ -17907,6 +17917,8 @@ async fn start_agent(
             "maxSeconds must be at least 60",
         ));
     }
+    let model = normalize_model(input.model.as_deref())
+        .map_err(|message| ApiError::new(StatusCode::BAD_REQUEST, message))?;
     let (auth, workspace_id) = auth_for_project(&state, &headers, &input.project_id).await?;
     require_workspace_permission(&state, &auth, &workspace_id, "project", "read").await?;
     require_workspace_permission(&state, &auth, &workspace_id, "task", "create").await?;
@@ -17967,12 +17979,7 @@ async fn start_agent(
             "sandbox_workspace_write.network_access=true".to_string(),
         ]);
     }
-    if let Some(model) = input
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-    {
+    if let Some(model) = model.as_deref() {
         command_args.extend(["--model".to_string(), model.to_string()]);
     }
     command_args.push(build_agent_prompt(&input, &workspace_id));
@@ -17990,7 +17997,7 @@ async fn start_agent(
         project_id: input.project_id.clone(),
         prompt: input.prompt.trim().to_string(),
         cwd,
-        model: input.model.clone(),
+        model,
         network_access,
         command: env::var("KANEO_CODEX_BIN").unwrap_or_else(|_| "codex".to_string()),
         command_args,
@@ -18041,7 +18048,8 @@ async fn delegate_orchestrator_child(
     {
         return Err("cwd must be 1000 characters or fewer".to_string());
     }
-    let model = mcp_optional_string(args, "model")?;
+    let requested_model = mcp_optional_string(args, "model")?;
+    let model = normalize_model(requested_model.as_deref())?;
     let network_access = mcp_optional_bool(args, "networkAccess")?.unwrap_or(false);
     let max_seconds = mcp_optional_positive_i64(args, "maxSeconds")?
         .map(|value| {
@@ -18697,6 +18705,8 @@ async fn create_orchestrator(
             "maxSeconds must be at least 60",
         ));
     }
+    let model = normalize_model(input.model.as_deref())
+        .map_err(|message| ApiError::new(StatusCode::BAD_REQUEST, message))?;
     let (auth, workspace_id) = auth_for_project(&state, &headers, &input.project_id).await?;
     require_workspace_permission(&state, &auth, &workspace_id, "project", "read").await?;
     require_workspace_permission(&state, &auth, &workspace_id, "task", "create").await?;
@@ -18737,7 +18747,7 @@ async fn create_orchestrator(
         credential: auth.credential.clone(),
         goal: input.goal.trim().to_string(),
         cwd,
-        model: input.model,
+        model,
         network_access: input.network_access.unwrap_or(false),
         max_children,
         max_retries,
@@ -19598,6 +19608,19 @@ mod tests {
         let runner = RunManager::new(RunnerConfig::default());
         refresh_orchestrator_status(&mut record, &runner, &HashMap::new());
         assert_eq!(record.status, OrchestratorStatus::Waiting);
+    }
+
+    #[test]
+    fn normalize_model_trims_optional_overrides_and_bounds_length() {
+        assert_eq!(
+            normalize_model(Some("  gpt-5  ")).expect("model should normalize"),
+            Some("gpt-5".to_string())
+        );
+        assert_eq!(
+            normalize_model(Some("  ")).expect("blank model is optional"),
+            None
+        );
+        assert!(normalize_model(Some(&"m".repeat(121))).is_err());
     }
 
     #[test]
