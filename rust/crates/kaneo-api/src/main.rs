@@ -22,7 +22,7 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{Algorithm, EncodingKey, Header as JwtHeader, encode};
-use kaneo_core::{AgentRun, AgentSpec, RunManager, RunStatus, RunnerConfig};
+use kaneo_core::{AgentEvent, AgentRun, AgentSpec, RunManager, RunStatus, RunnerConfig};
 use serde::de::Error as SerdeDeError;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -17039,11 +17039,13 @@ fn orchestrator_response(
     record: &OrchestratorRecord,
     runner: &RunManager,
     records: &HashMap<String, OrchestratorRecord>,
+    persisted_runs: &HashMap<String, AgentRun>,
 ) -> OrchestratorResponse {
     fn at_depth(
         record: &OrchestratorRecord,
         runner: &RunManager,
         records: &HashMap<String, OrchestratorRecord>,
+        persisted_runs: &HashMap<String, AgentRun>,
         depth: usize,
     ) -> OrchestratorResponse {
         OrchestratorResponse {
@@ -17070,13 +17072,23 @@ fn orchestrator_response(
                 .children
                 .iter()
                 .map(|child| {
-                    let run = runner.get(&child.run_id);
+                    let run = runner
+                        .get(&child.run_id)
+                        .or_else(|| persisted_runs.get(&child.run_id).cloned());
                     let orchestrator = if depth < MAX_ORCHESTRATOR_RESPONSE_DEPTH {
                         child
                             .orchestrator_id
                             .as_ref()
                             .and_then(|id| records.get(id))
-                            .map(|nested| Box::new(at_depth(nested, runner, records, depth + 1)))
+                            .map(|nested| {
+                                Box::new(at_depth(
+                                    nested,
+                                    runner,
+                                    records,
+                                    persisted_runs,
+                                    depth + 1,
+                                ))
+                            })
                     } else {
                         None
                     };
@@ -17107,7 +17119,30 @@ fn orchestrator_response(
         }
     }
 
-    at_depth(record, runner, records, 0)
+    at_depth(record, runner, records, persisted_runs, 0)
+}
+
+fn collect_orchestrator_run_ids(
+    orchestrator_id: &str,
+    records: &HashMap<String, OrchestratorRecord>,
+    run_ids: &mut HashSet<String>,
+    visiting: &mut HashSet<String>,
+) {
+    if !visiting.insert(orchestrator_id.to_string()) {
+        return;
+    }
+    if let Some(record) = records.get(orchestrator_id) {
+        if let Some(run_id) = record.active_turn_id.as_ref() {
+            run_ids.insert(run_id.clone());
+        }
+        for child in &record.children {
+            run_ids.insert(child.run_id.clone());
+            if let Some(child_orchestrator_id) = child.orchestrator_id.as_deref() {
+                collect_orchestrator_run_ids(child_orchestrator_id, records, run_ids, visiting);
+            }
+        }
+    }
+    visiting.remove(orchestrator_id);
 }
 
 async fn orchestrator_snapshot(
@@ -17135,9 +17170,24 @@ async fn orchestrator_snapshot(
         .cloned()
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Orchestrator not found"))?;
     let records = orchestrators.records.clone();
-    let response = orchestrator_response(&snapshot, &state.orchestrator_runner, &records);
     drop(orchestrators);
+    let mut run_ids = HashSet::new();
+    collect_orchestrator_run_ids(orchestrator_id, &records, &mut run_ids, &mut HashSet::new());
+    let mut persisted_runs = HashMap::new();
+    for run_id in run_ids {
+        if state.orchestrator_runner.get(&run_id).is_none() {
+            if let Some(run) = state.database.get_agent_run(&run_id).await? {
+                persisted_runs.insert(run_id, run);
+            }
+        }
+    }
     state.database.upsert_orchestrator(&snapshot).await?;
+    let response = orchestrator_response(
+        &snapshot,
+        &state.orchestrator_runner,
+        &records,
+        &persisted_runs,
+    );
     Ok(response)
 }
 
@@ -17507,6 +17557,21 @@ async fn start_orchestrator_turn(
             return Err(ApiError::new(StatusCode::CONFLICT, error.to_string()));
         }
     };
+    if let Err(error) = state.database.upsert_agent_run(&run).await {
+        let _ = state.orchestrator_runner.cancel(&run.id);
+        let mut orchestrators = state.orchestrators.lock().await;
+        if let Some(record) = orchestrators.records.get_mut(orchestrator_id) {
+            record.status = OrchestratorStatus::Failed;
+            record.error = Some(error.message.clone());
+            record.updated_at = now_rfc3339();
+        }
+        return Err(error);
+    }
+    spawn_agent_persistence_watcher(
+        state.clone(),
+        state.orchestrator_runner.clone(),
+        run.id.clone(),
+    );
     let accepted = {
         let mut orchestrators = state.orchestrators.lock().await;
         let record = orchestrators
@@ -17677,10 +17742,10 @@ fn agent_response(run: AgentRun) -> AgentRunResponse {
     }
 }
 
-fn spawn_agent_persistence_watcher(state: AppState, run_id: String) {
+fn spawn_agent_persistence_watcher(state: AppState, runner: RunManager, run_id: String) {
     tokio::spawn(async move {
         loop {
-            let Some(run) = state.runner.get(&run_id) else {
+            let Some(run) = runner.get(&run_id) else {
                 return;
             };
             if run.status.is_active() {
@@ -17848,7 +17913,7 @@ async fn start_agent(
         let _ = state.runner.cancel(&run.id);
         return Err(error);
     }
-    spawn_agent_persistence_watcher(state.clone(), run.id.clone());
+    spawn_agent_persistence_watcher(state.clone(), state.runner.clone(), run.id.clone());
     Ok((StatusCode::ACCEPTED, Json(agent_response(run))))
 }
 
@@ -17983,6 +18048,15 @@ async fn delegate_orchestrator_child(
         .orchestrator_runner
         .start(spec)
         .map_err(|error| error.to_string())?;
+    if let Err(error) = state.database.upsert_agent_run(&run).await {
+        let _ = state.orchestrator_runner.cancel(&run.id);
+        return Err(error.message);
+    }
+    spawn_agent_persistence_watcher(
+        state.clone(),
+        state.orchestrator_runner.clone(),
+        run.id.clone(),
+    );
     let child = OrchestratorChild {
         id: child_id.clone(),
         orchestrator_id: Some(child_orchestrator_id.clone()),
@@ -18268,6 +18342,17 @@ fn spawn_orchestrator_child_watcher(
                 );
                 match state.orchestrator_runner.start(spec) {
                     Ok(next_run) => {
+                        if let Err(error) = state.database.upsert_agent_run(&next_run).await {
+                            eprintln!(
+                                "[kaneo-rust-api] could not persist orchestrator retry {}: {}",
+                                next_run.id, error.message
+                            );
+                        }
+                        spawn_agent_persistence_watcher(
+                            state.clone(),
+                            state.orchestrator_runner.clone(),
+                            next_run.id.clone(),
+                        );
                         let mut accepted = false;
                         let mut retry_record = None;
                         {
@@ -19356,6 +19441,7 @@ mod tests {
             records.get("orchestrator-test").expect("root record"),
             &runner,
             &records,
+            &HashMap::new(),
         );
         let child = response.children.first().expect("child response");
         let nested_response = child
@@ -19370,6 +19456,69 @@ mod tests {
         );
         assert_eq!(nested_response.depth, 1);
         assert_eq!(nested_response.status, OrchestratorStatus::Waiting);
+    }
+
+    #[test]
+    fn orchestrator_response_uses_persisted_child_run_after_restart() {
+        let mut root = test_orchestrator();
+        root.children.push(OrchestratorChild {
+            id: "child-link".to_string(),
+            orchestrator_id: None,
+            task_id: Some("task-child".to_string()),
+            prompt: "Deliver the child task".to_string(),
+            cwd: root.cwd.clone(),
+            model: root.model.clone(),
+            network_access: false,
+            max_seconds: 60,
+            attempt: 1,
+            max_retries: 1,
+            run_id: "persisted-child-run".to_string(),
+            status: RunStatus::Failed,
+            error: Some("Rust API restarted before the child agent finished.".to_string()),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        });
+        let records = HashMap::from([(root.id.clone(), root)]);
+        let persisted_run = AgentRun {
+            id: "persisted-child-run".to_string(),
+            workspace_id: "workspace-test".to_string(),
+            project_id: "project-test".to_string(),
+            prompt: "Deliver the child task".to_string(),
+            cwd: std::env::current_dir()
+                .expect("current directory")
+                .display()
+                .to_string(),
+            model: Some("gpt-test".to_string()),
+            network_access: false,
+            status: RunStatus::Failed,
+            created_at: now_rfc3339(),
+            started_at: Some(now_rfc3339()),
+            finished_at: Some(now_rfc3339()),
+            exit_code: None,
+            error: Some("Rust API restarted before the child agent finished.".to_string()),
+            events: vec![AgentEvent {
+                at: now_rfc3339(),
+                event_type: "run.failed".to_string(),
+                text: "Child run was recovered from durable storage.".to_string(),
+            }],
+        };
+        let runner = RunManager::new(RunnerConfig::default());
+        let response = orchestrator_response(
+            records.get("orchestrator-test").expect("root record"),
+            &runner,
+            &records,
+            &HashMap::from([(persisted_run.id.clone(), persisted_run)]),
+        );
+        let child = response.children.first().expect("child response");
+        assert_eq!(child.status, RunStatus::Failed);
+        assert_eq!(
+            child
+                .run
+                .as_ref()
+                .and_then(|run| run.events.first())
+                .map(|event| event.text.as_str()),
+            Some("Child run was recovered from durable storage.")
+        );
     }
 
     #[test]

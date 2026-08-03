@@ -46,7 +46,9 @@ can chat through `/messages`, delegate bounded child runs with the
 and cancel the whole tree. Orchestrator and child lifecycle events are sent on
 the existing project WebSocket, so the board can remain open while agents
 work. Orchestrator hierarchy and messages are persisted without credentials;
-active work is marked interrupted on an API restart and can be resumed with a
+parent and child run summaries are persisted in the durable agent-run history,
+so recovered trees retain terminal events instead of only a status badge.
+Active work is marked interrupted on an API restart and can be resumed with a
 new authenticated message.
 
 Slack, Discord, and Telegram project-integration configuration is native too:
