@@ -5,6 +5,7 @@ import {
   FolderOpen,
   LoaderCircle,
   MessageCircle,
+  RotateCcw,
   Send,
   ShieldCheck,
   Square,
@@ -52,6 +53,10 @@ const orchestratorStorageKey = (projectId: string) =>
 
 function isActive(status?: OrchestratorStatus) {
   return status === "queued" || status === "running";
+}
+
+function canMessage(status?: OrchestratorStatus) {
+  return status === "waiting" || status === "failed";
 }
 
 function statusLabel(status?: OrchestratorStatus) {
@@ -159,7 +164,9 @@ export default function ProjectOrchestratorDialog({
           .then((restored) => {
             if (cancelled) return;
             setOrchestrator(restored);
-            if (isActive(restored.status)) setIsMonitorOpen(true);
+            if (isActive(restored.status) || restored.status === "failed") {
+              setIsMonitorOpen(true);
+            }
           })
           .catch((error: unknown) => {
             if (cancelled) return;
@@ -331,6 +338,27 @@ export default function ProjectOrchestratorDialog({
         error instanceof Error
           ? error.message
           : "Couldn't send the orchestrator message.",
+      );
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  const handleResume = async () => {
+    if (!orchestrator) return;
+    setIsSending(true);
+    try {
+      const updated = await sendOrchestratorMessage(
+        orchestrator.id,
+        "Resume from the persisted state. Re-check the current Kanban tasks and child-agent results, avoid repeating completed work, and continue the original goal with verification.",
+      );
+      setOrchestrator(updated);
+      toast.success("Orchestrator resumed");
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Couldn't resume the orchestrator.",
       );
     } finally {
       setIsSending(false);
@@ -548,7 +576,7 @@ export default function ProjectOrchestratorDialog({
                 <p className="text-xs text-destructive">{orchestrator.error}</p>
               )}
 
-              {orchestrator.status === "waiting" && (
+              {canMessage(orchestrator.status) && (
                 <div className="flex items-end gap-2">
                   <label
                     htmlFor="orchestrator-message"
@@ -566,7 +594,11 @@ export default function ProjectOrchestratorDialog({
                         }
                       }}
                       className="min-h-16"
-                      placeholder="Ask the orchestrator what to do next…"
+                      placeholder={
+                        orchestrator.status === "failed"
+                          ? "Describe how to resume or retry…"
+                          : "Ask the orchestrator what to do next…"
+                      }
                       disabled={isSending}
                     />
                   </label>
@@ -593,6 +625,17 @@ export default function ProjectOrchestratorDialog({
                   >
                     <Square className="size-3.5" />
                     Stop all agents
+                  </Button>
+                )}
+                {orchestrator.status === "failed" && (
+                  <Button
+                    size="xs"
+                    onClick={() => void handleResume()}
+                    disabled={isSending}
+                    loading={isSending}
+                  >
+                    <RotateCcw className="size-3.5" />
+                    Resume orchestrator
                   </Button>
                 )}
                 {!active && orchestrator.status !== "cancelled" && (
