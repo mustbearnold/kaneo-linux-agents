@@ -22,7 +22,7 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{Algorithm, EncodingKey, Header as JwtHeader, encode};
-use kaneo_core::{AgentEvent, AgentRun, AgentSpec, RunManager, RunStatus, RunnerConfig};
+use kaneo_core::{AgentRun, AgentSpec, RunManager, RunStatus, RunnerConfig};
 use serde::de::Error as SerdeDeError;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -19496,7 +19496,7 @@ mod tests {
             finished_at: Some(now_rfc3339()),
             exit_code: None,
             error: Some("Rust API restarted before the child agent finished.".to_string()),
-            events: vec![AgentEvent {
+            events: vec![kaneo_core::AgentEvent {
                 at: now_rfc3339(),
                 event_type: "run.failed".to_string(),
                 text: "Child run was recovered from durable storage.".to_string(),
