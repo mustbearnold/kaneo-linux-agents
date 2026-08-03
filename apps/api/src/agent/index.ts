@@ -1,7 +1,10 @@
+import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { describeRoute, resolver, validator } from "hono-openapi";
 import * as v from "valibot";
+import db from "../database";
+import { projectTable } from "../database/schema";
 import { requireWorkspacePermission } from "../utils/require-workspace-permission";
 import { validateWorkspaceAccess } from "../utils/validate-workspace-access";
 import { workspaceAccess } from "../utils/workspace-access-middleware";
@@ -79,9 +82,21 @@ const agent = new Hono<{
         });
       }
 
+      const project = await db.query.projectTable.findFirst({
+        where: and(
+          eq(projectTable.id, input.projectId),
+          eq(projectTable.workspaceId, c.get("workspaceId")),
+        ),
+        columns: { localPath: true },
+      });
+      if (!project) {
+        throw new HTTPException(404, { message: "Project not found" });
+      }
+
       try {
         const run = await startAgentRun({
           ...input,
+          projectCwd: project.localPath ?? undefined,
           workspaceId: c.get("workspaceId"),
           bearerToken: token,
         });

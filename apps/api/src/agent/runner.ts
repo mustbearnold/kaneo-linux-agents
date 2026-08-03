@@ -39,6 +39,7 @@ type StartAgentRunInput = {
   projectId: string;
   prompt: string;
   cwd?: string;
+  projectCwd?: string;
   model?: string;
   networkAccess?: boolean;
   maxSeconds?: number;
@@ -136,15 +137,17 @@ async function resolveWorkingDirectory(
   runId: string,
 ) {
   const requested = input.cwd?.trim();
-  if (requested && !isAbsolute(requested)) {
+  const projectDefault = input.projectCwd?.trim();
+  const selected = requested || projectDefault;
+  if (selected && !isAbsolute(selected)) {
     throw new Error("The agent working directory must be an absolute path.");
   }
 
-  const cwd = requested
-    ? resolve(requested)
+  const cwd = selected
+    ? resolve(selected)
     : join(tmpdir(), "kaneo-agent-runs", runId);
 
-  if (!requested) {
+  if (!selected) {
     await mkdir(cwd, { recursive: true });
   }
 

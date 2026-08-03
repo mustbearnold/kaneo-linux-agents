@@ -773,6 +773,8 @@ struct UpdateProjectInput {
     slug: String,
     description: String,
     is_public: bool,
+    #[serde(default)]
+    local_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2438,6 +2440,10 @@ async fn update_project(
     Json(input): Json<UpdateProjectInput>,
 ) -> Result<Json<Value>, ApiError> {
     let (_, workspace_id) = auth_for_project(&state, &headers, &id).await?;
+    let local_path = match input.local_path {
+        Some(value) => validate_project_local_path(Some(value))?,
+        None => project_local_path(&state.database, &id).await?,
+    };
     let updated = state
         .database
         .client
@@ -2445,14 +2451,15 @@ async fn update_project(
             r#"
               UPDATE project
               SET name = $1, icon = $2, slug = $3, description = $4,
-                  is_public = $5
-              WHERE id = $6 AND workspace_id = $7
+                  local_path = $5, is_public = $6
+              WHERE id = $7 AND workspace_id = $8
             "#,
             &[
                 &input.name,
                 &input.icon,
                 &input.slug,
                 &input.description,
+                &local_path,
                 &input.is_public,
                 &id,
                 &workspace_id,
@@ -6601,6 +6608,7 @@ fn mcp_tool_definitions() -> Value {
                 "slug": optional_string,
                 "description": {"type": "string"},
                 "isPublic": {"type": "boolean"},
+                "localPath": optional_string,
             }), &["id"]),
         }),
         json!({
@@ -7045,13 +7053,17 @@ async fn mcp_call_tool(
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
             });
-            let body = json!({
+            let local_path = mcp_optional_text(args, "localPath")?;
+            let mut body = json!({
                 "name": name,
                 "icon": icon,
                 "slug": slug,
                 "description": description,
                 "isPublic": is_public,
             });
+            if let Some(local_path) = local_path {
+                body["localPath"] = Value::String(local_path);
+            }
             mcp_api_request(
                 state,
                 auth,

@@ -5,6 +5,7 @@ import {
   useNavigate,
   useParams,
 } from "@tanstack/react-router";
+import { FolderOpen } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
@@ -43,6 +44,7 @@ import { useGetTasks } from "@/hooks/queries/task/use-get-tasks";
 import useActiveWorkspace from "@/hooks/queries/workspace/use-active-workspace";
 import { useWorkspacePermission } from "@/hooks/use-workspace-permission";
 import { cn } from "@/lib/cn";
+import { pickProjectFolder } from "@/lib/tauri";
 import { toast } from "@/lib/toast";
 import useProjectStore from "@/store/project.ts";
 
@@ -57,6 +59,7 @@ type ProjectFormValues = {
   slug: string;
   description?: string;
   icon: string;
+  localPath: string;
 };
 
 type NormalizedProjectValues = {
@@ -64,6 +67,7 @@ type NormalizedProjectValues = {
   slug: string;
   description: string;
   icon: string;
+  localPath: string;
 };
 
 function normalizeProjectValues(
@@ -74,6 +78,7 @@ function normalizeProjectValues(
     slug: data.slug.trim(),
     description: (data.description ?? "").trim(),
     icon: data.icon || "Layout",
+    localPath: data.localPath.trim(),
   };
 }
 
@@ -92,6 +97,9 @@ function RouteComponent() {
           .min(2, t("settings:projectGeneral.validation.keyShort"))
           .max(8, t("settings:projectGeneral.validation.keyMax")),
         description: z.string().optional(),
+        localPath: z
+          .string()
+          .max(1000, "Local project folder must be 1000 characters or fewer"),
         icon: z
           .string()
           .min(1, t("settings:projectGeneral.validation.iconRequired")),
@@ -108,6 +116,7 @@ function RouteComponent() {
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [iconPopoverOpen, setIconPopoverOpen] = useState(false);
   const [iconSearch, setIconSearch] = useState("");
+  const [isPickingFolder, setIsPickingFolder] = useState(false);
 
   const { data: workspace } = useActiveWorkspace();
   const { projectId: rawProjectId } = useParams({ strict: false });
@@ -136,6 +145,7 @@ function RouteComponent() {
       slug: project?.slug || "",
       description: project?.description || "",
       icon: project?.icon || "Layout",
+      localPath: project?.localPath || "",
     },
   });
 
@@ -147,6 +157,7 @@ function RouteComponent() {
       slug: project.slug || "",
       description: project.description || "",
       icon: project.icon || "Layout",
+      localPath: project.localPath || "",
     };
     lastSavedRef.current = normalizeProjectValues(nextValues);
 
@@ -169,8 +180,14 @@ function RouteComponent() {
       const descriptionChanged =
         lastSavedRef.current?.description !== normalizedData.description;
       const iconChanged = lastSavedRef.current?.icon !== normalizedData.icon;
+      const localPathChanged =
+        lastSavedRef.current?.localPath !== normalizedData.localPath;
       const hasChanges =
-        nameChanged || slugChanged || descriptionChanged || iconChanged;
+        nameChanged ||
+        slugChanged ||
+        descriptionChanged ||
+        iconChanged ||
+        localPathChanged;
 
       if (!hasChanges) return;
 
@@ -190,6 +207,9 @@ function RouteComponent() {
             ? normalizedData.description
             : (project.description ?? ""),
           icon: iconChanged ? normalizedData.icon : (project.icon ?? "Layout"),
+          localPath: localPathChanged
+            ? normalizedData.localPath
+            : (project.localPath ?? ""),
           isPublic: !!project.isPublic,
         };
 
@@ -232,6 +252,7 @@ function RouteComponent() {
       project?.slug,
       project?.description,
       project?.icon,
+      project?.localPath,
       updateProject,
       queryClient,
       workspace?.id,
@@ -244,6 +265,29 @@ function RouteComponent() {
   const projectFormRef = useRef(projectForm);
   saveProjectRef.current = saveProject;
   projectFormRef.current = projectForm;
+
+  const handlePickFolder = useCallback(async () => {
+    if (!canEdit) return;
+
+    setIsPickingFolder(true);
+    try {
+      const selected = await pickProjectFolder();
+      if (selected) {
+        projectForm.setValue("localPath", selected, {
+          shouldDirty: true,
+          shouldValidate: true,
+        });
+      }
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Couldn't open the local folder picker.",
+      );
+    } finally {
+      setIsPickingFolder(false);
+    }
+  }, [canEdit, projectForm]);
 
   const debouncedSave = useCallback(() => {
     if (debounceTimeoutRef.current) {
@@ -287,7 +331,8 @@ function RouteComponent() {
           last.name !== normalized.name ||
           last.slug !== normalized.slug ||
           last.description !== normalized.description ||
-          last.icon !== normalized.icon;
+          last.icon !== normalized.icon ||
+          last.localPath !== normalized.localPath;
         if (!hasPendingChanges) return;
 
         const isValid = await projectFormRef.current.trigger();
@@ -531,6 +576,66 @@ function RouteComponent() {
                             {...field}
                           />
                         </FormControl>
+                      </div>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <Separator />
+
+                <FormField
+                  control={projectForm.control}
+                  name="localPath"
+                  render={({ field }) => (
+                    <FormItem>
+                      <div className="flex items-center justify-between gap-4">
+                        <div className="space-y-0.5">
+                          <FormLabel className="text-sm font-medium">
+                            Local project folder
+                          </FormLabel>
+                          <p className="text-xs text-muted-foreground">
+                            Agents use this folder as their working directory.
+                          </p>
+                        </div>
+                        <div className="flex w-[28rem] max-w-[55%] items-center gap-2">
+                          <FormControl>
+                            <Input
+                              className="min-w-0 flex-1"
+                              placeholder="/home/you/Projects/your-repository"
+                              disabled={!canEdit}
+                              {...field}
+                            />
+                          </FormControl>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="shrink-0 gap-1.5"
+                            onClick={() => void handlePickFolder()}
+                            disabled={!canEdit || isPickingFolder}
+                          >
+                            <FolderOpen className="size-3.5" />
+                            {isPickingFolder ? "Opening…" : "Browse"}
+                          </Button>
+                          {field.value && (
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="shrink-0"
+                              onClick={() =>
+                                projectForm.setValue("localPath", "", {
+                                  shouldDirty: true,
+                                  shouldValidate: true,
+                                })
+                              }
+                              disabled={!canEdit || isPickingFolder}
+                            >
+                              Clear
+                            </Button>
+                          )}
+                        </div>
                       </div>
                       <FormMessage />
                     </FormItem>
