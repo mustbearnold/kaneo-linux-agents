@@ -134,6 +134,7 @@ export default function ProjectOrchestratorDialog({
   const [open, setOpen] = useState(false);
   const [goal, setGoal] = useState(DEFAULT_GOAL);
   const [cwd, setCwd] = useState("");
+  const [model, setModel] = useState("");
   const [networkAccess, setNetworkAccess] = useState(false);
   const [maxChildren, setMaxChildren] = useState("4");
   const [message, setMessage] = useState("");
@@ -302,6 +303,7 @@ export default function ProjectOrchestratorDialog({
         projectId,
         goal: goal.trim(),
         ...(cwd.trim() ? { cwd: cwd.trim() } : {}),
+        ...(model.trim() ? { model: model.trim() } : {}),
         networkAccess,
         maxChildren: Math.max(1, Math.min(8, Number(maxChildren) || 4)),
         maxRetries: 1,
@@ -426,6 +428,26 @@ export default function ProjectOrchestratorDialog({
                 className="min-h-28"
                 placeholder="What should the team of agents deliver?"
               />
+            </label>
+
+            <label htmlFor="orchestrator-model" className="block space-y-1.5">
+              <span className="text-sm font-medium">
+                Codex model override{" "}
+                <span className="font-normal text-muted-foreground">
+                  (optional)
+                </span>
+              </span>
+              <Input
+                id="orchestrator-model"
+                value={model}
+                onChange={(event) => setModel(event.target.value)}
+                disabled={active || isStarting}
+                placeholder="Leave blank for the configured OAuth default"
+              />
+              <span className="block text-xs text-muted-foreground">
+                The parent and delegated children use this model unless a child
+                explicitly overrides it.
+              </span>
             </label>
 
             <label htmlFor="orchestrator-cwd" className="block space-y-1.5">

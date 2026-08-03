@@ -43,7 +43,9 @@ in-memory state overlaid ahead of durable rows, and are restored after an API
 restart; any run that was still active at restart is reported as failed with
 an interruption error. Orchestrator-sourced runs are kept out of that direct
 history so a fresh project view cannot mistake a child turn for a standalone
-agent run.
+agent run. Both the direct-agent and orchestrator dialogs can pass an optional
+Codex model ID; leaving it blank preserves the account's configured OAuth
+default.
 
 The Rust runtime also exposes `/api/agent/orchestrators`: a parent Codex turn
 can chat through `/messages`, delegate bounded child runs with the

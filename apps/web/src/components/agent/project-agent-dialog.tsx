@@ -69,6 +69,7 @@ export default function ProjectAgentDialog({
   const [open, setOpen] = useState(false);
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
   const [cwd, setCwd] = useState("");
+  const [model, setModel] = useState("");
   const [networkAccess, setNetworkAccess] = useState(false);
   const [run, setRun] = useState<AgentRun | null>(null);
   const [isMonitorOpen, setIsMonitorOpen] = useState(false);
@@ -244,6 +245,7 @@ export default function ProjectAgentDialog({
         projectId,
         prompt,
         ...(cwd.trim() ? { cwd: cwd.trim() } : {}),
+        ...(model.trim() ? { model: model.trim() } : {}),
         networkAccess,
         maxSeconds: 60 * 60,
       });
@@ -330,6 +332,25 @@ export default function ProjectAgentDialog({
                 className="min-h-28"
                 placeholder="Tell the agent what outcome to deliver..."
               />
+            </label>
+
+            <label htmlFor="agent-model" className="block space-y-1.5">
+              <span className="text-sm font-medium">
+                Codex model override{" "}
+                <span className="font-normal text-muted-foreground">
+                  (optional)
+                </span>
+              </span>
+              <Input
+                id="agent-model"
+                value={model}
+                onChange={(event) => setModel(event.target.value)}
+                disabled={active || isStarting}
+                placeholder="Leave blank for the configured OAuth default"
+              />
+              <span className="block text-xs text-muted-foreground">
+                Enter a model ID available to the signed-in Codex account.
+              </span>
             </label>
 
             <label htmlFor="agent-cwd" className="block space-y-1.5">
