@@ -538,18 +538,7 @@ pub fn redact_secrets(text: &str) -> String {
         return serde_json::to_string_pretty(&value).unwrap_or_else(|_| text.to_string());
     }
 
-    let mut result = text.to_string();
-    for prefix in ["Bearer ", "bearer "] {
-        if let Some(start) = result.find(prefix) {
-            let token_start = start + prefix.len();
-            let token_end = result[token_start..]
-                .find(char::is_whitespace)
-                .map(|offset| token_start + offset)
-                .unwrap_or(result.len());
-            result.replace_range(token_start..token_end, "[redacted]");
-        }
-    }
-    result
+    redact_bearer_tokens(text)
 }
 
 fn redact_json(value: &mut Value) {
@@ -557,9 +546,13 @@ fn redact_json(value: &mut Value) {
         Value::Object(object) => {
             for (key, value) in object.iter_mut() {
                 let lower = key.to_ascii_lowercase();
-                if lower.contains("token")
-                    || lower.contains("api_key")
-                    || lower.contains("access_key")
+                let normalized = lower.replace(['_', '-', ' '], "");
+                if normalized.contains("token")
+                    || normalized.contains("apikey")
+                    || normalized.contains("accesskey")
+                    || normalized == "authorization"
+                    || normalized == "password"
+                    || normalized.contains("secret")
                 {
                     *value = Value::String("[redacted]".to_string());
                 } else {
@@ -568,8 +561,33 @@ fn redact_json(value: &mut Value) {
             }
         }
         Value::Array(values) => values.iter_mut().for_each(redact_json),
+        Value::String(value) => *value = redact_bearer_tokens(value),
         _ => {}
     }
+}
+
+fn redact_bearer_tokens(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while let Some(offset) = lower[cursor..].find("bearer ") {
+        let start = cursor + offset;
+        let token_start = start + "bearer ".len();
+        result.push_str(&text[cursor..token_start]);
+        let token_end = text[token_start..]
+            .char_indices()
+            .find(|(_, character)| {
+                character.is_whitespace() || matches!(character, '"' | '\'' | ',' | ')' | ']' | '}')
+            })
+            .map(|(offset, _)| token_start + offset)
+            .unwrap_or(text.len());
+        result.push_str("[redacted]");
+        cursor = token_end;
+    }
+
+    result.push_str(&text[cursor..]);
+    result
 }
 
 fn kill_child(child: &Arc<Mutex<Option<Child>>>) {
@@ -639,11 +657,16 @@ mod tests {
 
     #[test]
     fn redacts_sensitive_json_and_bearer_output() {
-        let redacted = redact_secrets(r#"{"token":"secret","nested":{"api_key":"hidden"}}"#);
+        let redacted = redact_secrets(
+            r#"{"token":"secret","nested":{"apiKey":"hidden","Authorization":"Bearer nested-secret"}}"#,
+        );
         assert!(!redacted.contains("secret"));
         assert!(!redacted.contains("hidden"));
         assert!(redacted.contains("[redacted]"));
-        assert_eq!(redact_secrets("Bearer super-secret"), "Bearer [redacted]");
+        assert_eq!(
+            redact_secrets("Bearer super-secret and bearer second-secret"),
+            "Bearer [redacted] and bearer [redacted]"
+        );
     }
 
     #[test]
