@@ -1347,6 +1347,13 @@ struct OrchestratorMessageInput {
     message: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OrchestratorListQuery {
+    project_id: Option<String>,
+    limit: Option<usize>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct OrchestratorChildResponse {
@@ -2495,7 +2502,7 @@ async fn openapi(State(state): State<AppState>) -> Json<Value> {
         ("/api/agent/runs", vec!["post"]),
         ("/api/agent/runs/{id}", vec!["get"]),
         ("/api/agent/runs/{id}/cancel", vec!["post"]),
-        ("/api/agent/orchestrators", vec!["post"]),
+        ("/api/agent/orchestrators", vec!["get", "post"]),
         ("/api/agent/orchestrators/{id}", vec!["get"]),
         ("/api/agent/orchestrators/{id}/messages", vec!["post"]),
         ("/api/agent/orchestrators/{id}/cancel", vec!["post"]),
@@ -18484,6 +18491,37 @@ fn spawn_orchestrator_child_watcher(
     });
 }
 
+async fn list_orchestrators(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<OrchestratorListQuery>,
+) -> Result<Json<Vec<OrchestratorResponse>>, ApiError> {
+    let project_id = query
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|project_id| !project_id.is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "projectId is required"))?;
+    let (auth, workspace_id) = auth_for_project(&state, &headers, project_id).await?;
+    require_workspace(&state, &auth, &workspace_id).await?;
+    let limit = query.limit.unwrap_or(20).clamp(1, 50);
+    let mut ids = {
+        let orchestrators = state.orchestrators.lock().await;
+        orchestrators
+            .records
+            .values()
+            .filter(|record| record.workspace_id == workspace_id && record.project_id == project_id)
+            .map(|record| (record.id.clone(), record.updated_at.clone()))
+            .collect::<Vec<_>>()
+    };
+    ids.sort_by(|left, right| right.1.cmp(&left.1));
+    let mut responses = Vec::with_capacity(ids.len().min(limit));
+    for (id, _) in ids.into_iter().take(limit) {
+        responses.push(orchestrator_snapshot(&state, &id).await?);
+    }
+    Ok(Json(responses))
+}
+
 async fn create_orchestrator(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -19185,7 +19223,10 @@ fn app(state: AppState) -> Router {
         .route("/api/agent/runs", post(start_agent))
         .route("/api/agent/runs/{id}", get(get_agent))
         .route("/api/agent/runs/{id}/cancel", post(cancel_agent))
-        .route("/api/agent/orchestrators", post(create_orchestrator))
+        .route(
+            "/api/agent/orchestrators",
+            get(list_orchestrators).post(create_orchestrator),
+        )
         .route("/api/agent/orchestrators/{id}", get(get_orchestrator))
         .route(
             "/api/agent/orchestrators/{id}/messages",

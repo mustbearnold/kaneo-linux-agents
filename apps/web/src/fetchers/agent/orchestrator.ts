@@ -41,6 +41,11 @@ export function createOrchestrator(
   });
 }
 
+export function listOrchestrators(projectId: string): Promise<Orchestrator[]> {
+  const query = new URLSearchParams({ projectId });
+  return request<Orchestrator[]>(`agent/orchestrators?${query.toString()}`);
+}
+
 export function getOrchestrator(id: string): Promise<Orchestrator> {
   return request<Orchestrator>(`agent/orchestrators/${encodeURIComponent(id)}`);
 }

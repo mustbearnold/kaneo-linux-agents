@@ -31,6 +31,7 @@ import {
   cancelOrchestrator,
   createOrchestrator,
   getOrchestrator,
+  listOrchestrators,
   sendOrchestratorMessage,
 } from "@/fetchers/agent/orchestrator";
 import { pickProjectFolder } from "@/lib/tauri";
@@ -156,30 +157,28 @@ export default function ProjectOrchestratorDialog({
       const storedOrchestratorId = window.localStorage.getItem(
         orchestratorStorageKey(projectId),
       );
-      if (!storedOrchestratorId) return;
 
       let retryCount = 0;
+      const restoreLatest = () =>
+        listOrchestrators(projectId).then((items) => items[0] ?? null);
       const restore = () => {
-        void getOrchestrator(storedOrchestratorId)
+        const request = storedOrchestratorId
+          ? getOrchestrator(storedOrchestratorId).catch((error: unknown) => {
+              if (isAgentNotFound(error)) return restoreLatest();
+              throw error;
+            })
+          : restoreLatest();
+        void request
           .then((restored) => {
             if (cancelled) return;
+            if (!restored) return;
             setOrchestrator(restored);
             if (isActive(restored.status) || restored.status === "failed") {
               setIsMonitorOpen(true);
             }
           })
-          .catch((error: unknown) => {
+          .catch((_error: unknown) => {
             if (cancelled) return;
-            if (isAgentNotFound(error)) {
-              try {
-                window.localStorage.removeItem(
-                  orchestratorStorageKey(projectId),
-                );
-              } catch {
-                // Ignore storage failures; the server remains the source of truth.
-              }
-              return;
-            }
             if (retryCount >= 5) return;
             const delay = Math.min(1_000 * 2 ** retryCount, 5_000);
             retryCount += 1;
