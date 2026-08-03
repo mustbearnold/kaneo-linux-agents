@@ -724,4 +724,52 @@ mod tests {
             RunStatus::Cancelled
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_kills_spawned_processes_in_the_run_group() {
+        let manager = RunManager::new(RunnerConfig::default());
+        let marker = std::env::temp_dir().join(format!("kaneo-agent-child-{}", Uuid::new_v4()));
+        let script = format!(
+            "sleep 10 & child=$!; printf '%s' \"$child\" > '{}'; wait",
+            marker.display()
+        );
+        manager
+            .start(shell_spec("process-tree", &script))
+            .expect("process-tree run starts");
+
+        let mut child_pid = None;
+        for _ in 0..100 {
+            if let Ok(pid) = std::fs::read_to_string(&marker) {
+                child_pid = pid.parse::<i32>().ok();
+                if child_pid.is_some() {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let Some(child_pid) = child_pid else {
+            let _ = manager.cancel("process-tree");
+            let _ = std::fs::remove_file(&marker);
+            panic!("spawned child pid was not recorded");
+        };
+
+        manager.cancel("process-tree");
+        assert_eq!(
+            wait_for_terminal(&manager, "process-tree").status,
+            RunStatus::Cancelled
+        );
+        let descendant_stopped = (0..100).any(|_| {
+            let stopped = unsafe { libc::kill(child_pid, 0) != 0 };
+            if !stopped {
+                thread::sleep(Duration::from_millis(10));
+            }
+            stopped
+        });
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            descendant_stopped,
+            "spawned child process survived cancellation"
+        );
+    }
 }
