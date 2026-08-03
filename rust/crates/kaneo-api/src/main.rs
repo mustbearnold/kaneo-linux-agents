@@ -17519,13 +17519,17 @@ async fn start_orchestrator_turn(
         record.clone()
     };
     if !record.cwd.is_dir() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Orchestrator working directory is not a directory: {}",
-                record.cwd.display()
-            ),
-        ));
+        let error = format!(
+            "Orchestrator working directory is not a directory: {}",
+            record.cwd.display()
+        );
+        let mut orchestrators = state.orchestrators.lock().await;
+        if let Some(current) = orchestrators.records.get_mut(orchestrator_id) {
+            current.status = OrchestratorStatus::Failed;
+            current.error = Some(error.clone());
+            current.updated_at = now_rfc3339();
+        }
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, error));
     }
     let run_id = Uuid::new_v4().to_string();
     let prompt = build_orchestrator_prompt(&record);
