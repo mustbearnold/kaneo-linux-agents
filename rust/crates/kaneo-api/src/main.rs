@@ -19,7 +19,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bcrypt::{hash as bcrypt_hash, verify as bcrypt_verify};
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, future::join_all};
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{Algorithm, EncodingKey, Header as JwtHeader, encode};
 use kaneo_core::{AgentRun, AgentSpec, RunManager, RunStatus, RunnerConfig};
@@ -17173,14 +17173,24 @@ async fn orchestrator_snapshot(
     drop(orchestrators);
     let mut run_ids = HashSet::new();
     collect_orchestrator_run_ids(orchestrator_id, &records, &mut run_ids, &mut HashSet::new());
-    let mut persisted_runs = HashMap::new();
-    for run_id in run_ids {
-        if state.orchestrator_runner.get(&run_id).is_none() {
-            if let Some(run) = state.database.get_agent_run(&run_id).await? {
-                persisted_runs.insert(run_id, run);
-            }
-        }
-    }
+    let persisted_runs = join_all(
+        run_ids
+            .into_iter()
+            .filter(|run_id| state.orchestrator_runner.get(run_id).is_none())
+            .map(|run_id| {
+                let database = state.database.clone();
+                async move {
+                    let run = database.get_agent_run(&run_id).await?;
+                    Ok::<_, ApiError>((run_id, run))
+                }
+            }),
+    )
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, ApiError>>()?
+    .into_iter()
+    .filter_map(|(run_id, run)| run.map(|run| (run_id, run)))
+    .collect::<HashMap<_, _>>();
     state.database.upsert_orchestrator(&snapshot).await?;
     let response = orchestrator_response(
         &snapshot,
