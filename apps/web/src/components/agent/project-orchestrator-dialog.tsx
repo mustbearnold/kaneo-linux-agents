@@ -11,7 +11,7 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -137,6 +137,7 @@ export default function ProjectOrchestratorDialog({
   const [isSending, setIsSending] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [isPickingFolder, setIsPickingFolder] = useState(false);
+  const pollFailures = useRef(0);
 
   const active = isActive(orchestrator?.status);
 
@@ -145,32 +146,47 @@ export default function ProjectOrchestratorDialog({
     setIsMonitorOpen(false);
 
     let cancelled = false;
-    let storedOrchestratorId: string | null = null;
+    let retryTimer: number | undefined;
     try {
-      storedOrchestratorId = window.localStorage.getItem(
+      const storedOrchestratorId = window.localStorage.getItem(
         orchestratorStorageKey(projectId),
       );
+      if (!storedOrchestratorId) return;
+
+      let retryCount = 0;
+      const restore = () => {
+        void getOrchestrator(storedOrchestratorId)
+          .then((restored) => {
+            if (cancelled) return;
+            setOrchestrator(restored);
+            if (isActive(restored.status)) setIsMonitorOpen(true);
+          })
+          .catch((error: unknown) => {
+            if (cancelled) return;
+            if (isAgentNotFound(error)) {
+              try {
+                window.localStorage.removeItem(
+                  orchestratorStorageKey(projectId),
+                );
+              } catch {
+                // Ignore storage failures; the server remains the source of truth.
+              }
+              return;
+            }
+            if (retryCount >= 5) return;
+            const delay = Math.min(1_000 * 2 ** retryCount, 5_000);
+            retryCount += 1;
+            retryTimer = window.setTimeout(restore, delay);
+          });
+      };
+      restore();
     } catch {
       return;
     }
-    if (!storedOrchestratorId) return;
-
-    void getOrchestrator(storedOrchestratorId)
-      .then((restored) => {
-        if (cancelled) return;
-        setOrchestrator(restored);
-        if (isActive(restored.status)) setIsMonitorOpen(true);
-      })
-      .catch(() => {
-        try {
-          window.localStorage.removeItem(orchestratorStorageKey(projectId));
-        } catch {
-          // Ignore storage failures; the server remains the source of truth.
-        }
-      });
 
     return () => {
       cancelled = true;
+      if (retryTimer) window.clearTimeout(retryTimer);
     };
   }, [projectId]);
 
@@ -188,10 +204,40 @@ export default function ProjectOrchestratorDialog({
   }, [projectId, orchestrator?.id]);
 
   useEffect(() => {
+    const key = orchestratorStorageKey(projectId);
+    const handleStorage = (event: StorageEvent) => {
+      if (
+        !event.newValue ||
+        event.key !== key ||
+        event.newValue === orchestrator?.id
+      ) {
+        return;
+      }
+      void getOrchestrator(event.newValue)
+        .then(setOrchestrator)
+        .catch((error: unknown) => {
+          if (isAgentNotFound(error)) {
+            try {
+              window.localStorage.removeItem(key);
+            } catch {
+              // Ignore storage failures; the missing orchestrator is terminal.
+            }
+          }
+        });
+    };
+    window.addEventListener("storage", handleStorage);
+    return () => window.removeEventListener("storage", handleStorage);
+  }, [orchestrator?.id, projectId]);
+
+  useEffect(() => {
     if (!orchestrator?.id || !isActive(orchestrator.status)) return;
+    pollFailures.current = 0;
     const interval = window.setInterval(() => {
       void getOrchestrator(orchestrator.id)
-        .then(setOrchestrator)
+        .then((updated) => {
+          pollFailures.current = 0;
+          setOrchestrator(updated);
+        })
         .catch((error: unknown) => {
           if (isAgentNotFound(error)) {
             try {
@@ -206,11 +252,14 @@ export default function ProjectOrchestratorDialog({
             );
             return;
           }
-          toast.error(
-            error instanceof Error
-              ? error.message
-              : "Couldn't read orchestrator status.",
-          );
+          pollFailures.current += 1;
+          if (pollFailures.current === 1 || pollFailures.current % 5 === 0) {
+            toast.error(
+              error instanceof Error
+                ? error.message
+                : "Couldn't read orchestrator status.",
+            );
+          }
         });
     }, 1200);
     return () => window.clearInterval(interval);

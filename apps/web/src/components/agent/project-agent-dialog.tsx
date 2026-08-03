@@ -9,7 +9,7 @@ import {
   Square,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -74,6 +74,7 @@ export default function ProjectAgentDialog({
   const [isStarting, setIsStarting] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [isPickingFolder, setIsPickingFolder] = useState(false);
+  const pollFailures = useRef(0);
   const activeRunId = run?.id;
   const activeRunStatus = run?.status;
 
@@ -82,30 +83,45 @@ export default function ProjectAgentDialog({
     setIsMonitorOpen(false);
 
     let cancelled = false;
-    let storedRunId: string | null = null;
+    let retryTimer: number | undefined;
     try {
-      storedRunId = window.localStorage.getItem(agentRunStorageKey(projectId));
+      const storedRunId = window.localStorage.getItem(
+        agentRunStorageKey(projectId),
+      );
+      if (!storedRunId) return;
+
+      let retryCount = 0;
+      const restore = () => {
+        void getAgentRun(storedRunId)
+          .then((restored) => {
+            if (cancelled) return;
+            setRun(restored);
+            if (isActive(restored.status)) setIsMonitorOpen(true);
+          })
+          .catch((error: unknown) => {
+            if (cancelled) return;
+            if (isAgentNotFound(error)) {
+              try {
+                window.localStorage.removeItem(agentRunStorageKey(projectId));
+              } catch {
+                // Ignore storage failures; the server remains the source of truth.
+              }
+              return;
+            }
+            if (retryCount >= 5) return;
+            const delay = Math.min(1_000 * 2 ** retryCount, 5_000);
+            retryCount += 1;
+            retryTimer = window.setTimeout(restore, delay);
+          });
+      };
+      restore();
     } catch {
       return;
     }
-    if (!storedRunId) return;
-
-    void getAgentRun(storedRunId)
-      .then((restored) => {
-        if (cancelled) return;
-        setRun(restored);
-        if (isActive(restored.status)) setIsMonitorOpen(true);
-      })
-      .catch(() => {
-        try {
-          window.localStorage.removeItem(agentRunStorageKey(projectId));
-        } catch {
-          // Ignore storage failures; the server remains the source of truth.
-        }
-      });
 
     return () => {
       cancelled = true;
+      if (retryTimer) window.clearTimeout(retryTimer);
     };
   }, [projectId]);
 
@@ -120,11 +136,37 @@ export default function ProjectAgentDialog({
   }, [projectId, run?.id]);
 
   useEffect(() => {
+    const key = agentRunStorageKey(projectId);
+    const handleStorage = (event: StorageEvent) => {
+      if (!event.newValue || event.key !== key || event.newValue === run?.id) {
+        return;
+      }
+      void getAgentRun(event.newValue)
+        .then(setRun)
+        .catch((error: unknown) => {
+          if (isAgentNotFound(error)) {
+            try {
+              window.localStorage.removeItem(key);
+            } catch {
+              // Ignore storage failures; the missing run is still terminal.
+            }
+          }
+        });
+    };
+    window.addEventListener("storage", handleStorage);
+    return () => window.removeEventListener("storage", handleStorage);
+  }, [projectId, run?.id]);
+
+  useEffect(() => {
     if (!activeRunId || !isActive(activeRunStatus)) return;
+    pollFailures.current = 0;
 
     const interval = window.setInterval(() => {
       void getAgentRun(activeRunId)
-        .then(setRun)
+        .then((updated) => {
+          pollFailures.current = 0;
+          setRun(updated);
+        })
         .catch((error: unknown) => {
           if (isAgentNotFound(error)) {
             try {
@@ -139,11 +181,14 @@ export default function ProjectAgentDialog({
             );
             return;
           }
-          toast.error(
-            error instanceof Error
-              ? error.message
-              : "Couldn't read agent status.",
-          );
+          pollFailures.current += 1;
+          if (pollFailures.current === 1 || pollFailures.current % 5 === 0) {
+            toast.error(
+              error instanceof Error
+                ? error.message
+                : "Couldn't read agent status.",
+            );
+          }
         });
     }, 1500);
 
