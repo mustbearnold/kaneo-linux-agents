@@ -184,15 +184,23 @@ fn wait_for_web_server(port: &str) {
 #[tauri::command]
 fn pick_project_folder() -> Result<Option<String>, String> {
     let start = env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("/"))
-        .display()
-        .to_string();
+        .ok()
+        .filter(|path| path.is_dir())
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_dir())
+        })
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let start_display = start.display().to_string();
+    let mut attempted = false;
+    let mut failures = Vec::new();
     for (program, args) in [
         (
             "kdialog",
             vec![
                 "--getexistingdirectory".to_string(),
-                start.clone(),
+                start_display.clone(),
                 "--title".to_string(),
                 "Select a Kaneo project folder".to_string(),
             ],
@@ -205,19 +213,60 @@ fn pick_project_folder() -> Result<Option<String>, String> {
                 "--title=Select a Kaneo project folder".to_string(),
             ],
         ),
+        (
+            "yad",
+            vec![
+                "--file-selection".to_string(),
+                "--directory".to_string(),
+                "--title=Select a Kaneo project folder".to_string(),
+            ],
+        ),
     ] {
         let output = match Command::new(program).args(&args).output() {
-            Ok(output) => output,
+            Ok(output) => {
+                attempted = true;
+                output
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(format!("Could not open the folder picker: {error}")),
+            Err(error) => {
+                attempted = true;
+                failures.push(format!("{program}: {error}"));
+                continue;
+            }
         };
-        if !output.status.success() {
+        if output.status.success() {
+            let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if selected.is_empty() {
+                failures.push(format!("{program}: returned an empty folder path"));
+                continue;
+            }
+            let selected_path = PathBuf::from(&selected);
+            if selected_path.is_dir() {
+                return Ok(Some(selected));
+            }
+            failures.push(format!("{program}: selected path is not a directory"));
+            continue;
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            // Native pickers conventionally use a silent non-zero exit for an
+            // explicit user cancellation. Do not open a second dialog after
+            // the user has cancelled the first one.
             return Ok(None);
         }
-        let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        return Ok((!selected.is_empty()).then_some(selected));
+        failures.push(format!("{program}: {stderr}"));
     }
-    Err("No native folder picker is installed (tried kdialog and zenity).".to_string())
+
+    if !attempted {
+        return Err(
+            "No native folder picker is installed (tried kdialog, zenity, and yad).".to_string(),
+        );
+    }
+    Err(format!(
+        "Could not open a native folder picker: {}",
+        failures.join("; ")
+    ))
 }
 
 fn create_window(app: &AppHandle) -> Result<(), String> {
