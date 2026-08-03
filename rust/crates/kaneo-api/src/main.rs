@@ -18796,6 +18796,7 @@ async fn get_orchestrator(
     };
     let auth = authenticate(&state, &headers).await?;
     require_workspace(&state, &auth, &record.workspace_id).await?;
+    require_workspace_permission(&state, &auth, &record.workspace_id, "project", "read").await?;
     Ok(Json(orchestrator_snapshot(&state, &id).await?))
 }
 
@@ -18827,6 +18828,9 @@ async fn message_orchestrator(
     };
     let auth = authenticate(&state, &headers).await?;
     require_workspace(&state, &auth, &record.workspace_id).await?;
+    require_workspace_permission(&state, &auth, &record.workspace_id, "project", "read").await?;
+    require_workspace_permission(&state, &auth, &record.workspace_id, "task", "create").await?;
+    require_workspace_permission(&state, &auth, &record.workspace_id, "task", "update").await?;
     {
         let mut orchestrators = state.orchestrators.lock().await;
         refresh_orchestrator_tree(&mut orchestrators.records, &id, &state.orchestrator_runner);
@@ -18872,6 +18876,7 @@ async fn cancel_orchestrator(
     };
     let auth = authenticate(&state, &headers).await?;
     require_workspace(&state, &auth, &record.workspace_id).await?;
+    require_workspace_permission(&state, &auth, &record.workspace_id, "project", "read").await?;
     let run_ids = {
         let mut orchestrators = state.orchestrators.lock().await;
         let mut run_ids = HashSet::new();
@@ -18904,6 +18909,7 @@ async fn get_agent(
     };
     let auth = authenticate(&state, &headers).await?;
     require_workspace(&state, &auth, &run.workspace_id).await?;
+    require_workspace_permission(&state, &auth, &run.workspace_id, "project", "read").await?;
     Ok(Json(agent_response(run)))
 }
 
@@ -18923,6 +18929,8 @@ async fn cancel_agent(
     };
     let auth = authenticate(&state, &headers).await?;
     require_workspace(&state, &auth, &run.workspace_id).await?;
+    require_workspace_permission(&state, &auth, &run.workspace_id, "project", "read").await?;
+    require_workspace_permission(&state, &auth, &run.workspace_id, "task", "update").await?;
     let cancelled = if live.is_some() {
         state
             .runner
