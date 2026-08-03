@@ -18604,6 +18604,7 @@ async fn list_orchestrators(
         .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "projectId is required"))?;
     let (auth, workspace_id) = auth_for_project(&state, &headers, project_id).await?;
     require_workspace(&state, &auth, &workspace_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "project", "read").await?;
     let limit = query.limit.unwrap_or(20).clamp(1, 50);
     let mut ids = {
         let orchestrators = state.orchestrators.lock().await;
@@ -18635,6 +18636,7 @@ async fn list_agent_runs(
         .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "projectId is required"))?;
     let (auth, workspace_id) = auth_for_project(&state, &headers, project_id).await?;
     require_workspace(&state, &auth, &workspace_id).await?;
+    require_workspace_permission(&state, &auth, &workspace_id, "project", "read").await?;
     let limit = query.limit.unwrap_or(20).clamp(1, 50);
     let persisted = state
         .database
