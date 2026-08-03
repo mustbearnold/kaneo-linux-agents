@@ -23,6 +23,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { isAgentNotFound } from "@/fetchers/agent/agent-request-error";
 import cancelAgentRun from "@/fetchers/agent/cancel-agent-run";
 import getAgentRun from "@/fetchers/agent/get-agent-run";
 import startAgentRun from "@/fetchers/agent/start-agent-run";
@@ -125,6 +126,19 @@ export default function ProjectAgentDialog({
       void getAgentRun(activeRunId)
         .then(setRun)
         .catch((error: unknown) => {
+          if (isAgentNotFound(error)) {
+            try {
+              window.localStorage.removeItem(agentRunStorageKey(projectId));
+            } catch {
+              // Ignore storage failures; the missing run is still terminal.
+            }
+            setRun(null);
+            setIsMonitorOpen(false);
+            toast.error(
+              "This agent run is no longer available. It may have been interrupted by an API restart.",
+            );
+            return;
+          }
           toast.error(
             error instanceof Error
               ? error.message
@@ -134,7 +148,7 @@ export default function ProjectAgentDialog({
     }, 1500);
 
     return () => window.clearInterval(interval);
-  }, [activeRunId, activeRunStatus]);
+  }, [activeRunId, activeRunStatus, projectId]);
 
   const visibleEvents = useMemo(() => run?.events.slice(-32) ?? [], [run]);
   const active = isActive(run?.status);

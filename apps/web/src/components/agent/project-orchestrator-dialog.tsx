@@ -25,6 +25,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { isAgentNotFound } from "@/fetchers/agent/agent-request-error";
 import {
   cancelOrchestrator,
   createOrchestrator,
@@ -192,6 +193,19 @@ export default function ProjectOrchestratorDialog({
       void getOrchestrator(orchestrator.id)
         .then(setOrchestrator)
         .catch((error: unknown) => {
+          if (isAgentNotFound(error)) {
+            try {
+              window.localStorage.removeItem(orchestratorStorageKey(projectId));
+            } catch {
+              // Ignore storage failures; the missing orchestrator is terminal.
+            }
+            setOrchestrator(null);
+            setIsMonitorOpen(false);
+            toast.error(
+              "This orchestrator is no longer available. It may have been interrupted by an API restart.",
+            );
+            return;
+          }
           toast.error(
             error instanceof Error
               ? error.message
@@ -200,7 +214,7 @@ export default function ProjectOrchestratorDialog({
         });
     }, 1200);
     return () => window.clearInterval(interval);
-  }, [orchestrator?.id, orchestrator?.status]);
+  }, [orchestrator?.id, orchestrator?.status, projectId]);
 
   const messages = useMemo(
     () => orchestrator?.messages.slice(-24) ?? [],

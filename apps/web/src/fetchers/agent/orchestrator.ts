@@ -1,4 +1,5 @@
 import { windowId } from "@kaneo/libs";
+import { AgentRequestError } from "@/fetchers/agent/agent-request-error";
 import { getApiUrl } from "@/fetchers/get-api-url";
 import type {
   CreateOrchestratorRequest,
@@ -23,7 +24,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Keep the raw response when the API did not return JSON.
     }
-    throw new Error(message || "Request failed with HTTP " + response.status);
+    throw new AgentRequestError(
+      response.status,
+      message || `Request failed with HTTP ${response.status}`,
+    );
   }
   return response.json() as Promise<T>;
 }
@@ -38,9 +42,7 @@ export function createOrchestrator(
 }
 
 export function getOrchestrator(id: string): Promise<Orchestrator> {
-  return request<Orchestrator>(
-    "agent/orchestrators/" + encodeURIComponent(id),
-  );
+  return request<Orchestrator>(`agent/orchestrators/${encodeURIComponent(id)}`);
 }
 
 export function sendOrchestratorMessage(
@@ -48,7 +50,7 @@ export function sendOrchestratorMessage(
   message: string,
 ): Promise<Orchestrator> {
   return request<Orchestrator>(
-    "agent/orchestrators/" + encodeURIComponent(id) + "/messages",
+    `agent/orchestrators/${encodeURIComponent(id)}/messages`,
     {
       method: "POST",
       body: JSON.stringify({ message }),
@@ -58,7 +60,7 @@ export function sendOrchestratorMessage(
 
 export function cancelOrchestrator(id: string): Promise<Orchestrator> {
   return request<Orchestrator>(
-    "agent/orchestrators/" + encodeURIComponent(id) + "/cancel",
+    `agent/orchestrators/${encodeURIComponent(id)}/cancel`,
     {
       method: "POST",
     },
