@@ -19253,9 +19253,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     spawn_orchestrator_persistence_loop(state.clone());
     let listener = TcpListener::bind(&bind).await?;
     eprintln!("[kaneo-rust-api] listening on http://{bind}");
-    axum::serve(listener, app(state))
+    axum::serve(listener, app(state.clone()))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    for run in state
+        .runner
+        .cancel_all()
+        .into_iter()
+        .chain(state.orchestrator_runner.cancel_all())
+    {
+        if let Err(error) = state.database.upsert_agent_run(&run).await {
+            eprintln!(
+                "[kaneo-rust-api] could not persist shutdown cancellation for {}: {}",
+                run.id, error.message
+            );
+        }
+    }
     Ok(())
 }
 

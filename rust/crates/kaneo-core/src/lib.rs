@@ -238,14 +238,23 @@ impl RunManager {
         };
 
         if let Some(child) = child {
-            if let Ok(mut child) = child.lock() {
-                if let Some(child) = child.as_mut() {
-                    let _ = child.kill();
-                }
-            }
+            kill_child(&child);
         }
 
         self.get(id)
+    }
+
+    pub fn cancel_all(&self) -> Vec<AgentRun> {
+        let ids = self
+            .state
+            .lock()
+            .expect("runner state lock poisoned")
+            .runs
+            .values()
+            .filter(|run| run.status.is_active())
+            .map(|run| run.id.clone())
+            .collect::<Vec<_>>();
+        ids.into_iter().filter_map(|id| self.cancel(&id)).collect()
     }
 
     pub fn active_count(&self) -> usize {
@@ -683,6 +692,36 @@ mod tests {
         assert_eq!(
             manager.get("third").expect("third is retained").status,
             RunStatus::Completed
+        );
+    }
+
+    #[test]
+    fn cancels_all_active_runs() {
+        let manager = RunManager::new(RunnerConfig {
+            max_active_runs: 2,
+            ..RunnerConfig::default()
+        });
+        manager
+            .start(shell_spec("first", "sleep 10"))
+            .expect("first run starts");
+        manager
+            .start(shell_spec("second", "sleep 10"))
+            .expect("second run starts");
+
+        let cancelled = manager.cancel_all();
+        assert_eq!(cancelled.len(), 2);
+        assert!(
+            cancelled
+                .iter()
+                .all(|run| run.status == RunStatus::Cancelled)
+        );
+        assert_eq!(
+            wait_for_terminal(&manager, "first").status,
+            RunStatus::Cancelled
+        );
+        assert_eq!(
+            wait_for_terminal(&manager, "second").status,
+            RunStatus::Cancelled
         );
     }
 }
