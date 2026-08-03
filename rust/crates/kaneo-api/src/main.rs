@@ -123,6 +123,16 @@ impl Database {
                 );
                 CREATE INDEX IF NOT EXISTS kaneo_agent_run_project_created_idx
                     ON kaneo_agent_run (workspace_id, project_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS kaneo_orchestrator (
+                    id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS kaneo_orchestrator_project_updated_idx
+                    ON kaneo_orchestrator (workspace_id, project_id, updated_at DESC);
                 UPDATE kaneo_agent_run
                 SET status = 'failed',
                     error = COALESCE(error, 'Rust API restarted before the agent run finished.'),
@@ -253,6 +263,82 @@ impl Database {
             error: row.try_get("error").map_err(database_error)?,
             events,
         }))
+    }
+
+    async fn upsert_orchestrator(&self, record: &OrchestratorRecord) -> Result<(), ApiError> {
+        let state = serde_json::to_string(record).map_err(database_error)?;
+        let status = orchestrator_status_name(record.status);
+        self.client
+            .execute(
+                r#"
+                INSERT INTO kaneo_orchestrator (
+                    id, workspace_id, project_id, status, state, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    workspace_id = EXCLUDED.workspace_id,
+                    project_id = EXCLUDED.project_id,
+                    status = EXCLUDED.status,
+                    state = EXCLUDED.state,
+                    updated_at = NOW()
+                "#,
+                &[
+                    &record.id,
+                    &record.workspace_id,
+                    &record.project_id,
+                    &status,
+                    &state,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn load_orchestrators(&self) -> Result<HashMap<String, OrchestratorRecord>, ApiError> {
+        let rows = self
+            .client
+            .query(
+                "SELECT id, state FROM kaneo_orchestrator ORDER BY updated_at ASC",
+                &[],
+            )
+            .await
+            .map_err(database_error)?;
+        let mut records = HashMap::new();
+        for row in rows {
+            let id: String = row.try_get("id").map_err(database_error)?;
+            let state: String = row.try_get("state").map_err(database_error)?;
+            let mut record: OrchestratorRecord = serde_json::from_str(&state).map_err(|error| {
+                database_error(format!(
+                    "Could not decode persisted orchestrator {id}: {error}"
+                ))
+            })?;
+            let mut recovered = false;
+            if matches!(
+                record.status,
+                OrchestratorStatus::Queued | OrchestratorStatus::Running
+            ) {
+                record.status = OrchestratorStatus::Failed;
+                record.active_turn_id = None;
+                record.error =
+                    Some("Rust API restarted before the orchestrator turn finished.".to_string());
+                recovered = true;
+            }
+            for child in &mut record.children {
+                if child.status.is_active() {
+                    child.status = RunStatus::Failed;
+                    child.error =
+                        Some("Rust API restarted before the child agent finished.".to_string());
+                    child.updated_at = now_rfc3339();
+                    recovered = true;
+                }
+            }
+            if recovered {
+                record.updated_at = now_rfc3339();
+                self.upsert_orchestrator(&record).await?;
+            }
+            records.insert(record.id.clone(), record);
+        }
+        Ok(records)
     }
 }
 
@@ -1041,7 +1127,7 @@ enum OrchestratorStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OrchestratorMessage {
     id: String,
@@ -1050,7 +1136,7 @@ struct OrchestratorMessage {
     at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct OrchestratorChild {
     id: String,
     orchestrator_id: Option<String>,
@@ -1069,7 +1155,7 @@ struct OrchestratorChild {
     updated_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct OrchestratorRecord {
     id: String,
     parent_orchestrator_id: Option<String>,
@@ -1077,6 +1163,7 @@ struct OrchestratorRecord {
     depth: usize,
     workspace_id: String,
     project_id: String,
+    #[serde(skip)]
     credential: String,
     goal: String,
     cwd: PathBuf,
@@ -16817,6 +16904,16 @@ fn run_status_from_name(status: &str) -> Option<RunStatus> {
     }
 }
 
+fn orchestrator_status_name(status: OrchestratorStatus) -> &'static str {
+    match status {
+        OrchestratorStatus::Queued => "queued",
+        OrchestratorStatus::Running => "running",
+        OrchestratorStatus::Waiting => "waiting",
+        OrchestratorStatus::Failed => "failed",
+        OrchestratorStatus::Cancelled => "cancelled",
+    }
+}
+
 fn append_orchestrator_message(record: &mut OrchestratorRecord, role: &str, text: &str) {
     let text = text.trim();
     if text.is_empty() {
@@ -17038,11 +17135,10 @@ async fn orchestrator_snapshot(
         .cloned()
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Orchestrator not found"))?;
     let records = orchestrators.records.clone();
-    Ok(orchestrator_response(
-        &snapshot,
-        &state.orchestrator_runner,
-        &records,
-    ))
+    let response = orchestrator_response(&snapshot, &state.orchestrator_runner, &records);
+    drop(orchestrators);
+    state.database.upsert_orchestrator(&snapshot).await?;
+    Ok(response)
 }
 
 fn publish_orchestrator_event(
@@ -17599,6 +17695,26 @@ fn spawn_agent_persistence_watcher(state: AppState, run_id: String) {
     });
 }
 
+fn spawn_orchestrator_persistence_loop(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let records = {
+                let orchestrators = state.orchestrators.lock().await;
+                orchestrators.records.values().cloned().collect::<Vec<_>>()
+            };
+            for record in records {
+                if let Err(error) = state.database.upsert_orchestrator(&record).await {
+                    eprintln!(
+                        "[kaneo-rust-api] could not persist orchestrator {}: {error}",
+                        record.id
+                    );
+                }
+            }
+        }
+    });
+}
+
 async fn start_agent(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -17788,6 +17904,10 @@ async fn delegate_orchestrator_child(
     require_workspace_permission(state, auth, &record.workspace_id, "task", "update")
         .await
         .map_err(|error| error.message.clone())?;
+    let record = OrchestratorRecord {
+        credential: auth.credential.clone(),
+        ..record
+    };
     if record.cancel_requested {
         return Err("Orchestrator has been cancelled".to_string());
     }
@@ -19014,6 +19134,7 @@ async fn shutdown_signal() {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = env::var("DATABASE_URL")?;
     let database = Database::connect(&database_url).await?;
+    let persisted_orchestrators = database.load_orchestrators().await?;
     let bind = env::var("KANEO_RUST_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     let client_url = env::var("KANEO_CLIENT_URL")
         .unwrap_or_else(|_| "http://localhost:5173".to_string())
@@ -19032,7 +19153,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_active_runs: orchestrator_max_active_runs,
             ..RunnerConfig::default()
         }),
-        orchestrators: Arc::new(Mutex::new(OrchestratorState::default())),
+        orchestrators: Arc::new(Mutex::new(OrchestratorState {
+            records: persisted_orchestrators,
+        })),
         http: reqwest::Client::new(),
         api_base_url: env::var("KANEO_API_URL")
             .unwrap_or_else(|_| format!("http://{bind}"))
@@ -19042,6 +19165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mcp: Arc::new(Mutex::new(McpState::default())),
         events,
     };
+    spawn_orchestrator_persistence_loop(state.clone());
     let listener = TcpListener::bind(&bind).await?;
     eprintln!("[kaneo-rust-api] listening on http://{bind}");
     axum::serve(listener, app(state))
@@ -19094,6 +19218,17 @@ mod tests {
         assert!(prompt.contains("orchestrator_children"));
         assert!(prompt.contains("orchestrator-test"));
         assert!(prompt.contains("Ship the test project"));
+    }
+
+    #[test]
+    fn persisted_orchestrator_state_never_contains_credentials() {
+        let record = test_orchestrator();
+        let state = serde_json::to_string(&record).expect("orchestrator serializes");
+        assert!(!state.contains("secret"));
+        let restored: OrchestratorRecord =
+            serde_json::from_str(&state).expect("orchestrator deserializes");
+        assert!(restored.credential.is_empty());
+        assert_eq!(restored.goal, record.goal);
     }
 
     #[test]

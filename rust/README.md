@@ -45,9 +45,9 @@ can chat through `/messages`, delegate bounded child runs with the
 `orchestrator_delegate` MCP tool, inspect them with `orchestrator_children`,
 and cancel the whole tree. Orchestrator and child lifecycle events are sent on
 the existing project WebSocket, so the board can remain open while agents
-work. Orchestrators are intentionally in-memory like the existing agent-run
-registry; active work should be cancelled or allowed to finish before an API
-restart.
+work. Orchestrator hierarchy and messages are persisted without credentials;
+active work is marked interrupted on an API restart and can be resumed with a
+new authenticated message.
 
 Slack, Discord, and Telegram project-integration configuration is native too:
 the Rust API validates webhook or bot credentials, preserves event settings,
