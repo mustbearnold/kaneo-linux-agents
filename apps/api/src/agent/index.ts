@@ -8,7 +8,12 @@ import { projectTable } from "../database/schema";
 import { requireWorkspacePermission } from "../utils/require-workspace-permission";
 import { validateWorkspaceAccess } from "../utils/validate-workspace-access";
 import { workspaceAccess } from "../utils/workspace-access-middleware";
-import { cancelAgentRun, getAgentRun, startAgentRun } from "./runner";
+import {
+  cancelAgentRun,
+  getAgentRun,
+  listAgentRuns,
+  startAgentRun,
+} from "./runner";
 
 const agentRunSchema = v.object({
   id: v.string(),
@@ -108,6 +113,45 @@ const agent = new Hono<{
           { message },
         );
       }
+    },
+  )
+  .get(
+    "/runs",
+    describeRoute({
+      operationId: "listAgentRuns",
+      tags: ["Agents"],
+      description: "List recent direct agent runs for a Kaneo project",
+      responses: {
+        200: {
+          description: "Recent direct agent runs",
+          content: {
+            "application/json": { schema: resolver(v.array(agentRunSchema)) },
+          },
+        },
+      },
+    }),
+    validator(
+      "query",
+      v.object({
+        projectId: v.pipe(v.string(), v.minLength(1)),
+        limit: v.optional(
+          v.pipe(
+            v.string(),
+            v.transform(Number),
+            v.number(),
+            v.integer("Limit must be an integer"),
+            v.minValue(1, "Limit must be at least 1"),
+            v.maxValue(50, "Limit must not exceed 50"),
+          ),
+          20,
+        ),
+      }),
+    ),
+    workspaceAccess.fromProject("projectId"),
+    requireWorkspacePermission({ project: ["read"] }),
+    (c) => {
+      const { projectId, limit } = c.req.valid("query");
+      return c.json(listAgentRuns(c.get("workspaceId"), projectId, limit));
     },
   )
   .get(

@@ -305,6 +305,21 @@ export function getAgentRun(id: string): AgentRun | null {
   return run ? publicRun(run) : null;
 }
 
+export function listAgentRuns(
+  workspaceId: string,
+  projectId: string,
+  limit = 20,
+): AgentRun[] {
+  const boundedLimit = Math.min(Math.max(limit, 1), 50);
+  return [...runs.values()]
+    .filter(
+      (run) => run.workspaceId === workspaceId && run.projectId === projectId,
+    )
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .slice(0, boundedLimit)
+    .map(publicRun);
+}
+
 export function cancelAgentRun(id: string): AgentRun | null {
   const run = runs.get(id);
   const process = processes.get(id);
