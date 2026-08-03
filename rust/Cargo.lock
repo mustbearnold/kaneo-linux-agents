@@ -1917,6 +1917,7 @@ name = "kaneo-desktop"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "libc",
  "tauri",
  "tauri-build",
  "tokio",

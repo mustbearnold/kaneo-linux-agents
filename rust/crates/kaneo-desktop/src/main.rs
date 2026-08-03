@@ -105,6 +105,30 @@ fn start_api(resource_dir: Option<&Path>) -> Result<Child, String> {
     })
 }
 
+fn stop_api(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // kaneo-api installs a SIGTERM handler that cancels and persists all
+        // direct and orchestrator runs before it exits. Give that path time to
+        // finish so closing the desktop window cannot strand Codex children.
+        unsafe {
+            let _ = libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        for _ in 0..100 {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+    }
+
+    // A broken or unresponsive API must not keep the desktop process alive
+    // indefinitely. This is the last-resort path after graceful shutdown.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn web_url() -> Result<Url, String> {
     let value = env::var("KANEO_WEB_URL").unwrap_or_else(|_| "http://127.0.0.1:5173".to_string());
     Url::parse(&value).map_err(|error| format!("Invalid KANEO_WEB_URL: {error}"))
@@ -301,10 +325,33 @@ fn main() {
                 if let Some(child) = app.try_state::<ApiChild>() {
                     if let Ok(mut child) = child.0.lock() {
                         if let Some(mut child) = child.take() {
-                            let _ = child.kill();
+                            stop_api(&mut child);
                         }
                     }
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_api_reaps_a_child_after_graceful_signal() {
+        let mut child = Command::new("sh")
+            .args(["-c", "trap 'exit 0' TERM; sleep 10"])
+            .spawn()
+            .expect("test child should start");
+
+        stop_api(&mut child);
+
+        assert!(
+            child
+                .try_wait()
+                .expect("test child status should be readable")
+                .is_some()
+        );
+    }
 }
